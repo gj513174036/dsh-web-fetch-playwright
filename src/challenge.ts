@@ -16,7 +16,10 @@
  *    (`/cdn-cgi/challenge-platform/` scripts, `#challenge-*` elements,
  *    `cf-chl-widget-` Turnstile frames, `window._cf_chl_opt`). Markers are
  *    deliberately structural: a blog post that merely MENTIONS Cloudflare
- *    must not classify as a challenge.
+ *    must not classify as a challenge. Bot Management's passive JSD
+ *    telemetry (`/cdn-cgi/challenge-platform/scripts/jsd/`), which
+ *    Cloudflare injects into every NORMAL page of a protected zone, is
+ *    explicitly neutralized — it is not a challenge signal.
  *
  * The security stance (issue #2): this module only DETECTS and classifies.
  * Solving, spoofing, CAPTCHA answering, and cookie lifting live outside the
@@ -86,14 +89,30 @@ export const CHALLENGE_TITLE_RE = new RegExp(
 )
 
 /**
+ * Cloudflare Bot Management's passive JavaScript-Detections (JSD)
+ * telemetry directory. Cloudflare injects this into EVERY normal page of
+ * a protected zone — as a direct `<script src>` or as the URL strung
+ * inside the hidden-1x1-iframe bootstrap's inline script text — with the
+ * page itself a plain 200 of real content. The path therefore proves
+ * nothing about a challenge and must be neutralized before the
+ * challenge-platform prefix check: real interstitials load orchestrate
+ * scripts (`/cdn-cgi/challenge-platform/h/[b|g]/orchestrate/...`), which
+ * never live under `scripts/jsd/`.
+ */
+const TELEMETRY_JSD_DIR = '/cdn-cgi/challenge-platform/scripts/jsd/'
+
+/**
  * Structural markers a challenge document carries in its HTML. Kept in
  * attribute/assignment form (`id="…"`, `window._cf_chl_opt`) rather than bare
  * substrings so an article that merely QUOTES these strings in prose or code
  * samples does not classify — the marker must look like the real element.
+ * The bare `/cdn-cgi/challenge-platform/` prefix is checked only after
+ * {@link TELEMETRY_JSD_DIR} occurrences are stripped (see
+ * {@link classifyChallengeHtml}); `scripts/jsd/main.js` in any spelling is
+ * passive telemetry and deliberately absent from this list.
  */
 const CHALLENGE_HTML_MARKERS = [
   '/cdn-cgi/challenge-platform/',
-  '/cdn-cgi/scripts/jsd/main.js',
   'id="cf-chl-widget-',
   'window._cf_chl_opt',
   'id="challenge-form"',
@@ -187,7 +206,14 @@ export function classifyChallengeHtml(html: string): ChallengeVerdict {
   const lowered = html.toLowerCase()
   if (lowered.includes(BLOCKED_BODY_PHRASE) && BLOCKED_BODY_MARKERS.some(marker => lowered.includes(marker))) return 'blocked'
   if (CHALLENGE_TITLE_RE.test(title)) return 'challenge'
-  if (CHALLENGE_HTML_MARKERS.some(marker => lowered.includes(marker))) return 'challenge'
+  // Strip the passive JSD telemetry directory before the marker scan: its
+  // URL embeds the `/cdn-cgi/challenge-platform/` prefix, so an unstripped
+  // scan misreads every Bot-Management-protected normal page (a plain 200
+  // with real content — e.g. openrouter.ai) as an interstitial, the wait
+  // can then never confirm a clear, and the fetch dies with
+  // WEB_FETCH_CHALLENGE despite the page having loaded fine.
+  const withoutTelemetry = lowered.split(TELEMETRY_JSD_DIR).join('')
+  if (CHALLENGE_HTML_MARKERS.some(marker => withoutTelemetry.includes(marker))) return 'challenge'
   // Crawlee's footer marker, as a two-class combo so prose quoting one class
   // alone stays clean.
   if (lowered.includes('class="ray-id"') && lowered.includes('class="footer-inner"')) return 'challenge'
@@ -200,7 +226,10 @@ export function classifyChallengeHtml(html: string): ChallengeVerdict {
  * what makes SPA-style clears visible — the document swaps its content
  * without any navigation, so only a DOM read can see the change. The title
  * regex is baked in at build time from the same single source the Node-side
- * check uses, so the two can never drift apart.
+ * check uses, so the two can never drift apart. Script srcs under
+ * `/cdn-cgi/challenge-platform/scripts/jsd/` are Bot Management's passive
+ * JSD telemetry — present on every normal page of a protected zone — and are
+ * excluded just like in {@link classifyChallengeHtml}.
  */
 export const CHALLENGE_DOM_PROBE = `(() => {
   const re = new RegExp(${JSON.stringify(CHALLENGE_TITLE_RE.source)}, ${JSON.stringify(CHALLENGE_TITLE_RE.flags)})
@@ -209,7 +238,7 @@ export const CHALLENGE_DOM_PROBE = `(() => {
   if (document.querySelector('[id^="cf-chl-widget-"]')) return true
   for (const script of Array.from(document.scripts)) {
     const src = script.getAttribute('src') || ''
-    if (src.includes('/cdn-cgi/challenge-platform/') || src.includes('/cdn-cgi/scripts/jsd/main.js')) return true
+    if (src.includes('/cdn-cgi/challenge-platform/') && !src.includes('/cdn-cgi/challenge-platform/scripts/jsd/')) return true
   }
   if (document.querySelector('.footer .footer-inner .ray-id')) return true
   return false

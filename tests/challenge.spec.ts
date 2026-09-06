@@ -35,6 +35,26 @@ const ARTICLE_ABOUT_CLOUDFLARE = `<!doctype html><html><head><title>How Cloudfla
 a snippet like <code>cf-chl-widget-abc123</code> inside prose, because a real article
 may quote these strings.</p></article></main></body></html>`
 
+/**
+ * The passive JSD-iframe bootstrap Cloudflare Bot Management injects into
+ * every NORMAL page of a protected zone — captured verbatim (minus noise)
+ * from https://openrouter.ai/openai/gpt-6-astra-pro, a plain 200 of real
+ * content. Its inline text strings the JSD telemetry URL, which embeds the
+ * challenge-platform prefix; the regression (badcase: openrouter.ai) is that
+ * the prefix scan misread this as an interstitial, the DOM probe then
+ * correctly said "not challenged", and the chained-round recheck overrode it
+ * with the same false positive until every attempt burned down.
+ */
+const JSD_BOOTSTRAP_PAGE = `<!doctype html><html><head><title>GPT-6 Astra Pro - API Pricing &amp; Providers | OpenRouter</title></head><body>
+<main><article><h1>OpenAI: GPT-6 Astra Pro</h1><p>Real body text of a normal 200 page.</p></article></main>
+<script>(function(){function c(){var b=a.contentDocument||(a.contentWindow&&a.contentWindow.document);if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a36c81a84a7ad7cc',t:'MTc4ODY4NzU2Ng=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';document.body.appendChild(a);c()}})()</script>
+</body></html>`
+
+/** The direct-injection variant some protected zones serve instead. */
+const JSD_DIRECT_PAGE = `<!doctype html><html><head><title>A normal protected page</title>
+<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js" defer></script>
+</head><body><main><article><h1>Article</h1><p>Body.</p></article></main></body></html>`
+
 describe('classifyChallengeResponse', () => {
   it('the documented header alone marks a challenge, whatever the status', () => {
     expect(classifyChallengeResponse(403, { 'cf-mitigated': 'challenge', 'content-type': 'text/html' })).toBe('challenge')
@@ -126,6 +146,24 @@ describe('classifyChallengeHtml', () => {
     expect(classifyChallengeHtml(ARTICLE_ABOUT_CLOUDFLARE)).toBe('none')
   })
 
+  it('Bot Management passive JSD telemetry is not a challenge (openrouter.ai badcase)', () => {
+    // The hidden-iframe bootstrap strings the JSD URL inside inline script
+    // text on every normal page of a protected zone — a plain 200 with real
+    // content must classify clean, or the bounded wait can never confirm a
+    // clear and the fetch dies with WEB_FETCH_CHALLENGE (last status 200).
+    expect(classifyChallengeHtml(JSD_BOOTSTRAP_PAGE)).toBe('none')
+    // The direct-injection variant (the script tag itself in the head).
+    expect(classifyChallengeHtml(JSD_DIRECT_PAGE)).toBe('none')
+    // Query-string variants of the telemetry URL stay neutralized too.
+    expect(classifyChallengeHtml('<html><head><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=abc" defer></script></head><body><p>x</p></body></html>')).toBe('none')
+  })
+
+  it('stripping JSD telemetry does not over-exclude a real interstitial', () => {
+    // A real challenge page may carry the JSD script AND its own orchestrate
+    // scripts; the orchestrate path survives the strip and still classifies.
+    expect(classifyChallengeHtml(`${CHALLENGE_HTML}<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js" defer></script>`)).toBe('challenge')
+  })
+
   it('recognizes the hard-block page distinctly', () => {
     expect(classifyChallengeHtml('<html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1></body></html>')).toBe('blocked')
     expect(classifyChallengeHtml('<html><head><title>Attention Required! | Cloudflare</title></head><body></body></html>')).toBe('blocked')
@@ -180,6 +218,8 @@ describe('CHALLENGE_DOM_PROBE', () => {
   it('reports false once the real document replaced the challenge (SPA clear)', () => {
     expect(runProbe(fakeDocument({ title: 'Real protected article' }))).toBe(false)
     expect(runProbe(fakeDocument({ title: 'Real protected article', scriptSrcs: ['/static/app.js'] }))).toBe(false)
+    // JSD telemetry srcs are passive detection on normal pages, not markers.
+    expect(runProbe(fakeDocument({ title: 'Real protected article', scriptSrcs: ['/cdn-cgi/challenge-platform/scripts/jsd/main.js', '/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=abc'] }))).toBe(false)
   })
 
   it('exports sane bounded-wait constants', () => {

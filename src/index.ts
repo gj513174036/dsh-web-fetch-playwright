@@ -11,7 +11,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type {} from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-web'
 import { Config } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
@@ -34,7 +34,7 @@ export const name = 'dsh-web-fetch-playwright'
 export const inject = ['web']
 
 /** Settings namespace carrying this provider's configuration card. */
-export const WEB_FETCH_PLAYWRIGHT_SETTINGS_NAMESPACE = settingsNamespace('web-fetch-playwright')
+export const WEB_FETCH_PLAYWRIGHT_SETTINGS_NAMESPACE = 'web-fetch-playwright'
 
 /** Register the Playwright fetch provider with `ctx.web`. */
 export function apply(ctx: Context, config: Config): void {
@@ -44,13 +44,15 @@ export function apply(ctx: Context, config: Config): void {
   // Passing `current` directly would pin the composition entry forever (the
   // web-search-deepseek provider uses the same wrapper idiom).
   let current: () => ResolvedConfig = () => config as ResolvedConfig
-  installSettingsSection(ctx, WEB_FETCH_PLAYWRIGHT_SETTINGS_NAMESPACE, Config, config, {
-    setSource: (source) => {
-      current = source as () => ResolvedConfig
-    },
-    // The provider projects the section per fetch, so a committed change
-    // needs no re-registration.
-    onChange: () => {},
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.settings.installSection(ctx, WEB_FETCH_PLAYWRIGHT_SETTINGS_NAMESPACE, Config, config, {
+      setSource: (source) => {
+        current = source as () => ResolvedConfig
+      },
+      // The provider projects the section per fetch, so a committed change
+      // needs no re-registration.
+      onChange: () => {},
+    })
   })
   // The CDP backend holds one shared connection for the provider's lifetime;
   // drop it when this plugin unloads so restarts don't strand sockets.
