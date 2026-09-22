@@ -98,6 +98,20 @@ DEFAULT_STATIC_RESOURCE_TYPES: Tuple[str, ...] = (
 STATIC_RESOURCE_TYPES = DEFAULT_STATIC_RESOURCE_TYPES
 
 _JSON_MIME_SUFFIX = "+json"
+#: XML 家族的 API 文档响应（RSS/Atom/SOAP 等同样是被当页面打开的接口）。
+_XML_MIME_SUFFIX = "+xml"
+#: 显式声明的 XML 家族 API 文档类型（RSS/Atom/SOAP 等被当页面打开的接口）。
+_API_DOCUMENT_MIMES = frozenset(
+    {
+        "application/xml",
+        "text/xml",
+        "application/rss+xml",
+        "application/atom+xml",
+    }
+)
+
+#: 长得像 XML 但其实是「网页」的类型：XHTML 是页面格式，``+xml`` 后缀规则必须放过它。
+_PAGE_LIKE_XML_MIMES = frozenset({"application/xhtml+xml", "application/xhtml+xml; charset=utf-8"})
 _JSON_MIMES = ("application/json", "text/json", "application/x-json")
 _READ_METHODS = ("GET", "HEAD", "OPTIONS")
 
@@ -151,6 +165,24 @@ def is_json_mime(mime: str) -> bool:
     if not base:
         return False
     return base in _JSON_MIMES or base.endswith(_JSON_MIME_SUFFIX)
+
+
+def is_api_document_mime(mime: str) -> bool:
+    """判断一个「顶层导航文档」的响应是否是 API 载荷而非网页。
+
+    ``document`` 只说明这是顶层导航，不说明它是网页：把接口地址当页面直接打开时，
+    响应体是 JSON/XML —— 那是核心业务接口，不是页面噪音。HTML 仍然按页面过滤。
+    """
+    if not mime:
+        return False
+    base = mime.split(";", 1)[0].strip().lower()
+    if not base:
+        return False
+    if base in _PAGE_LIKE_XML_MIMES:
+        return False
+    if is_json_mime(base):
+        return True
+    return base in _API_DOCUMENT_MIMES or base.endswith(_XML_MIME_SUFFIX)
 
 
 def _body_looks_like_json(entry: Entry) -> bool:
@@ -257,6 +289,16 @@ def classify_entry(entry: Entry, options: Optional[ClassifyOptions] = None) -> D
         return Decision(entry=entry, keep=False, reason=static_reason)
 
     if resource_type == "document" and not options.include_documents:
+        # 与上面的 api-over-static-extension 同构：导航这个「强证据」说的是
+        # 「这是顶层导航」，不是「这是网页」。响应体是 JSON/XML 时它是被当作页面
+        # 打开的业务接口，保留；HTML 页面照旧过滤。
+        if is_api_document_mime(entry.responseMimeType) or "json-response" in signals:
+            return Decision(
+                entry=entry,
+                keep=True,
+                reason="api-over-document",
+                signals=signals + ["document-overridden"],
+            )
         return Decision(entry=entry, keep=False, reason="document-page")
 
     if not signals and not options.include_static:

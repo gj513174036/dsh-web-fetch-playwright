@@ -19,6 +19,7 @@ from netdump.classify import (  # noqa: E402
     classify_entry,
     is_json_mime,
     is_static_asset,
+    is_api_document_mime,
     url_extension,
 )
 from netdump.endpoints import build_endpoints_document  # noqa: E402
@@ -390,3 +391,59 @@ class StaticExtensionExceptionRegressionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ApiDocumentRegressionTest(unittest.TestCase):
+    """接口被当作页面直接打开（resourceType=document）时不得被当成页面噪音丢弃。
+
+    真实场景：Agent 直接用 web_fetch 打开一个 API 地址，CDP 报的 resourceType 是
+    ``document``，但响应体是 JSON/XML —— 那是核心业务接口。HTML 页面照旧过滤。
+    """
+
+    def _document(self, url, mime, body=""):
+        return Entry(method="GET", url=url, status=200, resourceType="document",
+                     responseMimeType=mime, responseBody=body)
+
+    def test_json_document_is_kept_as_api(self):
+        decision = classify_entry(self._document("https://api.example.com/v1/items", "application/json", '{"a":1}'))
+        self.assertTrue(decision.keep)
+        self.assertEqual(decision.reason, "api-over-document")
+        self.assertIn("document-overridden", decision.signals)
+
+    def test_xml_document_is_kept_as_api(self):
+        for mime in ("application/xml", "text/xml", "application/atom+xml", "application/rss+xml"):
+            with self.subTest(mime=mime):
+                decision = classify_entry(self._document("https://api.example.com/feed", mime, "<rss/>"))
+                self.assertTrue(decision.keep)
+                self.assertEqual(decision.reason, "api-over-document")
+
+    def test_json_body_without_mime_is_kept_as_api(self):
+        decision = classify_entry(self._document("https://api.example.com/v1/items", "", '{"a":1}'))
+        self.assertTrue(decision.keep)
+        self.assertEqual(decision.reason, "api-over-document")
+
+    def test_html_document_is_still_filtered(self):
+        # XHTML 长得像 XML 但它是网页格式：绝不能被 API 例外放过。
+        for mime in ("text/html", "application/xhtml+xml"):
+            with self.subTest(mime=mime):
+                decision = classify_entry(
+                    self._document("https://www.example.com/page", mime, "<html><body>x</body></html>")
+                )
+                self.assertFalse(decision.keep)
+                self.assertEqual(decision.reason, "document-page")
+
+    def test_is_api_document_mime(self):
+        for mime in ("application/json", "application/vnd.api+json", "application/xml",
+                     "text/xml", "application/atom+xml", "application/rss+xml"):
+            with self.subTest(mime=mime):
+                self.assertTrue(is_api_document_mime(mime))
+        for mime in ("text/html", "application/xhtml+xml", "text/css", "", "application/javascript"):
+            with self.subTest(mime=mime):
+                self.assertFalse(is_api_document_mime(mime))
+
+    def test_include_documents_still_opts_everything_in(self):
+        decision = classify_entry(
+            self._document("https://www.example.com/page", "text/html", "<html/>"),
+            ClassifyOptions(include_documents=True),
+        )
+        self.assertFalse(decision.keep)  # 页面保留但无 API 信号 → no-api-signal
+        self.assertEqual(decision.reason, "no-api-signal")
