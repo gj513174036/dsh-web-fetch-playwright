@@ -112,8 +112,20 @@ HTTP/2 伪头（`:authority` 等）在解析阶段丢弃。
 
 唯一的例外：**后缀像静态文件但确实返回 JSON** 的 URL（例如 `/api/report.png`
 返回 `application/json`）会被保留，`rankReason` 记为 `api-over-static-extension`，
-避免把被静态后缀伪装的接口丢掉。WebSocket（`ws`/`wss`）默认保留，但只出现在
-`endpoints.json` 的 `websockets` 分组里，不会混进 HTTP 接口清单。
+避免把被静态后缀伪装的接口丢掉。这个例外覆盖两类「弱证据」的静态判定：
+
+* URL 后缀（`static-extension:.js`）；
+* 抓包**没有**给出资源类型、由 `har.py` 按后缀/mimeType 兜底推断出来的静态类型
+  （`Entry.resourceTypeInferred=True`，例如不带 `_resourceType` 的 HAR 里的
+  `/v2/export/report.js` + `content-type: application/json`）。
+
+反过来，抓包**明确给出**的类型是强证据：Chrome HAR 的 `_resourceType`、CDP 事件的
+`type`、插件 JSONL 的 `resourceType` 只要是 `script`/`image` 等静态类型，即使响应
+头写着 JSON 也照样被过滤，静态资源过滤不会因此放宽。回归用例见
+`fixtures/static-extension-json.har`（1 条伪装接口保留 + 4 条真静态资源过滤）。
+
+WebSocket（`ws`/`wss`）默认保留，但只出现在 `endpoints.json` 的 `websockets`
+分组里，不会混进 HTTP 接口清单。
 
 ## 4. `endpoints.json`
 
@@ -227,10 +239,11 @@ python3 crawler.py --help
 python3 -m unittest discover -s tools/netdump/tests -t tools/netdump
 ```
 
-测试覆盖：HAR/JSONL 解析与容错、静态过滤与保留规则、模板化/合并/评分、
-生成脚本的语法编译与 CLI 行为（含断点续跑、代理轮换、缺 httpx 时的提示）、
-权限位与凭据保留、以及 `fixtures/sample.har` → `endpoints.json` + `crawler.py`
-的端到端断言。
+测试覆盖：HAR/JSONL 解析与容错、静态过滤与保留规则（含 F3 回归：
+`fixtures/static-extension-json.har` 里伪装成 `.js` 的 JSON 接口保留、真脚本仍过滤）、
+模板化/合并/评分、生成脚本的语法编译与 CLI 行为（含断点续跑、代理轮换、
+缺 httpx 时的提示）、权限位与凭据保留、以及 `fixtures/sample.har` →
+`endpoints.json` + `crawler.py` 的端到端断言。
 
 ## 8. 已知限制
 

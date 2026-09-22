@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .classify import (
     ClassifyOptions,
+    api_signals,
     classify_entries,
     is_json_mime,
     is_static_asset,
@@ -338,7 +339,9 @@ def _merge_entry_into_group(group: _Group, entry: Entry) -> None:
         group.mime_types[mime] = group.mime_types.get(mime, 0) + 1
     if is_json_mime(entry.responseMimeType) or _body_is_json(entry):
         group.json_seen = True
-    if is_static_asset(entry)[0]:
+    # 「静态噪音」扣分只作用于「因为没有 API 信号、纯靠 --include-static 才被留下」的
+    # 记录；被 api-over-static-extension 保留下来的伪静态接口不算噪音。
+    if is_static_asset(entry)[0] and not api_signals(entry):
         group.static_included = True
     group.statuses[str(entry.status)] = group.statuses.get(str(entry.status), 0) + 1
     if entry.durationMs:

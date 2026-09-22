@@ -21,7 +21,8 @@ from netdump.classify import (  # noqa: E402
     is_static_asset,
     url_extension,
 )
-from netdump.har import Entry  # noqa: E402
+from netdump.endpoints import build_endpoints_document  # noqa: E402
+from netdump.har import Entry, parse_har  # noqa: E402
 
 CONTRACT_EXTENSIONS = (
     ".js",
@@ -272,6 +273,119 @@ class EdgeCasesTest(unittest.TestCase):
         self.assertTrue(payload["keep"])
         self.assertEqual(payload["kind"], "http")
         self.assertEqual(payload["signals"], ["resource-type:xhr"])
+
+
+def har_entry(url, mime, body="{}", rtype=None):
+    """构造一条 HAR entry；``rtype`` 为 None 时故意不带 ``_resourceType``。"""
+    raw = {
+        "startedDateTime": "2024-03-05T09:00:00.000Z",
+        "time": 12.0,
+        "request": {
+            "method": "GET",
+            "url": url,
+            "headers": [],
+            "queryString": [],
+            "cookies": [],
+            "headersSize": -1,
+            "bodySize": 0,
+        },
+        "response": {
+            "status": 200,
+            "statusText": "OK",
+            "httpVersion": "HTTP/1.1",
+            "headers": [{"name": "content-type", "value": mime}],
+            "cookies": [],
+            "content": {"size": len(body), "mimeType": mime, "text": body},
+            "redirectURL": "",
+            "headersSize": -1,
+            "bodySize": len(body),
+        },
+        "cache": {},
+        "timings": {"send": 0, "wait": 12, "receive": 0},
+    }
+    if rtype is not None:
+        raw["_resourceType"] = rtype
+    return parse_har({"log": {"version": "1.2", "entries": [raw]}})[0]
+
+
+class StaticExtensionExceptionRegressionTest(unittest.TestCase):
+    """F3 回归：HAR 不带 ``_resourceType`` 时，``api-over-static-extension`` 必须可达。
+
+    正例：``.js`` + ``application/json`` + 无 ``_resourceType``（只能按后缀推断成
+    script）→ 保留为业务 API 并标注 ``api-over-static-extension``。
+    反例（同一测试内）：真脚本（``application/javascript`` 或抓包明确给出
+    ``_resourceType=script``）仍必须被过滤，静态资源过滤不得被放宽。
+    """
+
+    def test_positive_js_json_is_kept_and_real_scripts_are_still_filtered(self):
+        # ---- 正例：被静态后缀伪装的接口 ----------------------------------
+        disguised = har_entry("https://api.example.com/v2/export/report.js", "application/json", '{"rows":[]}')
+        # 复现 F3 的前提：har.py 只能按后缀把它推断成 script（弱证据）
+        self.assertEqual(disguised.resourceType, "script")
+        self.assertTrue(disguised.resourceTypeInferred)
+        decision = classify_entry(disguised)
+        self.assertTrue(decision.keep, "F3：伪装成 .js 的 JSON 接口被误杀")
+        self.assertEqual(decision.reason, "api-over-static-extension")
+        self.assertIn("json-response", decision.signals)
+        self.assertIn("static-extension-overridden", decision.signals)
+        document = build_endpoints_document([disguised])
+        self.assertEqual(len(document["endpoints"]), 1)
+        self.assertEqual(document["filtered"], [])
+        endpoint = document["endpoints"][0]
+        self.assertEqual(endpoint["urlTemplate"], "https://api.example.com/v2/export/report.js")
+        self.assertIn("json-response", endpoint["rankReason"])
+        self.assertNotIn("static-included", endpoint["rankReason"])
+
+        # ---- 反例 1：真脚本，无 _resourceType（按后缀推断） ---------------
+        real_script = har_entry("https://cdn.example.com/assets/app.js", "application/javascript", "console.log(1)")
+        self.assertTrue(real_script.resourceTypeInferred)
+        script_decision = classify_entry(real_script)
+        self.assertFalse(script_decision.keep, "真脚本必须被过滤")
+        self.assertEqual(script_decision.reason, "static-resource-type:script")
+
+        # ---- 反例 2：抓包明确给出 _resourceType=script（强证据） ----------
+        explicit = har_entry("https://cdn.example.com/assets/vendor.js", "application/json", '{"a":1}', rtype="script")
+        self.assertFalse(explicit.resourceTypeInferred)
+        explicit_decision = classify_entry(explicit)
+        self.assertFalse(explicit_decision.keep, "显式 resourceType=script 即使返回 JSON 也必须过滤")
+        self.assertEqual(explicit_decision.reason, "static-resource-type:script")
+
+        # ---- 反例 3/4：其他静态资源不受影响 ------------------------------
+        for url, mime, expected in (
+            ("https://cdn.example.com/assets/theme.css", "text/css", "static-resource-type:stylesheet"),
+            ("https://cdn.example.com/assets/logo.png", "image/png", "static-resource-type:image"),
+        ):
+            with self.subTest(url=url):
+                asset = har_entry(url, mime, "x")
+                self.assertFalse(classify_entry(asset).keep)
+                self.assertEqual(classify_entry(asset).reason, expected)
+
+        # ---- 汇总：只有伪装接口留下来 ------------------------------------
+        document = build_endpoints_document([disguised, real_script, explicit])
+        self.assertEqual([item["urlTemplate"] for item in document["endpoints"]], [disguised.url])
+        self.assertEqual(
+            sorted(item["reason"] for item in document["filtered"]),
+            ["static-resource-type:script", "static-resource-type:script"],
+        )
+
+    def test_explicit_xhr_type_with_static_extension_is_kept(self):
+        """明确类型是 xhr/fetch 时，静态后缀本来就走例外（既有行为不变）。"""
+        entry = har_entry("https://api.example.com/v1/export.js", "application/json", "{}", rtype="xhr")
+        decision = classify_entry(entry)
+        self.assertTrue(decision.keep)
+        self.assertEqual(decision.reason, "api-over-static-extension")
+
+    def test_jsonl_style_records_without_type_keep_working(self):
+        """插件 JSONL 路径：没有资源类型、只有后缀的记录行为不变（后缀即弱证据）。"""
+        entry = Entry(
+            url="https://api.example.com/v1/export.js",
+            resourceType="",
+            responseMimeType="application/json",
+        )
+        decision = classify_entry(entry)
+        self.assertTrue(decision.keep)
+        self.assertEqual(decision.reason, "api-over-static-extension")
+        self.assertFalse(entry.resourceTypeInferred, "JSONL 路径不做后缀推断，provenance 保持默认")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from netdump.cli import main  # noqa: E402
 FIXTURES = os.path.join(ROOT, "fixtures")
 HAR_FIXTURE = os.path.join(FIXTURES, "sample.har")
 JSONL_FIXTURE = os.path.join(FIXTURES, "sample.jsonl")
+STATIC_EXT_JSON_FIXTURE = os.path.join(FIXTURES, "static-extension-json.har")
 
 COOKIE_VALUE = "session=abc123; csrf=zz9"
 TOKEN_VALUE = "Bearer eyJhbGciOiJIUzI1NiJ9.demo.signature"
@@ -255,6 +256,72 @@ class PipelineJsonlTest(unittest.TestCase):
         self.assertEqual(self.document["summary"]["endpoints"], 4)
         self.assertEqual(self.document["summary"]["filtered"], 1)
         self.assertEqual(self.document["filtered"][0]["reason"], "static-resource-type:image")
+
+
+class StaticExtensionJsonFixtureTest(unittest.TestCase):
+    """F3 端到端复现：fixtures/static-extension-json.har → endpoints.json + crawler.py。
+
+    fixture 里只有一条真业务接口（``.js`` 后缀但返回 ``application/json``，且没有
+    ``_resourceType``），其余 4 条是真正的静态资源；断言正反两面：
+    伪装接口进 endpoints 且进生成脚本，真脚本/样式/图片进 filtered。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.outdir = os.path.join(self.tmp.name, "out")
+        code = main(["build", STATIC_EXT_JSON_FIXTURE, "-o", self.outdir, "--quiet"])
+        self.assertEqual(code, 0)
+        self.document = json.loads(read_text(os.path.join(self.outdir, "endpoints.json")))
+        self.crawler_path = os.path.join(self.outdir, "crawler.py")
+        self.crawler_source = read_text(self.crawler_path)
+
+    def test_positive_disguised_api_survives_the_whole_pipeline(self):
+        self.assertEqual(self.document["source"]["format"], "har")
+        self.assertEqual(self.document["summary"]["totalEntries"], 5)
+        self.assertEqual(self.document["summary"]["endpoints"], 1)
+        self.assertEqual(self.document["summary"]["filtered"], 4)
+        endpoint = self.document["endpoints"][0]
+        self.assertEqual(endpoint["urlTemplate"], "https://api.example.com/v2/export/report.js")
+        self.assertEqual(endpoint["method"], "GET")
+        self.assertEqual(endpoint["resourceType"], "script", "resourceType 仍是后缀推断出来的 script")
+        self.assertIn("json-response", endpoint["rankReason"])
+        self.assertNotIn("static-included", endpoint["rankReason"])
+        self.assertIn("report.js", self.crawler_source)
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", self.crawler_path],
+            capture_output=True,
+            text=True,
+            cwd=self.outdir,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dry = subprocess.run(
+            [sys.executable, self.crawler_path, "--dry-run", "-o", os.path.join(self.tmp.name, "r.jsonl")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        plan = json.loads(dry.stdout)
+        self.assertEqual(plan["targets"], 1)
+        self.assertEqual(plan["targetsPreview"], ["GET https://api.example.com/v2/export/report.js"])
+
+    def test_negative_real_static_assets_stay_filtered(self):
+        filtered = {item["url"]: item["reason"] for item in self.document["filtered"]}
+        self.assertEqual(
+            filtered,
+            {
+                "https://cdn.example.com/assets/app.js": "static-resource-type:script",
+                # 抓包明确给出 _resourceType=script：即使响应是 JSON 也必须过滤
+                "https://cdn.example.com/assets/vendor.js": "static-resource-type:script",
+                "https://cdn.example.com/assets/theme.css": "static-resource-type:stylesheet",
+                "https://cdn.example.com/assets/logo.png": "static-resource-type:image",
+            },
+        )
+        self.assertNotIn("app.js", self.crawler_source)
+        self.assertNotIn("vendor.js", self.crawler_source)
+        self.assertNotIn("theme.css", self.crawler_source)
+        self.assertNotIn("logo.png", self.crawler_source)
 
 
 if __name__ == "__main__":

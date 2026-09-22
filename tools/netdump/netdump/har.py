@@ -162,6 +162,10 @@ class Entry:
     startedDateTime: str = ""
     error: str = ""
     source: str = ""
+    #: ``resourceType`` 是按 URL 后缀/mimeType 兜底推断出来的（抓包没有明确给出类型）。
+    #: 推断类型属于弱证据：当响应其实是 JSON 时，:mod:`netdump.classify` 允许用
+    #: ``api-over-static-extension`` 例外推翻它；抓包明确给出的类型永远是强证据。
+    resourceTypeInferred: bool = False
 
     # -- 便捷视图 ---------------------------------------------------------
     def header(self, name: str, default: str = "") -> str:
@@ -200,6 +204,7 @@ class Entry:
             "startedDateTime": self.startedDateTime,
             "error": self.error,
             "source": self.source,
+            "resourceTypeInferred": self.resourceTypeInferred,
         }
 
 
@@ -320,7 +325,12 @@ def _merge_header(target: Dict[str, str], name: str, value: str) -> None:
 
 
 def infer_resource_type(url: str, mime: str = "", explicit: str = "") -> str:
-    """在抓包没有给出资源类型时做兜底推断。"""
+    """在抓包没有给出资源类型时做兜底推断（后缀优先，其次 mimeType）。
+
+    推断出来的类型是**弱证据**：调用方应把 ``Entry.resourceTypeInferred`` 置为 True，
+    :mod:`netdump.classify` 会在响应确实是 JSON 时用 ``api-over-static-extension``
+    例外推翻「后缀像脚本」的推断，避免误杀伪装成静态文件的业务接口。
+    """
     if explicit:
         return str(explicit).lower()
     ext = os.path.splitext(url_path(url).lower())[1]
@@ -512,6 +522,7 @@ def entry_from_har(har_entry: Dict[str, Any]) -> Entry:
         resourceType=str(resource_type).lower()
         if resource_type
         else infer_resource_type(url, mime),
+        resourceTypeInferred=not bool(resource_type),
         durationMs=_coerce_float(har_entry.get("time"), 0.0),
         wsFrames=frames,
         responseBody=str(content.get("text") or ""),

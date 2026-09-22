@@ -15,6 +15,19 @@
 
 WebSocket（``ws`` / ``wss``）默认保留，但会被 :mod:`netdump.endpoints` 归到
 ``websockets`` 分组，而不是 HTTP 接口清单。
+
+**唯一例外（api-over-static-extension）**：当这条记录确实返回 JSON
+（``json-response`` 信号），而它的「静态」判定只来自
+
+* URL 后缀（``static-extension:.js``），或
+* :func:`netdump.har.infer_resource_type` 按后缀/mimeType 兜底推断出来的类型
+  （``Entry.resourceTypeInferred`` 为真，``static-resource-type:script``），
+
+则认为它是被静态后缀伪装的业务接口（例如 ``/v2/export/report.js`` 返回
+``application/json``），保留并标注 ``api-over-static-extension``。
+反之，抓包**明确给出**的类型（Chrome HAR 的 ``_resourceType``、CDP ``type``、
+插件 JSONL 的 ``resourceType``）是强证据：``resourceType=script`` 的脚本即使
+mimeType 写着 JSON 也仍然被过滤，静态资源过滤不会因此放宽。
 """
 
 from __future__ import annotations
@@ -221,26 +234,31 @@ def classify_entry(entry: Entry, options: Optional[ClassifyOptions] = None) -> D
     if scheme not in ("http", "https"):
         return Decision(entry=entry, keep=False, reason=f"unsupported-scheme:{scheme or 'none'}")
 
+    signals = api_signals(entry, options)
     static, static_reason = is_static_asset(entry, options)
     if static and not options.include_static:
-        # 静态扩展名（.js/.png/...）默认过滤；但如果这条记录确实返回 JSON，
-        # 说明它是被静态后缀伪装的业务接口（例如 /api/report.png 返回 JSON），
-        # 保留它并标注原因。资源类型层面的静态过滤是硬性的（bundle 就是 bundle）。
-        if static_reason.startswith("static-extension:"):
-            signals = api_signals(entry, options)
-            if "json-response" in signals:
-                return Decision(
-                    entry=entry,
-                    keep=True,
-                    reason="api-over-static-extension",
-                    signals=signals + ["static-extension-overridden"],
-                )
+        # 「静态」的判定可能来自两类证据：
+        #   (a) URL 后缀（static-extension:.js）
+        #   (b) 抓包没给类型，har.infer_resource_type 按后缀兜底推断出来的类型
+        #       （resourceTypeInferred=True，static-resource-type:script）
+        # 这两类都是弱证据；若响应确实是 JSON，说明它是被静态后缀伪装的业务接口，
+        # 保留并标注原因。抓包明确给出的类型（_resourceType / CDP type / JSONL
+        # resourceType）是强证据，仍然硬性过滤——bundle 就是 bundle。
+        weak_static = static_reason.startswith("static-extension:") or (
+            static_reason.startswith("static-resource-type:") and entry.resourceTypeInferred
+        )
+        if weak_static and "json-response" in signals:
+            return Decision(
+                entry=entry,
+                keep=True,
+                reason="api-over-static-extension",
+                signals=signals + ["static-extension-overridden"],
+            )
         return Decision(entry=entry, keep=False, reason=static_reason)
 
     if resource_type == "document" and not options.include_documents:
         return Decision(entry=entry, keep=False, reason="document-page")
 
-    signals = api_signals(entry, options)
     if not signals and not options.include_static:
         return Decision(entry=entry, keep=False, reason="no-api-signal")
     if not signals:
