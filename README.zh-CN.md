@@ -75,14 +75,14 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 | --- | --- | --- |
 | `backend` | `local` | radio：*本地 Playwright*（每次抓取一次性浏览器）/ *DSH 托管持久浏览器*（在 `user-data-dir` 上长期保留一个浏览器）/ *远端 CDP 地址*（你自己启动的浏览器），每个选项内嵌各自的填空。 |
 | `playwrightPath` | 空 | 本地与托管后端：`playwright` 可执行文件或 Chromium 系浏览器二进制路径；留空按 `$PATH` 查找，再回退到内置 `playwright-core`。 |
-| `headless` | `true` | 托管后端（以及本地后端与启动器）：浏览器是否无头运行。桌面环境下可取消勾选，手动登录一次。 |
+| `headless` | `true` | 作用于本插件启动的每个浏览器（本地与 DSH 托管）以及启动器的 `--headless=new`。桌面环境下可取消勾选，手动登录一次。CDP 后端下它只改变启动器命令（卡片预览会同步反映），可在命令行用 `--headful` 覆盖。 |
 | `userDataDir` | 空 | 托管后端：持久 profile 目录——登录态、cookie、扩展都在这里；留空 = `$DSH_HOME/web-fetch-playwright/profile`。**该目录属于凭据数据，插件永不清理。** |
-| `launchArgs` | 空 | 追加到本插件启动的每个浏览器（以及启动器命令）的额外 Chromium 参数，如 `--lang=zh-CN --disable-gpu`；按空格拆分，含空格的值请加引号。 |
+| `launchArgs` | 空 | 追加到本插件启动的每个浏览器以及启动器命令的额外 Chromium 参数，如 `--lang=zh-CN --disable-gpu`；按空格拆分，含空格的值请加引号。CDP 后端下只有启动器命令会带上它们，可在命令行用 `--launch-args` 覆盖。 |
 | `cdpEndpoint` | `127.0.0.1:9222` | 远端后端：`host:port`、`http(s)://…` 或 `ws(s)://…`。 |
 | `shareBrowserContext` | `true` | 仅 CDP 后端。**勾选（profile 模式）**：每次抓取是远端浏览器默认 context（真实 profile）里的一个标签页，cookie/localStorage 与之互通、已登录会话直接生效，抓取结束只关标签页；**取消勾选（隔离模式）**：每次抓取使用全新隐身式 context，互不共享。托管后端始终使用自己的持久 profile；本地后端忽略此字段。 |
 | `proxyServer` | 空 | 出站代理：`host:port` 或 `http(s)/socks4/socks5` 地址；留空 = 直连。**本地/托管**：注入所启动的浏览器；**CDP**：插件不生效（见[出站代理](#出站代理)），只用于生成启动器的 `--proxy-server`。 |
 | `proxyBypass` | 空 | 逗号分隔的绕过主机；回环地址（`127.0.0.1`、`localhost`、`::1`）始终并入；启动器会把它改写成 Chromium 的 `;` 分隔形式。 |
-| `proxyUsername` / `proxyPassword` | 空 | 代理凭据，以 `Proxy-Authorization` 发送；与其他设置一同保存，密码永远不会出现在错误信息里（卡片以掩码显示）。 |
+| `proxyUsername` / `proxyPassword` | 空 | 供**本插件自己启动的浏览器**（本地与 DSH 托管）以 `Proxy-Authorization` 发送的代理凭据；与其他设置一同保存，密码永远不会出现在错误信息里（卡片以掩码显示）。**CDP/启动器拓扑下不会下发**——Chromium 命令行无处承载，启动器会改为给出警告（见[两种拓扑](#两种拓扑可视浏览器--服务器无头)）。 |
 | `denoise` | `true` | 是否启用降噪；关闭时返回整页渲染 HTML，交由工具层转换。 |
 | `maxConcurrency` | *（自动）* | 同时渲染的页面上限（1–200）。留空按后端取默认：本地 **4**（每个槽位启动一个浏览器）/ CDP 与 DSH 托管后端 **50 个标签页**（浏览器已在运行，一个并发名额就是一个标签页）。超出的请求短暂排队；20s 内等不到空位则以 `WEB_FETCH_TIMEOUT` 尽快失败并提示重试或调大该值，而不是一直挂起直到工具层预算中止。 |
 | `challengeWaitMs` | `15000` | Cloudflare 挑战的**有界**自然等待上限（毫秒，0–60000），在同一标签页内等待浏览器自行通过验证。`0` 关闭整条挑战处理链路——直接返回首次响应（0.2.5 之前的旧行为）。 |
@@ -148,9 +148,14 @@ autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>
 # 3. 在插件宿主机：设置卡片 → 后端选「远端 CDP 地址」，cdpEndpoint 填 127.0.0.1:9222
 ```
 
-启动器即 `bin/launch-browser.mjs`，对外命令名 `dsh-web-fetch-launch`；它读取卡片写入的同一个 `web-fetch-playwright` 设置段（`$DSH_HOME/settings.yaml`），所以你在 UI 里配的代理、`headless`、`userDataDir`、`launchArgs` 就是它用的值。命令行参数优先于设置（`--proxy`、`--profile`、`--user-data-dir`、`--headless`/`--headful`、`--launch-args`、`--port`、`--address`、`--settings`），`--no-copy` 跳过 profile 复制，`--dry-run` 只打印。
+启动器即 `bin/launch-browser.mjs`，对外命令名 `dsh-web-fetch-launch`；它读取卡片写入的同一个 `web-fetch-playwright` 设置段（`$DSH_HOME/settings.yaml`），所以你在 UI 里配的代理、`headless`、`userDataDir`、`launchArgs` 就是它用的值。命令行参数优先于设置（`--proxy`、`--profile`、`--user-data-dir`、`--headless`/`--headful`、`--launch-args`、`--port`、`--settings`），`--no-copy` 跳过 profile 复制，`--force` 覆盖已存在的复制目标（不传时，若目标目录已存在会明确拒绝），`--dry-run` 只打印。
 
-profile 复制是**刻意不完整**的：`SingletonLock`/`SingletonCookie`/`SingletonSocket`（在运行浏览器的锁）、大缓存（`Cache`、`Code Cache`、`GPUCache`、`Service Worker`、`Media Cache`、各类 shader cache）与崩溃/遥测残留都会被排除；cookie、`Login Data`、`Local Storage`、`Preferences`、扩展会保留。目标目录上存在 `SingletonLock`（说明有浏览器正在用它）时会拒绝复制；目标已存在时除非显式要求，否则不会覆盖。在源码检出中使用需先 `pnpm build`（`bin/` 要 import 构建产物）；npm 安装包自带 `lib/`。
+两点必须在信任该浏览器之前知道：
+
+- **这里不会下发 `proxyUsername`/`proxyPassword`。** Chromium 命令行无处承载代理凭据，启动器也绝不会把它们拼进 `--proxy-server`——检测到设置卡片里填了它们时会打印明确警告。若代理要求鉴权，请在它前面放一跳免鉴权入口（`ssh -D 1080 user@host`，再用 `--proxy socks5://127.0.0.1:1080`，或在代理侧做 IP 白名单），或先以有头方式启动并手动应答一次鉴权。CDP 后端整体也是同一限制：对不是本插件启动的浏览器，插件既无法注入也无法校验代理。
+- **DevTools 端口只留在回环。** `--address` 只接受 `127.0.0.1`、`127.0.0.0/8` 其余地址、`::1`、`localhost`，其他值直接报错并说明原因（该端口等于浏览器的完全控制权 **加上** profile 里的登录凭据）。远程访问交给反向隧道。
+
+profile 复制是**刻意不完整**的：`SingletonLock`/`SingletonCookie`/`SingletonSocket`（在运行浏览器的锁）、大缓存（`Cache`、`Code Cache`、`GPUCache`、`Service Worker`、`Media Cache`、各类 shader cache）与崩溃/遥测残留都会被排除；cookie、`Login Data`、`Local Storage`、`Preferences`、扩展会保留。目标目录上存在 `SingletonLock`（说明有浏览器正在用它）时会拒绝复制；目标目录**已存在**时除非显式传 `--force`，否则一律拒绝——复制目标是真实 profile 数据的快照，静默合并进去从来不是本意。在源码检出中使用需先 `pnpm build`（`bin/` 要 import 构建产物）；npm 安装包自带 `lib/`。
 
 `autossh -R 9222:127.0.0.1:9222` 把远端端口绑到客户端回环——请保持这样（启动器已把 DevTools 绑在 `127.0.0.1`），并把该隧道视为「对你已登录浏览器的访问权限」。插件的安全立场不变：不做 SSRF 防护，因此能调用 `web_fetch` 的一方就能访问那个浏览器能访问的一切。
 

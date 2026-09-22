@@ -453,6 +453,15 @@ describe('PlaywrightCardController projection', () => {
 
     face.edit('headless', 'false')
     expect(store.getSnapshot().launcherCommand).not.toContain('--headless=new')
+
+    // headless/launchArgs are card-level (backend-independent) and the
+    // launcher preview reflects the drafts for EVERY backend, because the
+    // launcher command is what would actually run for the CDP topology.
+    face.edit('launchArgs', '--lang=zh-CN --disable-gpu')
+    expect(store.getSnapshot().launcherCommand).toContain('--lang=zh-CN')
+    expect(store.getSnapshot().launcherCommand).toContain('--disable-gpu')
+    face.edit('backend', 'cdp')
+    expect(store.getSnapshot().launcherCommand).toContain('--lang=zh-CN')
     expect(store.getSnapshot().dirty).toBe(true)
   })
 })

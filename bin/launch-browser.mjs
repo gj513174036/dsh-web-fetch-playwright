@@ -14,6 +14,11 @@
  *   node bin/launch-browser.mjs --dry-run
  *   node bin/launch-browser.mjs --profile "$HOME/.config/google-chrome"
  *   dsh-web-fetch-launch --headful --proxy http://127.0.0.1:7890
+ *
+ * Refusing to touch an existing copy target is the DEFAULT: pass `--force` to
+ * overwrite one. Proxy credentials from the settings card cannot ride a
+ * Chromium command line — the plan says so in its warnings, and the README
+ * documents the auth-free alternatives.
  */
 import { spawn } from 'node:child_process'
 
@@ -51,10 +56,11 @@ try {
 
 console.error(`settings: ${settingsFile} ${found ? '(read)' : '(not found — running on flags and defaults)'}`)
 for (const note of plan.notes) console.error(`  ${note}`)
+for (const warning of plan.warnings) console.error(`warning: ${warning}`)
 
 if (plan.copyProfile) {
   try {
-    const report = api.copyProfile(plan.profileSource, plan.userDataDir)
+    const report = api.copyProfile(plan.profileSource, plan.userDataDir, { force: flags.force === true })
     console.error(`profile copy: ${report.source} → ${report.destination} (locks, caches, and crash dumps excluded)`)
     if (report.sourceInUse) {
       console.error('warning: the source profile looks like it is in use (SingletonLock present) — the copy may be inconsistent; close that browser for a clean snapshot.')

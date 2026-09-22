@@ -1,12 +1,14 @@
 /**
  * The Playwright plugin-configuration card: backend radio group — `Local
- * Playwright` (path), `DSH-managed persistent browser` (headless,
- * user-data-dir, launch args), `Remote CDP endpoint` (endpoint, shared
- * context), each carrying its own inputs — the outbound-proxy fields (address,
+ * Playwright` (path), `DSH-managed persistent browser` (user-data-dir),
+ * `Remote CDP endpoint` (endpoint, shared context), each carrying its own
+ * inputs — then the BACKEND-INDEPENDENT controls: headless and extra browser
+ * arguments (they apply to every browser this plugin launches, and to the
+ * launcher's command for the CDP topology), the outbound-proxy fields (address,
  * bypass list, username, a masked password), the read-only launcher command
- * preview derived from those drafts, the denoise checkbox, and the numeric
- * limits, all staged and saved through the card form like the built-in plugin
- * cards.
+ * preview derived from those drafts, the P2 capture controls, the denoise
+ * checkbox, and the numeric limits — all staged and saved through the card form
+ * like the built-in plugin cards.
  *
  * The proxy fields sit at card level rather than under one backend option: a
  * proxy applies to every browser this plugin launches, and in CDP mode it
@@ -94,49 +96,20 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
             label: t('backendManaged'),
             hint: t('backendManagedHint'),
             content: (
-              <>
-                <CheckboxField
-                  embedded
-                  id="plugin-config-playwright-headless"
-                  label={t('headless')}
-                  hint={t('headlessHint')}
-                  checked={state.headless.text !== 'false'}
-                  overridden={state.headless.overridden}
-                  overriddenLabel={t('overridden')}
-                  resetLabel={t('reset')}
-                  disabled={disabled || backend !== 'managed'}
-                  onEdit={(text) => { props.edit('headless', text) }}
-                  onReset={() => { props.resetField('headless') }}
-                />
-                <ValueField
-                  embedded
-                  id="plugin-config-playwright-user-data-dir"
-                  label={t('userDataDir')}
-                  hint={t('userDataDirHint')}
-                  placeholder={t('userDataDirPlaceholder')}
-                  overriddenLabel={t('overridden')}
-                  resetLabel={t('reset')}
-                  invalidLabel={t('invalidText')}
-                  disabled={disabled || backend !== 'managed'}
-                  {...state.userDataDir}
-                  onEdit={(text) => { props.edit('userDataDir', text) }}
-                  onReset={() => { props.resetField('userDataDir') }}
-                />
-                <ValueField
-                  embedded
-                  id="plugin-config-playwright-launch-args"
-                  label={t('launchArgs')}
-                  hint={t('launchArgsHint')}
-                  placeholder={t('launchArgsPlaceholder')}
-                  overriddenLabel={t('overridden')}
-                  resetLabel={t('reset')}
-                  invalidLabel={t('invalidText')}
-                  disabled={disabled || backend !== 'managed'}
-                  {...state.launchArgs}
-                  onEdit={(text) => { props.edit('launchArgs', text) }}
-                  onReset={() => { props.resetField('launchArgs') }}
-                />
-              </>
+              <ValueField
+                embedded
+                id="plugin-config-playwright-user-data-dir"
+                label={t('userDataDir')}
+                hint={t('userDataDirHint')}
+                placeholder={t('userDataDirPlaceholder')}
+                overriddenLabel={t('overridden')}
+                resetLabel={t('reset')}
+                invalidLabel={t('invalidText')}
+                disabled={disabled || backend !== 'managed'}
+                {...state.userDataDir}
+                onEdit={(text) => { props.edit('userDataDir', text) }}
+                onReset={() => { props.resetField('userDataDir') }}
+              />
             ),
           },
           {
@@ -183,6 +156,31 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         disabled={disabled}
         onEdit={(text) => { props.edit('backend', text) }}
         onReset={() => { props.resetField('backend') }}
+      />
+      <CheckboxField
+        id="plugin-config-playwright-headless"
+        label={t('headless')}
+        hint={t('headlessHint')}
+        checked={state.headless.text !== 'false'}
+        overridden={state.headless.overridden}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        disabled={disabled}
+        onEdit={(text) => { props.edit('headless', text) }}
+        onReset={() => { props.resetField('headless') }}
+      />
+      <ValueField
+        id="plugin-config-playwright-launch-args"
+        label={t('launchArgs')}
+        hint={t('launchArgsHint')}
+        placeholder={t('launchArgsPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.launchArgs}
+        onEdit={(text) => { props.edit('launchArgs', text) }}
+        onReset={() => { props.resetField('launchArgs') }}
       />
       <ValueField
         id="plugin-config-playwright-proxy-server"

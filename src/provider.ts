@@ -132,13 +132,30 @@ const CDP_PROXY_NOTE = 'a proxy is a launch-time property of that browser: it mu
  * the CDP error messages — rather than enforced. A browser started without the
  * flag simply egresses directly; that footgun is documented, not policed.
  *
- * `'refuse'` would be the pre-P1 alternative (every CDP fetch fails with
- * {@link WEB_FETCH_PROXY_CODE} until the field is cleared); switching to it
- * means changing this constant AND restoring the refusal branch in
- * {@link PlaywrightFetchProvider.openSession} — nothing else in the provider,
- * the launcher, the card, or the docs is structured around either choice.
+ * `'refuse'` is the pre-P1 alternative: every fetch over CDP fails with
+ * {@link WEB_FETCH_PROXY_CODE} until the field is cleared. It is implemented —
+ * {@link cdpProxyRefusal} enforces whatever this constant says — so flipping it
+ * is genuinely a one-line change, and the tests assert the BEHAVIOR (a proxied
+ * CDP fetch runs) rather than the constant's literal value.
  */
 export const CDP_PROXY_POLICY: 'hint-only' | 'refuse' = 'hint-only'
+
+/**
+ * Enforce {@link CDP_PROXY_POLICY} for one fetch: `undefined` when the fetch
+ * may proceed, or the refusal to throw. With the shipped `'hint-only'` policy
+ * this is always `undefined`, and the CDP path explains the relationship
+ * ({@link CDP_PROXY_NOTE}) instead of blocking it.
+ *
+ * @param proxy - the resolved proxy option, if the settings configure one.
+ * @returns the error to throw, or undefined when the fetch may run.
+ */
+function cdpProxyRefusal(proxy: PlaywrightProxyOption | undefined): WebError | undefined {
+  if (proxy === undefined || CDP_PROXY_POLICY !== 'refuse') return undefined
+  return new WebError(
+    `the proxy ${redactProxyServer(proxy.server)} from the web-fetch-playwright settings cannot be applied to the CDP backend: ${CDP_PROXY_NOTE}. Start that browser with --proxy-server=${redactProxyServer(proxy.server)} yourself, or clear the proxyServer setting to fetch through CDP without one.`,
+    WEB_FETCH_PROXY_CODE,
+  )
+}
 
 /** Maximum accepted request URL length (http-provider parity). */
 const MAX_URL_LENGTH = 2048
@@ -574,6 +591,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // explanation in the CDP messages below.
     const proxy = resolveProxyOption(config)
     if (config.backend === 'cdp') {
+      // The single policy decision point (CDP_PROXY_POLICY): with the shipped
+      // policy this yields nothing and the fetch runs; a `refuse` policy would
+      // stop here with WEB_FETCH_PROXY.
+      const refusal = cdpProxyRefusal(proxy)
+      if (refusal !== undefined) throw refusal
       const endpoint = normalizeCdpEndpoint(config.cdpEndpoint)
       const { source } = await resolveCdpBackend()
       try {

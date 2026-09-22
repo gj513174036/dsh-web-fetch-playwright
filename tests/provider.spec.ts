@@ -17,7 +17,7 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import type { ResolvedConfig } from '../src/config.ts'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import type { ResolvedPlaywright } from '../src/playwright-resolve.ts'
-import { CDP_PROXY_POLICY, PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE, WEB_FETCH_PROXY_CODE } from '../src/provider.ts'
+import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE, WEB_FETCH_PROXY_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
 import type { CdpSession, PlaywrightBrowser, PlaywrightChromium, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightResponse } from '../src/types.ts'
 
@@ -1144,10 +1144,10 @@ describe('PlaywrightFetchProvider outbound proxy', () => {
   })
 
   it('does NOT enforce a configured proxy on the CDP backend: the fetch runs', async () => {
-    // The semantics is hint-only (CDP_PROXY_POLICY): a proxy belongs to the
-    // browser process that was started elsewhere, so the settings value drives
-    // the launcher command/card preview and the explanation — never a refusal.
-    expect(CDP_PROXY_POLICY).toBe('hint-only')
+    // Asserted BEHAVIORALLY, not by reading the policy constant: a proxy
+    // belongs to the browser process that was started elsewhere, so the
+    // settings value drives the launcher command/card preview and the
+    // explanation — and a proxied CDP fetch must complete like any other.
     const { state, pool } = fakeCdpConnection()
     const provider = new PlaywrightFetchProvider(() => resolvedConfig({
       backend: 'cdp',
@@ -1156,9 +1156,19 @@ describe('PlaywrightFetchProvider outbound proxy', () => {
       proxyBypass: '*.corp',
     }), pool)
     const result = await provider.fetch({ url: 'https://example.com/docs' })
-    expect(result.statusCode).toBe(200)
+    expect(result.statusCode).toBe(200) // not refused, not WEB_FETCH_PROXY
     expect(state.connects).toBe(1)
     expect(state.pagesClosed).toBe(1)
+
+    // A proxied CDP fetch never produces WEB_FETCH_PROXY, while an unusable
+    // proxy VALUE still does (the two paths the code can actually observe).
+    const unusable = new PlaywrightFetchProvider(() => resolvedConfig({
+      backend: 'cdp',
+      cdpEndpoint: '127.0.0.1:9222',
+      proxyServer: 'ftp://proxy.corp:21',
+    }), fakeCdpConnection().pool)
+    const error = await failureOf(unusable.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe(WEB_FETCH_PROXY_CODE)
   })
 
   it('names the --proxy-server remedy in a CDP connect failure', async () => {

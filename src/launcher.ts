@@ -84,6 +84,58 @@ export const PROFILE_COPY_EXCLUDES = [
   'OptimizationGuidePredictionModels',
 ] as const
 
+/** Undo YAML's double-quoted escapes (the ones a settings writer emits). */
+function unescapeDoubleQuoted(value: string): string {
+  let out = ''
+  for (let index = 0; index < value.length; index++) {
+    const char = value.charAt(index)
+    if (char !== '\\') {
+      out += char
+      continue
+    }
+    const next = value.charAt(index + 1)
+    if (next === '') {
+      out += char
+      continue
+    }
+    index++
+    if (next === 'n') out += '\n'
+    else if (next === 't') out += '\t'
+    else if (next === 'r') out += '\r'
+    else out += next // \\, \", and anything else stands for itself
+  }
+  return out
+}
+
+/**
+ * Strip `user:pass@` userinfo out of a string before it is echoed back to the
+ * user (an argv token, an error message). Anything without that shape is
+ * returned unchanged.
+ *
+ * @param text - the text about to be printed.
+ * @returns the same text with any `//user:pass@` reduced to `//`.
+ */
+export function scrubCredentials(text: string): string {
+  return text.replace(/\/\/[^\s/@]*@/g, '//')
+}
+
+/**
+ * Whether an address is a loopback one. The launcher refuses anything else for
+ * `--address`: the DevTools port is full control of the browser AND the
+ * credentials in its profile, so it is only ever safe on the machine itself
+ * (the intended remote path is a loopback-bound reverse tunnel).
+ *
+ * @param address - the candidate bind address.
+ * @returns true for `127.0.0.1`, the rest of `127.0.0.0/8`, `::1`, `localhost`.
+ */
+export function isLoopbackAddress(address: string): boolean {
+  const value = address.trim().toLowerCase()
+  if (value === 'localhost' || value === '::1' || value === '[::1]') return true
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value)
+  if (match === null) return false
+  return Number(match[1]) === 127
+}
+
 /** Prefixes excluded regardless of suffix (`SingletonLock`, `SingletonCookie`, …). */
 const PROFILE_COPY_EXCLUDED_PREFIXES = ['Singleton'] as const
 
@@ -115,6 +167,12 @@ export function resolveSettingsPath(env: NodeJS.ProcessEnv = process.env): strin
  * top-level key. Nested maps inside the section are not modeled (this plugin
  * has none) and are skipped.
  *
+ * A DOUBLE-quoted value is unescaped the way YAML spells the handful of
+ * characters that must be escaped (`\\`, `\"`, `\n`, `\t`, `\r`); a
+ * single-quoted value is taken literally (YAML semantics). That matters for a
+ * proxy password containing a backslash or a quote: without it the launcher
+ * would dial a different password than the plugin does.
+ *
  * @param text - the settings file contents.
  * @param namespace - the section to read (defaults to this plugin's).
  * @returns the section's key/value pairs, all as strings.
@@ -136,7 +194,11 @@ export function parseSettingsSection(text: string, namespace: string = LAUNCHER_
     const key = match[1] ?? ''
     const raw = (match[2] ?? '').trim()
     let value = raw
-    if (raw.length >= 2 && ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'")))) {
+    if (raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"')) {
+      // Double-quoted: undo the escapes a YAML writer emits, so a password
+      // with a quote/backslash/tab survives the round trip.
+      value = unescapeDoubleQuoted(raw.slice(1, -1))
+    } else if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) {
       value = raw.slice(1, -1)
     } else {
       value = raw.replace(/\s+#.*$/, '').trim()
@@ -175,6 +237,12 @@ export interface LauncherFlags {
   dryRun: boolean
   /** `--no-copy`: use `--user-data-dir` as-is, without copying a profile. */
   copyProfile: boolean
+  /**
+   * `--force`: overwrite an EXISTING copy target. Without it, a re-run into a
+   * directory that already exists is refused — the target is a snapshot of
+   * real profile data, and silently merging into it is never what was meant.
+   */
+  force: boolean
   /** `--browser <path>`: the Chromium-family executable to run. */
   browser?: string
   /** `--profile <dir>`: the REAL profile to copy from. */
@@ -210,6 +278,7 @@ export function launcherUsage(): string {
     '  --profile <dir>           real profile to copy (default: the OS Chrome profile)',
     '  --user-data-dir <dir>     profile the browser opens (the copy target)',
     '  --no-copy                 do not copy a profile; use --user-data-dir as-is',
+    '  --force                   overwrite an existing copy target (refused by default)',
     '  --proxy <server>          proxy server (default: the settings card value)',
     '  --proxy-bypass <list>     comma-separated bypass list',
     '  --launch-args <string>    extra browser arguments (shell-style quoting)',
@@ -218,6 +287,15 @@ export function launcherUsage(): string {
     `  --address <ip>            DevTools bind address (default ${LAUNCHER_CDP_ADDRESS})`,
     '  --settings <file>         alternative settings.yaml',
     '  --help                    this text',
+    '',
+    'Notes:',
+    `  --address only accepts a loopback value (${LAUNCHER_CDP_ADDRESS}, ::1, localhost):`,
+    '  the DevTools port is full control of the browser AND the credentials in its',
+    '  profile, so it is never bound anywhere else.',
+    '  Proxy credentials from the settings card are NOT sent: a Chromium command',
+    '  line cannot carry them. Use an auth-free local proxy instead (e.g.',
+    '  `ssh -D 1080 user@host` with --proxy socks5://127.0.0.1:1080), or answer the',
+    '  authentication once in a headful browser.',
     '',
     'The plugin then attaches over the tunnel endpoint (see the README):',
     `  ${TUNNEL_HINT}`,
@@ -233,7 +311,7 @@ export function launcherUsage(): string {
  * @throws {Error} on an unknown flag, a missing value, or a bad number.
  */
 export function parseLauncherArgs(argv: readonly string[]): LauncherFlags {
-  const flags: LauncherFlags = { help: false, dryRun: false, copyProfile: true }
+  const flags: LauncherFlags = { help: false, dryRun: false, copyProfile: true, force: false }
   const nextValue = (index: number, flag: string): string => {
     const value = argv[index + 1]
     if (value === undefined || value.startsWith('--')) throw new Error(`${flag} needs a value\n\n${launcherUsage()}`)
@@ -248,6 +326,7 @@ export function parseLauncherArgs(argv: readonly string[]): LauncherFlags {
       case '--help': case '-h': flags.help = true; break
       case '--dry-run': flags.dryRun = true; break
       case '--no-copy': flags.copyProfile = false; break
+      case '--force': flags.force = true; break
       case '--headless': flags.headless = true; break
       case '--headful': case '--no-headless': flags.headless = false; break
       case '--browser': flags.browser = take(); break
@@ -260,12 +339,15 @@ export function parseLauncherArgs(argv: readonly string[]): LauncherFlags {
       case '--address': flags.address = take(); break
       case '--port': {
         const value = take()
-        if (!/^\d+$/.test(value)) throw new Error(`--port needs a port number, got "${value}"\n\n${launcherUsage()}`)
+        if (!/^\d+$/.test(value)) throw new Error(`--port needs a port number, got "${scrubCredentials(value)}"\n\n${launcherUsage()}`)
         flags.port = Number(value)
         break
       }
       default:
-        throw new Error(`unknown option ${flag}\n\n${launcherUsage()}`)
+        // The flag itself may carry a proxy address WITH credentials (a
+        // typo'd `--proxyy=http://user:pass@host:1080` is the obvious case):
+        // never echo them back into a terminal or a log.
+        throw new Error(`unknown option ${scrubCredentials(flag)}\n\n${launcherUsage()}`)
     }
     if (inline === null && /^--(browser|profile|user-data-dir|proxy|proxy-bypass|launch-args|settings|address|port)$/.test(name)) index++
   }
@@ -364,6 +446,12 @@ export interface LauncherPlan {
   command: string
   /** One line per resolved decision, for `--dry-run` output. */
   notes: string[]
+  /**
+   * Things the user must know BEFORE trusting this launch — printed by the
+   * CLI as `warning:` lines. Currently: settings that silently cannot reach
+   * the launched browser.
+   */
+  warnings: string[]
 }
 
 /**
@@ -383,6 +471,7 @@ export function planLauncher(
   env: NodeJS.ProcessEnv = process.env,
 ): LauncherPlan {
   const notes: string[] = []
+  const warnings: string[] = []
   /** Flag wins over the settings section; both absent = undefined (default). */
   const pick = (flagValue: string | undefined, settingKey: string, label: string): string | undefined => {
     if (flagValue !== undefined && flagValue !== '') {
@@ -414,6 +503,30 @@ export function planLauncher(
   const proxyServer = proxyRaw === undefined ? undefined : normalizeProxyServer(proxyRaw)
   const proxyBypass = pick(flags.proxyBypass, 'proxyBypass', 'proxy-bypass')
   const launchArgs = pick(flags.launchArgs, 'launchArgs', 'launch-args')
+
+  // The DevTools port is full control of the browser AND the credentials in
+  // its profile: never bind it off-loopback. The supported remote path is a
+  // loopback-bound reverse tunnel (see the README), so this is a hard refusal
+  // rather than a warning.
+  if (flags.address !== undefined && !isLoopbackAddress(flags.address)) {
+    throw new Error(
+      `--address ${flags.address} is not a loopback address: the DevTools port grants full control of this browser and access to the logins in its profile, so binding it to a network interface would expose both. `
+      + `Use the default ${LAUNCHER_CDP_ADDRESS} and reach it over a reverse tunnel (${TUNNEL_HINT}).`,
+    )
+  }
+
+  // A Chromium command line has no place to put proxy credentials, so the
+  // settings' username/password cannot reach the launched browser — say so
+  // instead of letting the user believe authentication is configured.
+  const proxyUsername = (settings.proxyUsername ?? '').trim()
+  const proxyPassword = settings.proxyPassword ?? ''
+  if (proxyServer !== undefined && (proxyUsername !== '' || proxyPassword !== '')) {
+    warnings.push(
+      'proxyUsername/proxyPassword are set in the settings card but are NOT sent to the browser: a Chromium command line cannot carry proxy credentials. '
+      + 'If the proxy requires authentication, use an auth-free local hop instead (e.g. `ssh -D 1080 user@host` with --proxy socks5://127.0.0.1:1080, or an IP allowlist on the proxy), '
+      + 'or answer the authentication once in a headful browser.',
+    )
+  }
 
   const copyProfile = flags.copyProfile
   const configuredDir = settings.userDataDir
@@ -455,6 +568,7 @@ export function planLauncher(
     args,
     userDataDir,
     headless,
+    warnings,
     ...(profileSource === undefined ? {} : { profileSource }),
     copyProfile: copyProfile && profileSource !== undefined,
     endpoint: `${address}:${String(port)}`,
@@ -505,10 +619,12 @@ export interface ProfileCopyReport {
  *
  * @param source - the live profile directory to copy from.
  * @param destination - the directory to create/populate.
- * @param options - `force: false` refuses to overwrite an existing destination.
+ * @param options - the copy must be asked for: an existing destination is
+ *   refused unless `force: true` (the destination is a snapshot of real profile
+ *   data, and silently merging into it is never what was meant).
  * @returns the copy report.
  * @throws {Error} when the destination is in use, when it already exists and
- *   `force` is false, or when any filesystem step fails.
+ *   `force` is not true, or when any filesystem step fails.
  */
 export function copyProfile(source: string, destination: string, options: { force?: boolean } = {}): ProfileCopyReport {
   try {
@@ -519,8 +635,8 @@ export function copyProfile(source: string, destination: string, options: { forc
   if (isProfileInUse(destination)) {
     throw new Error(`the target profile ${destination} is in use: a browser is running on it (SingletonLock is present). Close that browser, pick another --user-data-dir, or delete the directory.`)
   }
-  if (options.force === false && existsSync(destination)) {
-    throw new Error(`the target profile ${destination} already exists; remove it or pass --force to overwrite it`)
+  if (options.force !== true && existsSync(destination)) {
+    throw new Error(`the target profile ${destination} already exists; pass --force to overwrite it (or --user-data-dir to copy somewhere else)`)
   }
   const sourceInUse = isProfileInUse(source)
   try {

@@ -188,7 +188,12 @@ export interface CdpLaunchInput {
   launchArgs?: string
   /** Overridden only by tests/tools; the docs and tunnel example pin 9222. */
   port?: number
-  /** Overridden only by tests/tools; loopback is the shipped default. */
+  /**
+   * The DevTools bind address. Loopback by default, and the LAUNCHER only
+   * accepts a loopback value (127.0.0.1 / ::1 / localhost) — an explicit
+   * override would otherwise expose full control of the browser and the
+   * credentials in its profile. Tools/tests may pass anything else.
+   */
   address?: string
 }
 

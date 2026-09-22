@@ -7,11 +7,12 @@
  * Filesystem-touching cases run in a throwaway temp directory; nothing here
  * launches a browser.
  */
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildCdpLaunchArgs, LAUNCHER_CDP_ADDRESS, LAUNCHER_CDP_PORT, mergeProxyBypass, parseLaunchArgs, renderCommand } from '../src/launch-args.ts'
+import type { LauncherFlags } from '../src/launcher.ts'
 import {
   copyProfile,
   defaultProfileCandidates,
@@ -23,8 +24,10 @@ import {
   planLauncher,
   PROFILE_COPY_EXCLUDES,
   profileCopyExcluded,
+  isLoopbackAddress,
   readSettingsSection,
   resolveSettingsPath,
+  scrubCredentials,
 } from '../src/launcher.ts'
 import { launcherPreview } from '../src/client/command.ts'
 
@@ -238,6 +241,11 @@ describe('defaultProfileCandidates', () => {
   })
 })
 
+/** The launcher flags a test starts from (everything off/default). */
+function flags(over: Partial<LauncherFlags> = {}): LauncherFlags {
+  return { help: false, dryRun: false, copyProfile: true, force: false, ...over }
+}
+
 describe('planLauncher', () => {
   let dir: string
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'dsh-launcher-plan-')) })
@@ -257,7 +265,7 @@ describe('planLauncher', () => {
   it('turns the settings card into the launcher command', () => {
     const { env, browser, profile } = envWithBrowser()
     const plan = planLauncher(
-      { help: false, dryRun: true, copyProfile: true, profile },
+      flags({ dryRun: true, profile }),
       {
         headless: 'false',
         userDataDir: join(dir, 'copy'),
@@ -288,7 +296,7 @@ describe('planLauncher', () => {
   it('lets a flag win over the settings card', () => {
     const { env, profile } = envWithBrowser()
     const plan = planLauncher(
-      { help: false, dryRun: true, copyProfile: true, profile, proxyServer: 'socks5://127.0.0.1:1080', headless: true, userDataDir: join(dir, 'flag-copy') },
+      flags({ dryRun: true, profile, proxyServer: 'socks5://127.0.0.1:1080', headless: true, userDataDir: join(dir, 'flag-copy') }),
       { headless: 'false', userDataDir: join(dir, 'setting-copy'), proxyServer: 'http://127.0.0.1:7890' },
       env,
     )
@@ -300,7 +308,7 @@ describe('planLauncher', () => {
 
   it('defaults the copy target under $DSH_HOME and skips the copy without a source profile', () => {
     const { env } = envWithBrowser()
-    const plan = planLauncher({ help: false, dryRun: true, copyProfile: true }, { headless: 'true' }, env)
+    const plan = planLauncher(flags({ dryRun: true }), { headless: 'true' }, env)
     expect(plan.userDataDir).toBe(join(dir, 'dsh', 'chrome-dsh-profile'))
     expect(plan.copyProfile).toBe(false)
     expect(plan.args).toContain('--headless=new')
@@ -309,7 +317,7 @@ describe('planLauncher', () => {
 
   it('honours --no-copy: the profile directory is used as-is', () => {
     const { env } = envWithBrowser()
-    const plan = planLauncher({ help: false, dryRun: true, copyProfile: false, userDataDir: join(dir, 'keep') }, {}, env)
+    const plan = planLauncher(flags({ dryRun: true, copyProfile: false, userDataDir: join(dir, 'keep') }), {}, env)
     expect(plan.copyProfile).toBe(false)
     expect(plan.profileSource).toBeUndefined()
     expect(plan.userDataDir).toBe(join(dir, 'keep'))
@@ -318,11 +326,11 @@ describe('planLauncher', () => {
 
   it('fails readably when no browser exists and when the proxy value is unusable', () => {
     const empty = { PATH: join(dir, 'nothing'), DSH_HOME: dir }
-    expect(() => planLauncher({ help: false, dryRun: true, copyProfile: false }, {}, empty))
+    expect(() => planLauncher(flags({ dryRun: true, copyProfile: false }), {}, empty))
       .toThrow(/no Chromium-family browser found/)
 
     const { env } = envWithBrowser()
-    expect(() => planLauncher({ help: false, dryRun: true, copyProfile: false, proxyServer: 'ftp://proxy:21' }, {}, env))
+    expect(() => planLauncher(flags({ dryRun: true, copyProfile: false, proxyServer: 'ftp://proxy:21' }), {}, env))
       .toThrow(/scheme/i)
   })
 })
@@ -338,6 +346,7 @@ describe('parseLauncherArgs', () => {
       help: false,
       dryRun: true,
       copyProfile: true,
+      force: false,
       headless: true,
       browser: '/usr/bin/chromium',
       profile: '/real',
@@ -423,8 +432,12 @@ describe('profile copy', () => {
     const dest = join(root, 'existing')
     makeProfile(source)
     mkdirSync(dest)
-    expect(() => copyProfile(source, dest, { force: false })).toThrow(/already exists/)
-    expect(() => copyProfile(source, dest)).not.toThrow()
+    // Refusing is the DEFAULT: a copy target is a snapshot of real profile
+    // data, and silently merging into it is never what was meant.
+    expect(() => copyProfile(source, dest)).toThrow(/already exists; pass --force/)
+    expect(() => copyProfile(source, dest, { force: false })).toThrow(/already exists; pass --force/)
+    expect(() => copyProfile(source, dest, { force: true })).not.toThrow()
+    expect(existsSync(join(dest, 'Default', 'Cookies'))).toBe(true)
   })
 
   it('reports a source that is not a directory', () => {
@@ -464,5 +477,162 @@ describe('the card preview and the launcher agree', () => {
     expect(preview).toContain('--user-data-dir=<user-data-dir>')
     expect(preview).toContain('--headless=new')
     expect(preview).not.toContain('--proxy-server')
+  })
+})
+
+/** The launcher's CLI contract: argv → planLauncher → copyProfile → spawn. */
+describe('launcher CLI contract', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-launcher-cli-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  /** A miniature real profile plus the fake browser the CLI would run. */
+  function makeEnv(): { settingsFile: string; profile: string; browser: string; userDataDir: string } {
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    const browser = join(bin, 'google-chrome')
+    writeFileSync(browser, '#!/bin/sh\n')
+    const profile = join(root, 'real-profile')
+    mkdirSync(join(profile, 'Default'), { recursive: true })
+    writeFileSync(join(profile, 'Default', 'Cookies'), 'cookie-db')
+    writeFileSync(join(profile, 'Default', 'Preferences'), '{}')
+    mkdirSync(join(profile, 'Default', 'Cache'), { recursive: true })
+    const settingsFile = join(root, 'settings.yaml')
+    writeFileSync(settingsFile, 'web-fetch-playwright:\n  backend: cdp\n  headless: false\n')
+    return { settingsFile, profile, browser, userDataDir: join(root, 'copy') }
+  }
+
+  /**
+   * The exact path `bin/launch-browser.mjs` takes (it is argv → parse → read
+   * settings → planLauncher → copyProfile), so the CLI's wiring is what is
+   * under test — not just the functions it calls.
+   */
+  function runCli(argv: string[], env: NodeJS.ProcessEnv): { plan: ReturnType<typeof planLauncher>; report?: ReturnType<typeof copyProfile> } {
+    const parsed = parseLauncherArgs(argv)
+    const { settings } = readSettingsSection(parsed.settingsFile ?? join(root, 'settings.yaml'))
+    const plan = planLauncher(parsed, settings, env)
+    const source = plan.profileSource
+    const report = plan.copyProfile && source !== undefined
+      ? copyProfile(source, plan.userDataDir, { force: parsed.force === true })
+      : undefined
+    return { plan, report }
+  }
+
+  it('(a) refuses an existing target without --force and leaves it untouched', () => {
+    const { settingsFile, profile, browser, userDataDir } = makeEnv()
+    const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
+    // First run populates the copy target.
+    const first = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
+    expect(first.report?.destination).toBe(userDataDir)
+    const marker = join(userDataDir, 'Default', 'Cookies')
+    expect(readFileSync(marker, 'utf8')).toBe('cookie-db')
+
+    // A second run must refuse, and must not touch what is already there.
+    writeFileSync(marker, 'edited-by-hand')
+    expect(() => runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env))
+      .toThrow(/already exists; pass --force/)
+    expect(readFileSync(marker, 'utf8')).toBe('edited-by-hand')
+  })
+
+  it('(b) overwrites the existing target with --force', () => {
+    const { settingsFile, profile, browser, userDataDir } = makeEnv()
+    const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
+    runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
+    const marker = join(userDataDir, 'Default', 'Cookies')
+    writeFileSync(marker, 'edited-by-hand')
+
+    const forced = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--force'], env)
+    expect(forced.report?.destination).toBe(userDataDir)
+    expect(readFileSync(marker, 'utf8')).toBe('cookie-db') // re-copied
+    expect(parseLauncherArgs(['--force']).force).toBe(true)
+    expect(launcherUsage()).toContain('--force')
+  })
+
+  it('passes the settings section through the same path the CLI uses', () => {
+    const { settingsFile, profile, browser, userDataDir } = makeEnv()
+    const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
+    const { plan } = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
+    expect(plan.headless).toBe(false) // from the settings section
+    expect(plan.args).toContain('--user-data-dir=' + userDataDir)
+    expect(plan.args).not.toContain('--headless=new')
+    expect(plan.warnings).toEqual([])
+  })
+
+  it('warns that proxy credentials cannot ride the command line', () => {
+    const { settingsFile, profile, browser, userDataDir } = makeEnv()
+    writeFileSync(settingsFile, [
+      'web-fetch-playwright:',
+      '  proxyServer: http://127.0.0.1:7890',
+      '  proxyUsername: proxyuser',
+      '  proxyPassword: "p@ss word"',
+      '',
+    ].join('\n'))
+    const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
+    const { plan } = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
+    expect(plan.args).toContain('--proxy-server=http://127.0.0.1:7890')
+    expect(plan.warnings.join('\n')).toContain('proxyUsername/proxyPassword are set')
+    expect(plan.warnings.join('\n')).toContain('NOT sent to the browser')
+    // The credentials never reach the command line.
+    expect(plan.command).not.toContain('proxyuser')
+    expect(plan.command).not.toContain('p@ss word')
+
+    // No credentials configured → no warning.
+    writeFileSync(settingsFile, 'web-fetch-playwright:\n  proxyServer: http://127.0.0.1:7890\n')
+    // --force: the target already exists from the run above.
+    expect(runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--force'], env).plan.warnings).toEqual([])
+  })
+
+  it('refuses a non-loopback --address and accepts the loopback spellings', () => {
+    const { settingsFile, profile, browser, userDataDir } = makeEnv()
+    const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
+    const base = ['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile]
+    expect(() => runCli([...base, '--address', '0.0.0.0'], env)).toThrow(/not a loopback address/)
+    expect(() => runCli([...base, '--address', '192.168.1.10'], env)).toThrow(/full control of this browser/)
+    for (const address of ['127.0.0.1', '127.0.0.5', '::1', 'localhost']) {
+      // --no-copy: these cases only assert the generated flags.
+      expect(runCli([...base, '--address', address, '--no-copy'], env).plan.args, address)
+        .toContain(`--remote-debugging-address=${address}`)
+    }
+    expect(isLoopbackAddress('127.0.0.1')).toBe(true)
+    expect(isLoopbackAddress('127.9.9.9')).toBe(true)
+    expect(isLoopbackAddress('10.0.0.1')).toBe(false)
+  })
+
+  it('never echoes credentials from argv in an error message', () => {
+    // A typo'd flag that carries a credentialed proxy URL is the realistic leak.
+    const argv = ['--proxyy=http://user:sup3r-secret@proxy.corp:1080']
+    let message = ''
+    try {
+      parseLauncherArgs(argv)
+    } catch (error: unknown) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+    expect(message).toContain('unknown option')
+    expect(message).not.toContain('sup3r-secret')
+    expect(message).not.toContain('user:')
+    expect(scrubCredentials('--x=http://u:p@h:1 trailing')).toBe('--x=http://h:1 trailing')
+
+    let portMessage = ''
+    try {
+      parseLauncherArgs(['--port', 'http://u:p@h:1'])
+    } catch (error: unknown) {
+      portMessage = error instanceof Error ? error.message : String(error)
+    }
+    expect(portMessage).toContain('--port needs a port number')
+    expect(portMessage).not.toContain('p@h')
+  })
+
+  it('decodes a double-quoted settings value (escapes), leaving single quotes literal', () => {
+    // String.raw keeps the settings text byte-for-byte: the `\\`, `\"` and
+    // `\t` below are the two-character escapes a YAML writer emits.
+    const settings = parseSettingsSection(String.raw`
+web-fetch-playwright:
+  proxyPassword: "a\\b \"quoted\" tab\tend"
+  proxyUsername: 'raw\nnot-decoded'
+`)
+    // Double-quoted: `\\` → `\`, `\"` → `"`, `\t` → TAB.
+    expect(settings.proxyPassword).toBe(String.raw`a\b "quoted" tab` + '\t' + 'end')
+    // Single-quoted: taken literally (YAML semantics) — no decoding at all.
+    expect(settings.proxyUsername).toBe(String.raw`raw\nnot-decoded`)
   })
 })
