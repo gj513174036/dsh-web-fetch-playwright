@@ -58,7 +58,7 @@ class FakeScope implements SettingsScope<Record<string, unknown>> {
   }
 }
 
-/** The card's field set: backend radio, nine text inputs, three checkboxes, two numbers. */
+/** The card's field set: backend radio, eleven text inputs, six checkboxes, three numbers. */
 function makeForm(scope: SettingsScope<Record<string, unknown>>) {
   return new CardForm(scope, [
     radioField('backend', ['local', 'cdp', 'managed']),
@@ -74,6 +74,11 @@ function makeForm(scope: SettingsScope<Record<string, unknown>>) {
     checkboxField('headless'),
     textField('userDataDir'),
     textField('launchArgs'),
+    checkboxField('recordNetwork'),
+    textField('recordDir'),
+    checkboxField('captureBodies'),
+    numberField('maxBodyBytes', 0, 16 * 1024 * 1024),
+    checkboxField('recordAllResources'),
   ])
 }
 
@@ -424,6 +429,17 @@ describe('PlaywrightCardController projection', () => {
     expect(state.launcherCommand).not.toContain('--headless=new')
   })
 
+  it('projects the capture fields and keeps the recording switch independent of the launcher preview', () => {
+    const face = controllerFor({ recordNetwork: true, recordDir: '/data/dumps', maxBodyBytes: 4096 }).inject()
+    const state = face.hooks.playwrightCard.getSnapshot()
+    expect(state.recordNetwork.text).toBe('true')
+    expect(state.recordDir.text).toBe('/data/dumps')
+    expect(state.maxBodyBytes.text).toBe('4096')
+    expect(state.captureBodies.text).toBe('') // absent = the schema default (bodies on)
+    // Capture settings never leak into the launcher command preview.
+    expect(state.launcherCommand).not.toContain('/data/dumps')
+  })
+
   it('re-derives and republishes the preview as the user types', () => {
     const face = controllerFor({}).inject()
     const store = face.hooks.playwrightCard
@@ -438,5 +454,69 @@ describe('PlaywrightCardController projection', () => {
     face.edit('headless', 'false')
     expect(store.getSnapshot().launcherCommand).not.toContain('--headless=new')
     expect(store.getSnapshot().dirty).toBe(true)
+  })
+})
+
+/** The P2 capture fields: opt-in switch, path, body capture, byte cap. */
+describe('CardForm capture fields', () => {
+  it('seeds the capture fields, with recording off and bodies on by default', () => {
+    const form = makeForm(new FakeScope({}))
+    expect(form.field('recordNetwork').text).toBe('') // absent = schema default (off)
+    expect(form.field('recordDir').text).toBe('')
+    expect(form.field('captureBodies').text).toBe('')
+    expect(form.field('maxBodyBytes').text).toBe('')
+    expect(form.field('recordAllResources').text).toBe('')
+    expect(form.shell().dirty).toBe(false)
+  })
+
+  it('stages and saves every capture field', async () => {
+    const scope = new FakeScope({})
+    const form = makeForm(scope)
+    form.actions().edit('recordNetwork', 'true')
+    form.actions().edit('recordDir', '/data/dumps')
+    form.actions().edit('captureBodies', 'false')
+    form.actions().edit('maxBodyBytes', '65536')
+    form.actions().edit('recordAllResources', 'true')
+    form.actions().edit('proxyServer', '127.0.0.1:7890')
+    expect(form.shell()).toMatchObject({ dirty: true, invalid: false })
+    await form.save()
+    expect(scope.writes).toEqual([
+      { field: 'recordNetwork', op: 'set', value: true },
+      { field: 'recordDir', op: 'set', value: '/data/dumps' },
+      { field: 'captureBodies', op: 'set', value: false },
+      { field: 'maxBodyBytes', op: 'set', value: 65536 },
+      { field: 'recordAllResources', op: 'set', value: true },
+      { field: 'proxyServer', op: 'set', value: '127.0.0.1:7890' },
+    ])
+    expect(form.field('recordNetwork').overridden).toBe(true)
+  })
+
+  it('accepts 0 as the body cap (metadata only) and blocks out-of-range drafts', () => {
+    const form = makeForm(new FakeScope({}))
+    form.actions().edit('maxBodyBytes', '0')
+    expect(form.field('maxBodyBytes').invalid).toBe(false)
+    form.actions().edit('maxBodyBytes', String(16 * 1024 * 1024 + 1))
+    expect(form.field('maxBodyBytes').invalid).toBe(true)
+    expect(form.shell().invalid).toBe(true)
+    form.actions().edit('maxBodyBytes', 'lots')
+    expect(form.field('maxBodyBytes').invalid).toBe(true)
+    form.actions().discard()
+  })
+
+  it('resetField clears a saved capture switch and path', async () => {
+    const scope = new FakeScope(
+      { recordNetwork: true, recordDir: '/data/dumps' },
+      { recordNetwork: true, recordDir: '/data/dumps' },
+      {},
+    )
+    const form = makeForm(scope)
+    form.actions().resetField('recordNetwork')
+    form.actions().resetField('recordDir')
+    await form.save()
+    expect(scope.writes).toEqual([
+      { field: 'recordNetwork', op: 'unset' },
+      { field: 'recordDir', op: 'unset' },
+    ])
+    expect(form.field('recordNetwork').overridden).toBe(false)
   })
 })

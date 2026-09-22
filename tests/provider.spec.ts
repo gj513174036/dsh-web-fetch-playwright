@@ -9,14 +9,17 @@
  * aborts) — and the outbound proxy: launch-option injection, the
  * WEB_FETCH_PROXY mapping, password redaction, and the CDP refusal.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { ResolvedConfig } from '../src/config.ts'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import type { ResolvedPlaywright } from '../src/playwright-resolve.ts'
 import { CDP_PROXY_POLICY, PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE, WEB_FETCH_PROXY_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
-import type { PlaywrightBrowser, PlaywrightChromium, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightResponse } from '../src/types.ts'
+import type { CdpSession, PlaywrightBrowser, PlaywrightChromium, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightResponse } from '../src/types.ts'
 
 /**
  * Controllable seam over the LOCAL backend resolution. With no hook installed
@@ -79,6 +82,64 @@ function fakePersistentContext(spec: FakePageSpec = {}): { handle: PlaywrightPer
   return { handle, state }
 }
 
+/** One event a fake CDP session replays once the Network domain is enabled. */
+interface FakeCdpEvent {
+  event: string
+  params: Record<string, unknown>
+}
+
+/** What a fake CDP session does, per test. */
+interface FakeCaptureScript {
+  /** Events replayed right after `Network.enable` (the tab's own traffic). */
+  events?: FakeCdpEvent[]
+  /** `Network.getResponseBody` answers, keyed by requestId. */
+  bodies?: Record<string, { body: string; base64Encoded?: boolean }>
+  /** Make `Network.enable` reject (a backend without the domain). */
+  failEnable?: boolean
+  /** Make `newCDPSession` reject (no session on this page/context). */
+  sessionError?: Error
+}
+
+/** A fake CDP session: records commands, replays a scripted event stream. */
+class FakeCdpSession implements CdpSession {
+  readonly sent: Array<{ method: string; params: Record<string, unknown> | undefined }> = []
+  private readonly listeners = new Map<string, Array<(params: Record<string, unknown>) => void>>()
+
+  constructor(private readonly script: FakeCaptureScript = {}) {}
+
+  async send(method: string, params?: Record<string, unknown>): Promise<unknown> {
+    this.sent.push({ method, params })
+    if (method === 'Network.enable') {
+      if (this.script.failEnable === true) throw new Error('Network domain is not available')
+      for (const step of this.script.events ?? []) this.emit(step.event, step.params)
+      return {}
+    }
+    if (method === 'Network.getResponseBody') {
+      const requestId = String(params?.['requestId'] ?? '')
+      const body = this.script.bodies?.[requestId]
+      if (body === undefined) throw new Error(`No resource with given identifier found (${requestId})`)
+      return { body: body.body, base64Encoded: body.base64Encoded === true }
+    }
+    return {}
+  }
+
+  on(event: string, listener: (params: Record<string, unknown>) => void): unknown {
+    const list = this.listeners.get(event) ?? []
+    list.push(listener)
+    this.listeners.set(event, list)
+    return undefined
+  }
+
+  private emit(event: string, params: Record<string, unknown>): void {
+    for (const listener of [...(this.listeners.get(event) ?? [])]) listener(params)
+  }
+
+  /** The protocol commands this session received, by method name. */
+  methods(): string[] {
+    return this.sent.map(entry => entry.method)
+  }
+}
+
 /** What a fake backend recorded, for assertions. */
 interface FakeBackend {
   /** `launch` option objects, in call order (the per-fetch local backend). */
@@ -87,6 +148,8 @@ interface FakeBackend {
   persistentLaunches: Array<{ userDataDir: string; options: Parameters<PlaywrightChromium['launchPersistentContext']>[1] }>
   /** The persistent contexts those calls produced (one per launch). */
   persistentContexts: Array<{ handle: PlaywrightPersistentContext; state: FakePersistentState }>
+  /** CDP sessions the backends handed out (the P2 capture seam). */
+  cdpSessions: FakeCdpSession[]
 }
 
 /**
@@ -95,18 +158,25 @@ interface FakeBackend {
  * observable) and the failure switches make it reject the way a real
  * browser/proxy failure would.
  */
-function installFakeLocalBackend(behavior: { failLaunch?: Error; failPersistentLaunch?: Error } = {}): FakeBackend {
-  const record: FakeBackend = { launches: [], persistentLaunches: [], persistentContexts: [] }
+function installFakeLocalBackend(behavior: { failLaunch?: Error; failPersistentLaunch?: Error; capture?: FakeCaptureScript; page?: FakePageSpec } = {}): FakeBackend {
+  const record: FakeBackend = { launches: [], persistentLaunches: [], persistentContexts: [], cdpSessions: [] }
+  const cdpSession = async (): Promise<CdpSession> => {
+    if (behavior.capture?.sessionError !== undefined) throw behavior.capture.sessionError
+    const session = new FakeCdpSession(behavior.capture ?? {})
+    record.cdpSessions.push(session)
+    return session
+  }
   const chromium: PlaywrightChromium = {
     launch: async (options) => {
       record.launches.push(options)
       if (behavior.failLaunch !== undefined) throw behavior.failLaunch
       const pageState: FakePageState = { pageClosed: false, gotos: 0 }
-      const page = makeFakePage({}, pageState)
+      const page = makeFakePage(behavior.page ?? {}, pageState)
       const context: PlaywrightContext = {
         newPage: async () => page,
         route: async () => {},
         close: async () => {},
+        newCDPSession: cdpSession,
       }
       return { newContext: async () => context, close: async () => {} }
     },
@@ -395,7 +465,7 @@ class GatedProvider extends PlaywrightFetchProvider {
  * tracked for assertions. The default context records (and tests assert it
  * never receives) a close.
  */
-function fakeCdpConnection(spec: FakePageSpec = {}) {
+function fakeCdpConnection(spec: FakePageSpec = {}, capture: FakeCaptureScript = {}) {
   const state = {
     connects: 0,
     isolatedContextsOpened: 0,
@@ -410,6 +480,8 @@ function fakeCdpConnection(spec: FakePageSpec = {}) {
     browserClosed: false,
     /** Popup listeners the guard registered on the leased pages. */
     popupListeners: [] as Array<(page: PlaywrightPage) => void>,
+    /** CDP sessions the P2 capture opened on leased tabs. */
+    cdpSessions: [] as FakeCdpSession[],
   }
   const makePage = (): PlaywrightPage => {
     state.pagesOpened++
@@ -425,6 +497,12 @@ function fakeCdpConnection(spec: FakePageSpec = {}) {
       },
     }
   }
+  const cdpSession = async (): Promise<CdpSession> => {
+    if (capture.sessionError !== undefined) throw capture.sessionError
+    const session = new FakeCdpSession(capture)
+    state.cdpSessions.push(session)
+    return session
+  }
   const defaultContext: PlaywrightContext = {
     newPage: async () => {
       state.defaultPagesOpened++
@@ -432,6 +510,7 @@ function fakeCdpConnection(spec: FakePageSpec = {}) {
     },
     route: async () => {},
     close: async () => { state.defaultContextClosed++ },
+    newCDPSession: cdpSession,
   }
   const browser: PlaywrightBrowser = {
     newContext: async () => {
@@ -440,6 +519,7 @@ function fakeCdpConnection(spec: FakePageSpec = {}) {
         newPage: async () => makePage(),
         route: async () => {},
         close: async () => { state.isolatedContextsClosed++ },
+        newCDPSession: cdpSession,
       }
       return context
     },
@@ -1259,5 +1339,250 @@ describe('PlaywrightFetchProvider managed backend', () => {
     await new PlaywrightFetchProvider(() => resolvedConfig()).fetch({ url: 'https://example.com/docs' })
     expect(bare.launches[0]?.headless).toBe(true)
     expect(bare.launches[0]).not.toHaveProperty('args')
+  })
+})
+
+/** The P2 capture wiring: one CDP session per fetch, JSONL + HAR on disk. */
+describe('PlaywrightFetchProvider network capture', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-capture-')) })
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true })
+    localBackendHook.current = undefined
+  })
+
+  /** The scripted traffic a fake tab produces once Network is enabled. */
+  function captureScript(body = '{"token":"tok-123"}'): FakeCaptureScript {
+    return {
+      events: [
+        {
+          event: 'Network.requestWillBeSent',
+          params: {
+            requestId: '1',
+            type: 'XHR',
+            request: {
+              url: 'https://api.example.com/v1/login',
+              method: 'POST',
+              headers: { 'content-type': 'application/json', cookie: 'session=abc123', authorization: 'Bearer tok-123' },
+              postData: '{"user":"u","pw":"p"}',
+            },
+          },
+        },
+        {
+          event: 'Network.responseReceived',
+          params: {
+            requestId: '1',
+            type: 'XHR',
+            response: { status: 200, statusText: 'OK', mimeType: 'application/json', headers: { 'set-cookie': 'sid=xyz; Path=/' } },
+          },
+        },
+        { event: 'Network.loadingFinished', params: { requestId: '1', encodedDataLength: body.length } },
+        { event: 'Network.webSocketCreated', params: { requestId: 'ws1', url: 'wss://stream.example.com/socket' } },
+        { event: 'Network.webSocketFrameReceived', params: { requestId: 'ws1', response: { opcode: 1, payloadData: '{"price":42}' } } },
+        { event: 'Network.webSocketClosed', params: { requestId: 'ws1' } },
+      ],
+      bodies: { '1': { body } },
+    }
+  }
+
+  /** The capture directories a test produced, in name (≈ time) order. */
+  function captureDirs(): string[] {
+    return existsSync(root) ? readdirSync(root).sort() : []
+  }
+
+  /** Poll until the capture session directory exists (attach is async). */
+  async function waitForCaptureDir(): Promise<string> {
+    for (let attempt = 0; attempt < 400; attempt++) {
+      const dirs = captureDirs()
+      if (dirs.length > 0) return join(root, dirs[0] ?? '')
+      await new Promise(resolve => { setTimeout(resolve, 5) })
+    }
+    throw new Error('the capture session directory never appeared')
+  }
+
+  function readJsonl(dir: string): Array<Record<string, unknown>> {
+    return readFileSync(join(dir, 'network.jsonl'), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+  }
+
+  function readHar(dir: string): { log: { version: string; creator: { name: string }; entries: Array<Record<string, unknown>> } } {
+    return JSON.parse(readFileSync(join(dir, 'har.json'), 'utf8')) as { log: { version: string; creator: { name: string }; entries: Array<Record<string, unknown>> } }
+  }
+
+  it('opens one CDP session on the fetch tab and writes JSONL + HAR under <recordDir>/<session>', async () => {
+    const backend = installFakeLocalBackend({ capture: captureScript() })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      recordNetwork: true,
+      recordDir: root,
+      captureBodies: true,
+      maxBodyBytes: 1024,
+    }))
+
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+    expect(backend.cdpSessions).toHaveLength(1) // one session, on the fetch's own tab
+    expect(backend.cdpSessions[0]?.methods()).toContain('Network.enable')
+    expect(backend.cdpSessions[0]?.methods()).toContain('Network.getResponseBody')
+
+    const dirs = captureDirs()
+    expect(dirs).toHaveLength(1)
+    const dir = join(root, dirs[0] ?? '')
+    const lines = readJsonl(dir)
+    expect(lines[0]).toMatchObject({ kind: 'session', fetchUrl: 'https://example.com/docs' })
+    expect(lines[0]).not.toHaveProperty('url')
+    // The body-carrying `responseBody` line is appended after its async
+    // getResponseBody, so the order among kinds is not guaranteed — only the
+    // header-first invariant and the set of events are.
+    expect([...lines.map(line => line['kind'])].sort()).toEqual([
+      'finished', 'request', 'response', 'responseBody', 'session', 'websocketClosed', 'websocketCreated', 'websocketFrame',
+    ])
+    // Credentials are stored verbatim, on purpose.
+    expect((lines[1]?.['headers'] as Record<string, string>)['cookie']).toBe('session=abc123')
+
+    const har = readHar(dir)
+    expect(har.log.version).toBe('1.2')
+    expect(har.log.creator.name).toBe('dsh-web-fetch-playwright')
+    expect(har.log.entries).toHaveLength(2)
+    const http = har.log.entries.find(entry => entry['_resourceType'] === 'XHR')
+    expect(http).toMatchObject({ request: { method: 'POST', url: 'https://api.example.com/v1/login' }, response: { status: 200 } })
+    const socket = har.log.entries.find(entry => entry['_resourceType'] === 'WebSocket')
+    expect(socket?.['_webSocketMessages']).toEqual([{ type: 'receive', time: expect.any(Number), opcode: 1, data: '{"price":42}' }])
+  })
+
+  it('bounds the captured body with maxBodyBytes and flags the cut', async () => {
+    const backend = installFakeLocalBackend({ capture: captureScript('x'.repeat(500)) })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root, maxBodyBytes: 32 }))
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(backend.cdpSessions).toHaveLength(1)
+
+    const dir = join(root, captureDirs()[0] ?? '')
+    const bodyLine = readJsonl(dir).find(line => line['kind'] === 'responseBody')
+    expect(bodyLine).toMatchObject({ base64Encoded: false, bodyTruncated: true, bodyBytes: 500 })
+    expect(String(bodyLine?.['body']).length).toBe(32)
+    const http = readHar(dir).log.entries.find(entry => entry['_resourceType'] === 'XHR') as
+      | { response: { content: { text?: string; size: number } } }
+      | undefined
+    expect(http?.response.content.text).toBe('x'.repeat(32))
+    expect(http?.response.content.size).toBe(500)
+  })
+
+  it('keeps recording metadata when captureBodies is off', async () => {
+    const backend = installFakeLocalBackend({ capture: captureScript() })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root, captureBodies: false }))
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(backend.cdpSessions[0]?.methods()).not.toContain('Network.getResponseBody')
+
+    const dir = join(root, captureDirs()[0] ?? '')
+    expect(readJsonl(dir).some(line => line['kind'] === 'responseBody')).toBe(false)
+    expect(readHar(dir).log.entries.some(entry => entry['_resourceType'] === 'XHR')).toBe(true)
+  })
+
+  it('exports the HAR when the fetch itself throws', async () => {
+    const backend = installFakeLocalBackend({
+      capture: captureScript(),
+      page: { gotoError: new Error('net::ERR_CONNECTION_REFUSED') },
+    })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+    const error = await provider.fetch({ url: 'https://example.com/down' }).then(
+      () => { throw new Error('expected the fetch to reject') },
+      (thrown: unknown) => thrown as WebError,
+    )
+    expect(error).toBeInstanceOf(WebError)
+    expect(backend.cdpSessions).toHaveLength(1)
+
+    const dir = join(root, captureDirs()[0] ?? '')
+    expect(existsSync(join(dir, 'har.json'))).toBe(true)
+    expect(readHar(dir).log.entries).toHaveLength(2) // the scripted XHR + WebSocket
+    expect(readJsonl(dir).some(line => line['kind'] === 'finished')).toBe(true)
+  })
+
+  it('exports the HAR when the fetch is aborted mid-capture', async () => {
+    const backend = installFakeLocalBackend({ capture: captureScript(), page: { hangGoto: true } })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+    const controller = new AbortController()
+    const pending = provider.fetch({ url: 'https://example.com/aborted' }, controller.signal)
+      .then(() => { throw new Error('expected the fetch to reject') }, (thrown: unknown) => thrown as WebError)
+    const dir = await waitForCaptureDir() // the recorder is attached; goto hangs
+    expect(backend.cdpSessions).toHaveLength(1)
+    controller.abort()
+
+    const error = await pending
+    expect(error.code).toBe('WEB_ABORTED')
+    expect(existsSync(join(dir, 'har.json'))).toBe(true)
+    expect(readJsonl(dir)[0]).toMatchObject({ kind: 'session', fetchUrl: 'https://example.com/aborted' })
+  })
+
+  it('does nothing at all when recordNetwork is off (the default)', async () => {
+    const backend = installFakeLocalBackend({ capture: captureScript() })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig())
+    await provider.fetch({ url: 'https://example.com/docs' })
+    expect(backend.cdpSessions).toHaveLength(0)
+    expect(captureDirs()).toHaveLength(0)
+  })
+
+  it('never fails a fetch when the capture cannot start', async () => {
+    const backend = installFakeLocalBackend({ capture: { sessionError: new Error('no CDP on this page') } })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+    expect(backend.cdpSessions).toHaveLength(0)
+    expect(captureDirs()).toHaveLength(0)
+
+    // A session whose Network domain refuses still records nothing fatal.
+    const broken = installFakeLocalBackend({ capture: { failEnable: true, events: captureScript().events } })
+    const brokenProvider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+    expect((await brokenProvider.fetch({ url: 'https://example.com/docs' })).statusCode).toBe(200)
+    expect(broken.cdpSessions).toHaveLength(1)
+    expect(captureDirs()).toHaveLength(1)
+  })
+
+  it('records the CDP backend too (a session on the leased remote tab)', async () => {
+    const { state, pool } = fakeCdpConnection({}, captureScript())
+    const provider = new PlaywrightFetchProvider(
+      () => resolvedConfig({ backend: 'cdp', cdpEndpoint: '127.0.0.1:9222', recordNetwork: true, recordDir: root }),
+      pool,
+    )
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+    // One session on the tab this fetch leased — the shared connection and the
+    // remote default context are untouched by recording.
+    expect(state.cdpSessions).toHaveLength(1)
+    expect(state.defaultContextClosed).toBe(0)
+
+    const dir = join(root, captureDirs()[0] ?? '')
+    expect(readHar(dir).log.entries.some(entry => entry['_resourceType'] === 'XHR')).toBe(true)
+    await provider.dispose()
+    expect(state.browserClosed).toBe(true) // teardown still only disconnects
+  })
+
+  it('relaunches the capture directory per fetch (one session each)', async () => {
+    installFakeLocalBackend({ capture: captureScript() })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+    await provider.fetch({ url: 'https://example.com/a' })
+    await provider.fetch({ url: 'https://example.com/b' })
+    const dirs = captureDirs()
+    expect(dirs).toHaveLength(2)
+    // Session ids carry a random suffix, so two captures in the same
+    // millisecond may order either way: compare the set.
+    const urls = dirs.map(dir => readJsonl(join(root, dir))[0]?.['fetchUrl'])
+    expect([...urls].sort()).toEqual(['https://example.com/a', 'https://example.com/b'])
+  })
+
+  it('flushes an in-flight capture on plugin teardown (dispose)', async () => {
+    const backend = installFakeLocalBackend({ page: { hangGoto: true } })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+    const controller = new AbortController()
+    // The page never settles: the fetch is still running when the plugin unloads.
+    const pending = provider.fetch({ url: 'https://example.com/slow' }, controller.signal)
+      .then(() => undefined, (error: unknown) => error)
+    const dir = await waitForCaptureDir()
+    expect(backend.cdpSessions).toHaveLength(1)
+
+    // Unload while the capture is still running: dispose flushes it.
+    await provider.dispose()
+    expect(existsSync(join(dir, 'har.json'))).toBe(true)
+    expect(readJsonl(dir)[0]).toMatchObject({ kind: 'session', fetchUrl: 'https://example.com/slow' })
+
+    controller.abort()
+    expect(await pending).toBeInstanceOf(WebError)
   })
 })

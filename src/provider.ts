@@ -47,6 +47,15 @@
  * surfaces as {@link WEB_FETCH_PROXY_CODE}, naming the proxy address and where
  * it came from — and never the password.
  *
+ * Network capture (P2): with `recordNetwork` on, every fetch opens ONE CDP
+ * session on the tab it just created and records that tab's XHR/Fetch/
+ * WebSocket traffic — nothing else; other tabs of a shared browser are never
+ * observed (no `Target.setAutoAttach`). The recorder appends JSONL events as
+ * they arrive and writes a HAR 1.2 export when the fetch ends, on every path
+ * (success, thrown error, abort, and plugin teardown through
+ * {@link PlaywrightFetchProvider.dispose}). All of it is best-effort: a CDP or
+ * filesystem failure is swallowed and can never fail a fetch.
+ *
  * Cloudflare challenges (issue #2): when a navigation lands on a challenge
  * interstitial, the fetch waits — on the SAME page and in the SAME browser
  * context, so the browser's natural verification and any clearance cookies
@@ -66,8 +75,9 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
 import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 import type { ChallengeVerdict } from './challenge.ts'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveHeadless, effectiveMaxConcurrency, managedLaunchFor, managedLaunchKey, normalizeCdpEndpoint, proxyOptionFor, redactProxyServer } from './config.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, captureOptionsFor, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveHeadless, effectiveMaxConcurrency, managedLaunchFor, managedLaunchKey, normalizeCdpEndpoint, proxyOptionFor, redactProxyServer } from './config.ts'
 import type { ManagedLaunch, ProxySettings, ResolvedConfig } from './config.ts'
+import { NetworkRecorder, newCaptureSessionId } from './recorder.ts'
 import { BrowserPool } from './browser-pool.ts'
 import type { BrowserPoolOptions } from './browser-pool.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
@@ -175,6 +185,13 @@ export interface BrowserSession {
   sharedBrowser?: boolean
   /** True when `context` is the remote default context — close only the page. */
   persistent?: boolean
+  /**
+   * The P2 capture session riding this fetch's tab, when recording is on and
+   * the backend could provide a CDP session. Its JSONL is already being
+   * appended to while the fetch runs; {@link closeSession} finishes it (flush
+   * + HAR export) on every exit path.
+   */
+  recorder?: NetworkRecorder
 }
 
 /**
@@ -405,6 +422,13 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   protected readonly managedPool: BrowserPool<ManagedLaunch, PlaywrightPersistentContext>
 
   /**
+   * Capture sessions that may still be running, so plugin teardown can flush
+   * them (the `ctx.effect` in `index.ts` calls {@link dispose}). Finished ones
+   * are pruned on the next recorded fetch and cleared by `dispose`.
+   */
+  private readonly activeRecorders = new Set<NetworkRecorder>()
+
+  /**
    * @param configSource - thunk returning the currently authoritative config.
    * @param cdpPool - optional pool over the CDP backend (tests inject fakes).
    * @param managedPool - optional pool over the managed persistent backend.
@@ -433,6 +457,10 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    * close them when they finish.
    */
   async dispose(): Promise<void> {
+    // Plugins unload while fetches may still be in flight: flush their
+    // captures (JSONL + HAR) before dropping the browsers those fetches use.
+    await Promise.all([...this.activeRecorders].map(async (recorder) => { await recorder.finish() }))
+    this.activeRecorders.clear()
     await this.cdpPool.dispose()
     await this.managedPool.dispose()
   }
@@ -451,13 +479,19 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       this.semaphore.resize(effectiveMaxConcurrency(config))
       await this.semaphore.acquire(deadline.signal, QUEUE_TIMEOUT_MS)
       acquired = true
-      session = await this.openSession(config, deadline)
+      session = await this.openSession(config, deadline, url.toString())
       // An aborted deadline must also interrupt Playwright's own waits:
       // closing the page rejects every pending operation on it (and, for
       // fetch-owned contexts, the context close that follows takes the rest).
       const held = session
       const onAbort = () => { void closeSession(held) }
       deadline.signal.addEventListener('abort', onAbort, { once: true })
+      // An abort that landed WHILE the session was opening never fires the
+      // listener just added (an already-aborted signal does not re-notify), so
+      // the fetch would sit in its first navigation until the deadline. Close
+      // the session now: the navigation rejects immediately, the recorder
+      // flushes, and the fetch reports WEB_ABORTED.
+      if (deadline.signal.aborted) onAbort()
       try {
         return await this.retrieve(session, url, config, deadline)
       } finally {
@@ -482,7 +516,56 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    * @param deadline - the fetch budget, applied to launch/connect timeouts.
    * @returns the browser session the fetch will use.
    */
-  protected async openSession(config: ResolvedConfig, deadline: Deadline): Promise<BrowserSession> {
+  protected async openSession(config: ResolvedConfig, deadline: Deadline, fetchUrl = ''): Promise<BrowserSession> {
+    const session = await this.openBackendSession(config, deadline)
+    return await this.withRecorder(config, session, fetchUrl)
+  }
+
+  /**
+   * Attach the P2 capture session to a fresh tab, best-effort in both
+   * directions: a backend without `newCDPSession` (or with recording off)
+   * simply returns the session unchanged, and any failure to open or start the
+   * capture is swallowed — recording never fails a fetch.
+   */
+  private async withRecorder(config: ResolvedConfig, session: BrowserSession, fetchUrl: string): Promise<BrowserSession> {
+    const plan = captureOptionsFor(config, newCaptureSessionId())
+    if (!plan.enabled) return session
+    // Drop captures that already ended (their fetch released them): the set
+    // then holds at most the ones live since the previous recorded fetch.
+    for (const finished of this.activeRecorders) {
+      if (finished.done) this.activeRecorders.delete(finished)
+    }
+    const openCdp = session.context.newCDPSession?.bind(session.context)
+    if (openCdp === undefined) return session
+    try {
+      const cdp = await openCdp(session.page)
+      const recorder = await NetworkRecorder.create({
+        session: cdp,
+        dir: plan.dir,
+        url: fetchUrl,
+        backend: config.backend ?? 'local',
+        captureBodies: plan.captureBodies,
+        maxBodyBytes: plan.maxBodyBytes,
+        recordAllResources: plan.recordAllResources,
+      })
+      if (recorder === undefined) return session
+      this.activeRecorders.add(recorder)
+      return { ...session, recorder }
+    } catch {
+      // Best-effort by contract: the fetch proceeds unrecorded.
+      return session
+    }
+  }
+
+  /**
+   * Open the configured backend and its per-fetch page. Split out so the
+   * test suite can substitute a fake browser, and so the recorder can wrap
+   * whatever a backend produced.
+   * @param config - the resolved settings section.
+   * @param deadline - the fetch budget, applied to launch/connect timeouts.
+   * @returns the browser session the fetch will use.
+   */
+  private async openBackendSession(config: ResolvedConfig, deadline: Deadline): Promise<BrowserSession> {
     const timeout = Math.min(deadline.remainingMs(), 20_000)
     // Proxy settings are validated before any launch/connect: an unusable
     // value deserves its own diagnosis rather than being reported as a
@@ -843,6 +926,11 @@ function capResult(url: string, statusCode: number, body: { kind: 'html' | 'text
  */
 async function closeSession(session: BrowserSession | undefined): Promise<void> {
   if (session === undefined) return
+  // Finish the capture BEFORE the page goes away: the JSONL is already
+  // flushed, this writes the HAR while the tab can still answer for a body
+  // that is mid-flight. `finish()` is idempotent, so the abort listener and
+  // the fetch's own finally may both call it safely.
+  if (session.recorder !== undefined) await session.recorder.finish()
   await closeWithGrace(session.page)
   if (session.persistent !== true) await closeWithGrace(session.context)
   if (session.sharedBrowser !== true) await closeWithGrace(session.browser)

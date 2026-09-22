@@ -3,13 +3,14 @@
  * schema the loader validates the row against, the settings namespace's
  * resolved shape, and the small pure normalizers the provider applies per
  * fetch (CDP endpoint shaping, outbound-proxy shaping, the DSH-managed
- * backend's launch plan) — kept network-free for unit tests.
+ * backend's launch plan, the network recorder's dump location) — kept
+ * network-free for unit tests.
  *
  * @module dsh-web-fetch-playwright/config
  */
 
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { mergeProxyBypass, normalizeProxyServer, parseLaunchArgs } from './launch-args.ts'
 import type { PlaywrightProxyOption } from './types.ts'
@@ -65,6 +66,20 @@ export const DEFAULT_CHALLENGE_RETRIES = 1
 
 /** Ceiling the schema accepts for `challengeRetries`. */
 export const MAX_CHALLENGE_RETRIES = 3
+
+/**
+ * Directory name the capture dumps live under when `recordDir` is blank:
+ * `<working directory>/net-dumps/<sessionId>`. `net-dumps/` is in this
+ * repository's `.gitignore` — the dumps carry plaintext credentials — so the
+ * basename is fixed here and must not be renamed.
+ */
+export const DEFAULT_RECORD_DIRECTORY = 'net-dumps'
+
+/** Default per-body byte cap for a capture: big enough for an API payload, small enough to bound a dump. */
+export const DEFAULT_MAX_BODY_BYTES = 262_144
+
+/** Ceiling the schema accepts for `maxBodyBytes` (16 MiB). */
+export const MAX_BODY_BYTES_CEILING = 16 * 1024 * 1024
 
 /**
  * Which browser backend serves a fetch:
@@ -167,6 +182,30 @@ export interface Config {
    * whitespace with shell-style quoting.
    */
   launchArgs?: string
+  /**
+   * Record the XHR/Fetch/WebSocket traffic of each fetch to disk (one CDP
+   * session on the fetch's own tab, one session directory). Off by default:
+   * the dumps carry plaintext credentials.
+   */
+  recordNetwork?: boolean
+  /**
+   * Base directory for the dumps; each capture gets a `<sessionId>`
+   * subdirectory under it. Blank = `<working directory>/net-dumps` — the
+   * gitignored default, whose basename is fixed.
+   */
+  recordDir?: string
+  /**
+   * Fetch response bodies through `Network.getResponseBody` (bounded by
+   * {@link Config.maxBodyBytes}). Off = metadata only.
+   */
+  captureBodies?: boolean
+  /** Byte cap for a stored response body / WebSocket frame payload. */
+  maxBodyBytes?: number
+  /**
+   * Keep image/font/media/stylesheet records too. Off (the default) drops
+   * them: they are noise for the API extraction this dump exists for.
+   */
+  recordAllResources?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -196,6 +235,13 @@ export const Config: z<Config> = z.object({
   headless: z.boolean().default(true),
   userDataDir: z.string().default(''),
   launchArgs: z.string().default(''),
+  // The P2 capture knobs: opt-in (dumps hold plaintext credentials), with the
+  // default directory's basename pinned to the gitignored `net-dumps`.
+  recordNetwork: z.boolean().default(false),
+  recordDir: z.string().default(''),
+  captureBodies: z.boolean().default(true),
+  maxBodyBytes: z.number().step(1024).min(0).max(MAX_BODY_BYTES_CEILING).default(DEFAULT_MAX_BODY_BYTES),
+  recordAllResources: z.boolean().default(false),
 })
 
 /** The four proxy fields, as the settings section carries them. */
@@ -204,8 +250,11 @@ export type ProxySettings = Pick<Config, 'proxyServer' | 'proxyBypass' | 'proxyU
 /** The managed-backend fields, as the settings section carries them. */
 export type ManagedSettings = Pick<Config, 'headless' | 'userDataDir' | 'launchArgs' | 'playwrightPath' | 'proxyServer' | 'proxyBypass' | 'proxyUsername' | 'proxyPassword'>
 
+/** The capture fields, as the settings section carries them. */
+export type CaptureSettings = Pick<Config, 'recordNetwork' | 'recordDir' | 'captureBodies' | 'maxBodyBytes' | 'recordAllResources'>
+
 /** Field names whose effective value is resolved by a helper, not the schema. */
-type ResolvedLaterFieldName = 'maxConcurrency' | 'proxyServer' | 'proxyBypass' | 'proxyUsername' | 'proxyPassword' | 'headless' | 'userDataDir' | 'launchArgs'
+type ResolvedLaterFieldName = 'maxConcurrency' | 'proxyServer' | 'proxyBypass' | 'proxyUsername' | 'proxyPassword' | 'headless' | 'userDataDir' | 'launchArgs' | 'recordNetwork' | 'recordDir' | 'captureBodies' | 'maxBodyBytes' | 'recordAllResources'
 
 /**
  * Complete config after schemastery applies the field defaults it owns.
@@ -216,13 +265,16 @@ type ResolvedLaterFieldName = 'maxConcurrency' | 'proxyServer' | 'proxyBypass' |
  * every reader treats a missing or blank value as "no proxy"; `headless`
  * defaults to `true` ({@link effectiveHeadless}); `userDataDir` defaults to
  * `$DSH_HOME/web-fetch-playwright/profile` ({@link effectiveUserDataDir});
- * `launchArgs` defaults to `''`. Keeping them optional here leaves hand-built
- * configs written before these features (composition rows restored from an
- * older profile, test fixtures) assignable without inventing values.
+ * `launchArgs` defaults to `''`; the five capture fields default to "off,
+ * `<cwd>/net-dumps`, bodies on, {@link DEFAULT_MAX_BODY_BYTES}, static
+ * resources dropped" ({@link effectiveRecordDir}, {@link captureOptionsFor}).
+ * Keeping them optional here leaves hand-built configs written before these
+ * features (composition rows restored from an older profile, test fixtures)
+ * assignable without inventing values.
  */
 export type ResolvedConfig = Omit<Required<Config>, ResolvedLaterFieldName> & {
   maxConcurrency?: number
-} & ProxySettings & Pick<ManagedSettings, 'headless' | 'userDataDir' | 'launchArgs'>
+} & ProxySettings & Pick<ManagedSettings, 'headless' | 'userDataDir' | 'launchArgs'> & CaptureSettings
 
 /**
  * The concurrency limit a fetch actually runs with: an explicit setting
@@ -380,6 +432,70 @@ export function managedLaunchKey(launch: ManagedLaunch): string {
     launch.proxy?.username ?? '',
     launch.proxy?.password ?? '',
   ])
+}
+
+/**
+ * The directory one capture session writes into: the configured `recordDir`
+ * as the BASE (resolved against the working directory when relative), else
+ * `<working directory>/{@link DEFAULT_RECORD_DIRECTORY}` — then the session id
+ * as the last segment, so concurrent fetches never share a directory and the
+ * default always ends in `net-dumps/<sessionId>`.
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @param sessionId - this capture's id (see `newCaptureSessionId`).
+ * @param cwd - the working directory the default and relative paths resolve against.
+ * @returns the absolute session dump directory.
+ */
+export function effectiveRecordDir(
+  config: Pick<Config, 'recordDir'>,
+  sessionId: string,
+  cwd: string = process.cwd(),
+): string {
+  const configured = (config.recordDir ?? '').trim()
+  const base = configured !== ''
+    ? (isAbsolute(configured) ? configured : resolve(cwd, configured))
+    : join(cwd, DEFAULT_RECORD_DIRECTORY)
+  return join(base, sessionId)
+}
+
+/** Everything one capture session needs, resolved from the settings section. */
+export interface CapturePlan {
+  /** The session's own directory (0700, files 0600). */
+  dir: string
+  /** Fetch response bodies through `Network.getResponseBody`. */
+  captureBodies: boolean
+  /** Byte cap for a stored body / frame payload. */
+  maxBodyBytes: number
+  /** Keep image/font/media/stylesheet records instead of dropping them. */
+  recordAllResources: boolean
+  /** Whether recording is on at all. */
+  enabled: boolean
+}
+
+/**
+ * Resolve the capture plan for one fetch. Recording is opt-in
+ * (`recordNetwork`), bodies are captured by default, and the byte cap falls
+ * back to {@link DEFAULT_MAX_BODY_BYTES} when the setting is absent.
+ *
+ * @param config - the resolved settings section.
+ * @param sessionId - this capture's id.
+ * @param cwd - the working directory the default dump path resolves against.
+ * @returns the plan the recorder runs with.
+ */
+export function captureOptionsFor(
+  config: CaptureSettings,
+  sessionId: string,
+  cwd: string = process.cwd(),
+): CapturePlan {
+  return {
+    enabled: config.recordNetwork === true,
+    dir: effectiveRecordDir(config, sessionId, cwd),
+    captureBodies: config.captureBodies !== false,
+    maxBodyBytes: typeof config.maxBodyBytes === 'number' && Number.isFinite(config.maxBodyBytes)
+      ? config.maxBodyBytes
+      : DEFAULT_MAX_BODY_BYTES,
+    recordAllResources: config.recordAllResources === true,
+  }
 }
 
 /**

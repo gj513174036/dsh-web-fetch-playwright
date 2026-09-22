@@ -72,13 +72,42 @@ export interface PlaywrightPage {
 
 /**
  * A browser context: fetch-owned and isolated (local backend, or CDP
- * `isolated` mode), or the remote browser's default context carrying its
- * real profile (CDP `profile` mode — never closed by a fetch).
+ * `isolated` mode), or a persistent profile (CDP `profile` mode, or the
+ * DSH-managed backend — never closed by a fetch).
  */
 export interface PlaywrightContext {
   newPage(): Promise<PlaywrightPage>
   route(glob: string, handler: (route: PlaywrightRoute) => Promise<void>): Promise<void>
   close(): Promise<void>
+  /**
+   * Open a CDP session on ONE page of this context — the seam the network
+   * recorder attaches to. Chromium-family contexts expose it; absent on
+   * minimal fakes and non-CDP-capable backends, in which case recording is
+   * skipped (never a fetch failure).
+   */
+  newCDPSession?(page: PlaywrightPage): Promise<CdpSession>
+}
+
+/**
+ * One Chrome DevTools Protocol session attached to exactly one page, as
+ * `context.newCDPSession(page)` returns it. Only the two members the network
+ * recorder uses are declared, and both are structural so the test suite can
+ * substitute a fake that replays an event stream.
+ *
+ * A session is per-page on purpose: the recorder must see ONLY the tab this
+ * plugin's fetch opened, never the other tabs of a shared browser (profile
+ * mode) — no `Target.setAutoAttach`, no browser-wide capture.
+ */
+export interface CdpSession {
+  /** Send one protocol command (e.g. `Network.enable`). */
+  send(method: string, params?: Record<string, unknown>): Promise<unknown>
+  /**
+   * Subscribe to one protocol event. The payload is the raw CDP params
+   * object; the recorder narrows the fields it needs itself.
+   */
+  on(event: string, listener: (params: Record<string, unknown>) => void): unknown
+  /** Detach the session; best-effort (absent on minimal fakes). */
+  detach?(): Promise<void>
 }
 
 /** A route interception decision. */

@@ -15,6 +15,7 @@
 - **浏览器解析** —— 配置路径 → `$PATH` 上的 `playwright` CLI → 插件自带的 `playwright-core`；CDP 模式完全不需要本地浏览器。
 - **共享或隔离会话** —— 每次抓取严格限定为一个标签页。本地后端每次抓取启动并关闭自己的浏览器；DSH 托管后端与 CDP 后端各保持**一个共享浏览器**，每次抓取只在其里开一个标签页、用完即关。CDP 默认该标签页位于远端浏览器的**真实 profile**（沿用其 cookie、localStorage 与已登录会话，效果类似 `playwright-cli open`）；取消勾选「共享浏览器上下文」则切换为每次抓取全新隔离 context。
 - **可视调试用本地启动器** —— `dsh-web-fetch-launch` 复制你的真实 profile、用 `--remote-debugging-port`（并带上配置好的代理）启动你自己的 Chrome，并打印把该端口送到插件宿主机的 `autossh` 反向隧道命令（见 [两种拓扑](#两种拓扑可视浏览器--服务器无头)）。
+- **抓包记录** —— 每次抓取一条 CDP 会话，把该标签页的 XHR/Fetch/WebSocket 流量（URL、Method、Headers、载荷、响应正文、WS 帧）在抓取进行中就追加进 JSONL，结束时导出 HAR 1.2；默认关闭，且产物按设计含明文凭据（见[抓包记录](#抓包记录xhr--fetch--websocket)）。
 - **热配置** —— 「设置 → 插件 → 插件配置」卡片可随时切换后端、上下文模式、降噪开关与并发数，改动对下一次抓取即时生效，无需重启。
 - **预算控制** —— 单次抓取 45s 超时；并发按后端定价（`maxConcurrency`，默认本地 4 个浏览器 / CDP 与 DSH 托管后端 **50 个标签页**；排队的抓取等不到空位会在 20s 内尽快报错并提示重试，而不是一直挂到被工具层中止）；拦截图片/字体/媒体子请求；返回体 10 万字符封顶。
 - **Cloudflare 挑战有界等待** —— 导航落到验证中间页（"Just a moment…" 及其多语言同族，通过官方 `cf-mitigated: challenge` 响应头 + 结构性页面标记识别）时，抓取保持**同一标签页与上下文**，等待浏览器自行通过验证：跟踪*最后一次*主 frame 响应（真实页面随后重载进来），并轮询活 DOM 以捕获 SPA 式清除。有界且可配置（`challengeWaitMs`，默认 15s；`0` 恢复旧版首响应行为），附带同标签页有界重试（`challengeRetries`，默认 1）。预算耗尽时以独立的 `WEB_FETCH_CHALLENGE` 错误码明确失败，而不是把中间页当正文返回。全程不点击、不注入验证码答案、不伪造浏览器状态、不导出或复制 cookie。
@@ -86,6 +87,11 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 | `maxConcurrency` | *（自动）* | 同时渲染的页面上限（1–200）。留空按后端取默认：本地 **4**（每个槽位启动一个浏览器）/ CDP 与 DSH 托管后端 **50 个标签页**（浏览器已在运行，一个并发名额就是一个标签页）。超出的请求短暂排队；20s 内等不到空位则以 `WEB_FETCH_TIMEOUT` 尽快失败并提示重试或调大该值，而不是一直挂起直到工具层预算中止。 |
 | `challengeWaitMs` | `15000` | Cloudflare 挑战的**有界**自然等待上限（毫秒，0–60000），在同一标签页内等待浏览器自行通过验证。`0` 关闭整条挑战处理链路——直接返回首次响应（0.2.5 之前的旧行为）。 |
 | `challengeRetries` | `1` | 一个等待窗口耗尽后的**同标签页**重新导航次数（0–3）；浏览器已拿到的通关 cookie 留在上下文里供重试使用。总耗时始终受 45s 单次抓取预算约束。 |
+| `recordNetwork` | `false` | 记录每次抓取的 XHR/Fetch/WebSocket 流量，产出 JSONL + HAR 1.2。默认关闭：产物含明文凭据。 |
+| `recordDir` | 空 | 抓包基目录；每次抓包在其下新建独立的 `<sessionId>` 子目录。留空 = `<工作目录>/net-dumps`（已 gitignore；目录 `0700`、文件 `0600`）。 |
+| `captureBodies` | `true` | 通过 `Network.getResponseBody` 读取响应正文。关闭则只记 URL、状态、Headers 与请求载荷。 |
+| `maxBodyBytes` | `262144` | 单条正文 / WebSocket 帧的存储上限（0–16 MiB）。被截断的标记 `bodyTruncated` 并保留原始 `bodyBytes`。 |
+| `recordAllResources` | `false` | 同时记录 image/font/media/stylesheet（默认丢弃：对提取业务 API 是噪音）。 |
 
 本地后端解析顺序：
 
@@ -166,6 +172,33 @@ google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome
 
 无头服务器（先在有头环境预置登录态）：`chromium --headless=new --remote-debugging-port=9222 --user-data-dir=/data/chrome-dsh-profile`。**不要**叠加 `--incognito` 或一次性 user-data-dir——都会让 profile 模式失效。设计依据与已核实的 playwright-core 源码事实见 [`docs/context-mode-profile.md`](./docs/context-mode-profile.md)。
 
+### 抓包记录（XHR / Fetch / WebSocket）
+
+打开 `recordNetwork` 后，每次抓取都在**它自己刚打开的那个标签页**上挂一条 CDP 会话，静默记录该标签页的流量：请求 URL、Method、Headers、请求载荷，响应状态/Headers/正文，以及 WebSocket 建连、帧与关闭。除此之外什么都不看——不做 `Target.setAutoAttach`、不碰共享浏览器里的其它标签页（profile 模式也一样）：抓取开了哪个标签页，就只记录哪个。
+
+每次抓包产出两个文件，位于 `<recordDir>/<sessionId>/`（默认 `<工作目录>/net-dumps/<sessionId>`）：
+
+| 文件 | 内容 |
+| --- | --- |
+| `network.jsonl` | 每行一个 JSON 对象，**抓取进行中持续追加**——先是 `session` 头行，然后每个请求依次 `request` / `response` / `responseBody` / `finished`（失败则 `failed`），以及 `websocketCreated` / `websocketFrame` / `websocketClosed`。可边跑边读、中断也不丢，也是离线流水线的输入格式。 |
+| `har.json` | 抓取结束时导出的 HAR 1.2——正常结束、抛错、被 abort 三条路径都会写（插件卸载也会 flush）。WebSocket 流量按 Chrome 的 `_webSocketMessages` 扩展挂在 entry 上。 |
+
+> **抓包产物含明文凭据。** `Cookie`、`Set-Cookie`、`Authorization`、token 与请求/响应正文都按原样保存——这是刻意设计，因为「复现已登录会话」正是它的用途——所以请把 dump 目录当作密码文件对待。默认值做了防护：目录 `0700`、文件 `0600`，且 `net-dumps/` 已在本仓库 `.gitignore` 中。但一旦你把目录复制出去或提交，这些防护就失效了：切勿外发、发布或作为附件分享。
+
+配置项：`recordNetwork`（默认关闭——因为抓包会把凭据写到磁盘，所以是显式开关）、`recordDir`（基目录；每次抓包在其下新建 `<sessionId>` 子目录）、`captureBodies`（通过 `getResponseBody` 读取响应正文）、`maxBodyBytes`（单条正文/帧上限，0–16 MiB；被截断的会标记 `bodyTruncated` 并保留原始 `bodyBytes`）、`recordAllResources`（同时记录 image/font/media/stylesheet，默认丢弃：对提取业务 API 是噪音且量最大）。设置卡片就在开关旁给出明文凭据警告。
+
+录制全程 **best-effort**：CDP 抖动、正文已被回收、目录不可写、事件格式异常——一律吞掉（记录在 recorder report 里），**绝不会让 `web_fetch` 失败**，也不会让页面内容被吞。
+
+### 从抓包到爬虫（离线、无 AI）
+
+`tools/netdump/`（仅依赖 Python 3.11 标准库）把抓包转成业务 API 清单与可直接运行的 `httpx` 爬虫——内嵌抓到的 Headers 与 Cookie、过滤静态资源、列出 WebSocket 通道：
+
+```sh
+PYTHONPATH=tools/netdump python3 -m netdump build net-dumps/<session>/network.jsonl -o netdump-out
+PYTHONPATH=tools/netdump python3 -m netdump build net-dumps/<session>/har.json        -o netdump-out   # HAR 同样支持
+PYTHONPATH=tools/netdump python3 -m netdump summary net-dumps/<session>/network.jsonl                   # 看抓到了什么
+```
+
 ### Cloudflare 挑战处理（有界自然等待）
 
 部分严格站点会在返回真实页面前先给一个 Cloudflare 验证中间页。真实浏览器通常几秒内就能**自行**通过验证；但只看第一次响应的抓取会把中间页当成正文返回（0.2.5 之前的旧行为；把 `challengeWaitMs` 设为 `0` 可随时复现，或在仓库检出、执行 `pnpm build` 后运行 `node scripts/challenge-demo.mjs` 看本地模拟站点的前后对比、`node scripts/challenge-online.mjs <url>` 对真实站点做在线对比）。
@@ -197,6 +230,8 @@ src/
 ├── provider.ts            # WebFetchProvider：导航、超时、信号量、截断
 ├── browser-pool.ts        # 共享浏览器池（租约/存活/替换），两个共享型后端共用
 ├── cdp-pool.ts            # 该池的 CDP 实例化
+├── recorder.ts            # P2 抓包：每 fetch 一条 CDP 会话 → JSONL + HAR（best-effort）
+├── har.ts                 # 抓包结果的 HAR 1.2 组装（纯函数）
 ├── launcher.ts            # 本地启动器逻辑：设置段读取、命令拼装、profile 复制
 ├── launch-args.ts         # 无依赖的参数拼装（宿主 + 卡片预览 + 启动器共用）
 ├── markdown.ts            # 降噪管线（Readability + DOMPurify + Turndown/GFM）

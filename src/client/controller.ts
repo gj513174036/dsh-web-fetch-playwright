@@ -66,6 +66,19 @@ export interface PlaywrightSettings {
   userDataDir?: string
   /** Extra browser arguments for plugin-launched browsers and the launcher. */
   launchArgs?: string
+  /**
+   * Record each fetch's XHR/Fetch/WebSocket traffic to disk. Off by default:
+   * the dump holds plaintext credentials.
+   */
+  recordNetwork?: boolean
+  /** Base directory for the dumps; blank = `<working directory>/net-dumps`. */
+  recordDir?: string
+  /** Capture response bodies through CDP (bounded by `maxBodyBytes`). */
+  captureBodies?: boolean
+  /** Byte cap for a stored body / WebSocket frame payload. */
+  maxBodyBytes?: number
+  /** Keep image/font/media/stylesheet records too (default: dropped). */
+  recordAllResources?: boolean
 }
 
 /** What the Playwright card renders. */
@@ -98,6 +111,16 @@ export interface PlaywrightCardState extends CardShell {
   userDataDir: CardFieldState
   /** Extra browser arguments input (shell-style quoted). */
   launchArgs: CardFieldState
+  /** Capture master switch (draft 'true'/'false'). */
+  recordNetwork: CardFieldState
+  /** Capture base directory input. */
+  recordDir: CardFieldState
+  /** Response-body capture checkbox (draft 'true'/'false'). */
+  captureBodies: CardFieldState
+  /** Body byte-cap input (draft decimal integer). */
+  maxBodyBytes: CardFieldState
+  /** Keep-static-resources checkbox (draft 'true'/'false'). */
+  recordAllResources: CardFieldState
   /**
    * Read-only preview of the local launcher's command, derived from the
    * drafts above (never staged, never saved).
@@ -139,6 +162,11 @@ export class PlaywrightCardController {
         checkboxField('headless'),
         textField('userDataDir'),
         textField('launchArgs'),
+        checkboxField('recordNetwork'),
+        textField('recordDir'),
+        checkboxField('captureBodies'),
+        numberField('maxBodyBytes', 0, 16 * 1024 * 1024),
+        checkboxField('recordAllResources'),
       ],
     )
     this.store = this.form.bind(() => this.projection())
@@ -161,6 +189,11 @@ export class PlaywrightCardController {
       headless: this.form.field('headless'),
       userDataDir: this.form.field('userDataDir'),
       launchArgs: this.form.field('launchArgs'),
+      recordNetwork: this.form.field('recordNetwork'),
+      recordDir: this.form.field('recordDir'),
+      captureBodies: this.form.field('captureBodies'),
+      maxBodyBytes: this.form.field('maxBodyBytes'),
+      recordAllResources: this.form.field('recordAllResources'),
       launcherCommand: this.preview(),
     }
   }

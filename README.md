@@ -15,6 +15,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 - **Browser resolution** — a configured path, a `playwright` CLI on `$PATH`, or the bundled `playwright-core`; CDP needs no local browser at all.
 - **Isolated or profile sessions** — every fetch is scoped to exactly one tab. Local launches close their browser per fetch; the DSH-managed backend and the CDP backend keep **one shared browser** and each fetch opens a tab inside it, closed when done. For CDP the default is a tab in the remote browser's **real profile** (its cookies, localStorage, and persistent logins apply — like `playwright-cli open`); unchecking *Share the browser context* switches to a throwaway isolated context per fetch.
 - **Local launcher for the visible-browser topology** — `dsh-web-fetch-launch` copies your real profile, starts your own Chrome with `--remote-debugging-port` (plus the configured proxy), and prints the `autossh` reverse-tunnel line that carries that port to the machine the plugin runs on (see [Two topologies](#two-topologies-visible-browser--headless-server)).
+- **Network capture** — one CDP session per fetch records that tab's XHR/Fetch/WebSocket traffic (URL, method, headers, payload, response body, WS frames) to JSONL while the fetch runs, plus a HAR 1.2 export when it ends; opt-in, and the dumps hold plaintext credentials by design (see [Network capture](#network-capture-xhr--fetch--websocket)).
 - **Live configuration** — a settings card (设置 → 插件 → 插件配置) edits the backend, context mode, denoise toggle, and concurrency; changes apply to the next fetch without a restart.
 - **Budget-aware** — per-fetch deadline (45s); concurrency is backend-priced (`maxConcurrency`, default 4 local browsers / **50 tabs** for the CDP and DSH-managed backends; queued fetches fail fast with a retry hint after 20s instead of hanging); image/font/media subrequests aborted; body capped at 100k chars.
 - **Bounded Cloudflare-challenge wait** — when a navigation lands on a challenge interstitial ("Just a moment…" and its localized siblings, recognized via the documented `cf-mitigated: challenge` response header plus structural page markers), the fetch keeps the **same tab and context** and waits for the browser's own verification to clear it — tracking the *last* main-frame response (the real page reloads in) and watching the live DOM so SPA-style clears are caught too. Bounded and configurable (`challengeWaitMs`, default 15s; 0 restores the legacy first-response behavior), with a bounded same-tab retry (`challengeRetries`, default 1). When the budget runs out, the fetch fails with the distinct `WEB_FETCH_CHALLENGE` error code instead of returning the interstitial as content. It never clicks, never injects CAPTCHA answers, never fakes browser state, and never exports or copies cookies.
@@ -86,6 +87,11 @@ The settings card (设置 → 插件 → 插件配置 → *Playwright 网页爬�
 | `maxConcurrency` | *(auto)* | How many fetches may render at once (1–200). Blank = backend default: **4** for local (each slot launches a browser) / **50 tabs** for the CDP and DSH-managed backends (one browser is already alive, so a slot is a tab in it). Beyond the limit, fetches wait briefly; if no slot frees within 20s they fail with `WEB_FETCH_TIMEOUT` and a hint to retry or raise this setting, rather than hanging until the tool budget aborts. |
 | `challengeWaitMs` | `15000` | Bounded wait (ms, 0–60000) for a Cloudflare challenge to clear naturally in the same tab. `0` disables the whole challenge path — the first response is returned as-is (the pre-0.2.5 behavior). |
 | `challengeRetries` | `1` | Same-tab re-navigation attempts after a wait window runs out (0–3); any clearance cookies the browser earned stay in the context for the retry. Everything stays inside the 45s per-fetch deadline. |
+| `recordNetwork` | `false` | Record each fetch's XHR/Fetch/WebSocket traffic to JSONL + HAR 1.2. Off by default: the dumps contain plaintext credentials. |
+| `recordDir` | (blank) | Base directory for the dumps; each capture gets its own `<sessionId>` subdirectory. Blank = `<working directory>/net-dumps` (gitignored; directory `0700`, files `0600`). |
+| `captureBodies` | `true` | Read response bodies through `Network.getResponseBody`. Off = URLs, statuses, headers, and request payloads only. |
+| `maxBodyBytes` | `262144` | Byte cap per stored response body / WebSocket frame (0–16 MiB). A cut body is flagged `bodyTruncated` and keeps its original `bodyBytes`. |
+| `recordAllResources` | `false` | Keep image/font/media/stylesheet records too (dropped by default: noise for API extraction). |
 
 Local backend resolution order:
 
@@ -166,6 +172,33 @@ The profile copy is deliberately partial: `SingletonLock`/`SingletonCookie`/`Sin
 
 `autossh -R 9222:127.0.0.1:9222` binds the remote port to the client's loopback — keep it that way (the launcher already binds DevTools to `127.0.0.1`), and treat the tunnel as access to your logged-in browser. The plugin's security stance is unchanged: no SSRF protection, so an agent that can call `web_fetch` can reach whatever that browser can reach.
 
+### Network capture (XHR / Fetch / WebSocket)
+
+With `recordNetwork` on, every fetch opens **one CDP session on the tab it just created** and silently records that tab's traffic: request URL, method, headers, request payload, response status/headers/body, and WebSocket lifecycle + frames. Nothing else is observed — no `Target.setAutoAttach`, no other tab of a shared browser, not even in profile mode: what the fetch opened is what gets recorded.
+
+Two files per capture, under `<recordDir>/<sessionId>/` (default `<working directory>/net-dumps/<sessionId>`):
+
+| File | What it is |
+| --- | --- |
+| `network.jsonl` | One JSON object per line, appended **while the fetch runs** — a `session` header, then `request` / `response` / `responseBody` / `finished` (or `failed`) per exchange, plus `websocketCreated` / `websocketFrame` / `websocketClosed`. Live-readable, crash-tolerant, and what the offline pipeline consumes. |
+| `har.json` | A HAR 1.2 export written when the fetch ends — on success, on a thrown error, and on abort (plugin teardown flushes too). WebSocket traffic rides Chrome's `_webSocketMessages` extension. |
+
+> **The dumps contain PLAINTEXT credentials.** `Cookie`, `Set-Cookie`, `Authorization`, tokens, and request/response bodies are stored verbatim — deliberately, because replaying a logged-in session is the point — so treat a dump directory as you would a password file. The defaults help: mode `0700` on the directory, `0600` on every file, and `net-dumps/` is in this repository's `.gitignore`. They do not help if you copy the directory somewhere else or commit it: never share, publish, or attach a dump.
+
+Config knobs: `recordNetwork` (off by default — an opt-in switch, because recording writes credentials to disk), `recordDir` (base directory; each capture gets its own `<sessionId>` subdirectory), `captureBodies` (read response bodies through `getResponseBody`), `maxBodyBytes` (per-body/frame cap, 0–16 MiB; a cut body is flagged `bodyTruncated` with its original `bodyBytes`), `recordAllResources` (keep image/font/media/stylesheet records — dropped by default: they are noise for API extraction and dominate the volume). The settings card shows the plaintext-credentials warning next to the switch.
+
+Recording is **best-effort**: a CDP hiccup, a body that was already evicted, an unwritable directory, or a malformed event is swallowed (and listed in the recorder report) — it can never fail a `web_fetch`, and it never hides the fetched page.
+
+### From a capture to a crawler (offline, no AI)
+
+`tools/netdump/` (Python 3.11 standard library only) turns a dump into a business-API list and a runnable `httpx` crawler — with the captured headers and cookies embedded, static resources filtered, WebSocket channels listed:
+
+```sh
+PYTHONPATH=tools/netdump python3 -m netdump build net-dumps/<session>/network.jsonl -o netdump-out
+PYTHONPATH=tools/netdump python3 -m netdump build net-dumps/<session>/har.json        -o netdump-out   # HAR works too
+PYTHONPATH=tools/netdump python3 -m netdump summary net-dumps/<session>/network.jsonl                   # what is in here?
+```
+
 ### Cloudflare challenge handling (bounded natural wait)
 
 Some strict sites serve a Cloudflare interstitial before the real page. A real browser often passes the check on its own within a few seconds — but a fetch that only looks at the first response hands you the interstitial as if it were the page (the pre-0.2.5 behavior; reproduce it any time with `challengeWaitMs: 0`, or — from a repo checkout, after `pnpm build` — run `node scripts/challenge-demo.mjs` for a local simulated before/after, and `node scripts/challenge-online.mjs <url>` against a real site).
@@ -197,6 +230,8 @@ src/
 ├── provider.ts            # WebFetchProvider: navigation, deadline, semaphore, caps
 ├── browser-pool.ts        # shared-browser pool (lease/liveness/replacement) both backends ride
 ├── cdp-pool.ts            # the CDP instantiation of that pool
+├── recorder.ts            # P2 capture: per-fetch CDP session → JSONL + HAR (best-effort)
+├── har.ts                 # HAR 1.2 assembly for a capture (pure)
 ├── launcher.ts            # local launcher logic: settings section, command, profile copy
 ├── launch-args.ts         # dependency-free flag shaping (host + card preview + launcher)
 ├── markdown.ts            # denoise pipeline (Readability + DOMPurify + Turndown/GFM)

@@ -8,10 +8,12 @@
  * limits, all staged and saved through the card form like the built-in plugin
  * cards.
  *
- * The proxy fields and the preview sit at card level rather than under one
- * backend option: a proxy applies to every browser this plugin launches, and
- * in CDP mode it shapes the launcher's `--proxy-server` flag, so it must stay
- * visible (and resettable) whichever backend runs.
+ * The proxy fields sit at card level rather than under one backend option: a
+ * proxy applies to every browser this plugin launches, and in CDP mode it
+ * shapes the launcher's `--proxy-server` flag, so it must stay visible (and
+ * resettable) whichever backend runs. The P2 capture fields do too — every
+ * backend can record — and they carry the plaintext-credentials warning that
+ * belongs next to the switch that produces the dumps.
  *
  * @module dsh-web-fetch-playwright/client/card
  */
@@ -41,6 +43,10 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
   const backend = state.backend.text === 'cdp'
     ? 'cdp'
     : state.backend.text === 'managed' ? 'managed' : 'local'
+  // The capture master switch (absent draft = the schema default, off):
+  // its detail fields stay disabled until recording is actually on, so the
+  // 0700/0600 + plaintext-credentials warning is what the eye lands on first.
+  const recording = state.recordNetwork.text === 'true'
   return (
     <PluginCard
       copy={{
@@ -272,6 +278,68 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         {...state.challengeWaitMs}
         onEdit={(text) => { props.edit('challengeWaitMs', text) }}
         onReset={() => { props.resetField('challengeWaitMs') }}
+      />
+      <CheckboxField
+        id="plugin-config-playwright-record-network"
+        label={t('recordNetwork')}
+        hint={state.recordNetwork.text === 'true' ? t('recordWarning') : t('recordNetworkHint')}
+        checked={state.recordNetwork.text === 'true'}
+        overridden={state.recordNetwork.overridden}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        disabled={disabled}
+        onEdit={(text) => { props.edit('recordNetwork', text) }}
+        onReset={() => { props.resetField('recordNetwork') }}
+      />
+      <ValueField
+        id="plugin-config-playwright-record-dir"
+        label={t('recordDir')}
+        hint={t('recordDirHint')}
+        placeholder={t('recordDirPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled || recording === false}
+        {...state.recordDir}
+        onEdit={(text) => { props.edit('recordDir', text) }}
+        onReset={() => { props.resetField('recordDir') }}
+      />
+      <CheckboxField
+        id="plugin-config-playwright-capture-bodies"
+        label={t('captureBodies')}
+        hint={t('captureBodiesHint')}
+        checked={state.captureBodies.text !== 'false'}
+        overridden={state.captureBodies.overridden}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        disabled={disabled || recording === false}
+        onEdit={(text) => { props.edit('captureBodies', text) }}
+        onReset={() => { props.resetField('captureBodies') }}
+      />
+      <ValueField
+        id="plugin-config-playwright-max-body-bytes"
+        label={t('maxBodyBytes')}
+        hint={t('maxBodyBytesHint')}
+        placeholder={t('maxBodyBytesPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled || recording === false}
+        {...state.maxBodyBytes}
+        onEdit={(text) => { props.edit('maxBodyBytes', text) }}
+        onReset={() => { props.resetField('maxBodyBytes') }}
+      />
+      <CheckboxField
+        id="plugin-config-playwright-record-all-resources"
+        label={t('recordAllResources')}
+        hint={t('recordAllResourcesHint')}
+        checked={state.recordAllResources.text === 'true'}
+        overridden={state.recordAllResources.overridden}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        disabled={disabled || recording === false}
+        onEdit={(text) => { props.edit('recordAllResources', text) }}
+        onReset={() => { props.resetField('recordAllResources') }}
       />
     </PluginCard>
   )

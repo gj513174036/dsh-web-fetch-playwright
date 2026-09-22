@@ -3,6 +3,7 @@
  * normalizers, the backend-dependent concurrency resolution, and the
  * challenge-wait knobs (pure, network-free).
  */
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   Config,
@@ -12,7 +13,10 @@ import {
   DEFAULT_MAX_CONCURRENCY_CDP,
   DEFAULT_MAX_CONCURRENCY_LOCAL,
   DEFAULT_MAX_CONCURRENCY_MANAGED,
+  DEFAULT_MAX_BODY_BYTES,
+  DEFAULT_RECORD_DIRECTORY,
   MANAGED_PROFILE_DIRECTORY,
+  MAX_BODY_BYTES_CEILING,
   MAX_CHALLENGE_RETRIES,
   MAX_CHALLENGE_WAIT_MS,
   MAX_CONCURRENCY_CEILING,
@@ -22,7 +26,9 @@ import {
   effectiveContextMode,
   effectiveHeadless,
   effectiveMaxConcurrency,
+  effectiveRecordDir,
   effectiveUserDataDir,
+  captureOptionsFor,
   managedLaunchFor,
   managedLaunchKey,
   mergeProxyBypass,
@@ -55,6 +61,11 @@ describe('Config', () => {
       headless: true,
       userDataDir: '',
       launchArgs: '',
+      recordNetwork: false,
+      recordDir: '',
+      captureBodies: true,
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      recordAllResources: false,
     })
   })
 
@@ -120,6 +131,11 @@ describe('Config', () => {
       headless: true,
       userDataDir: '',
       launchArgs: '',
+      recordNetwork: false,
+      recordDir: '',
+      captureBodies: true,
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      recordAllResources: false,
     })
   })
 
@@ -180,6 +196,62 @@ describe('effectiveMaxConcurrency', () => {
     expect(effectiveMaxConcurrency({ backend: 'local', maxConcurrency: 50 })).toBe(50)
     expect(effectiveMaxConcurrency({ backend: 'cdp', maxConcurrency: 2 })).toBe(2)
     expect(effectiveMaxConcurrency({ backend: 'managed', maxConcurrency: 12 })).toBe(12)
+  })
+})
+
+describe('network capture settings', () => {
+  it('defaults to off, the gitignored net-dumps base, bodies on, and a bounded cap', () => {
+    const resolved = Config({})
+    expect(resolved.recordNetwork).toBe(false) // opt-in: dumps hold credentials
+    expect(resolved.recordDir).toBe('')
+    expect(resolved.captureBodies).toBe(true)
+    expect(resolved.maxBodyBytes).toBe(DEFAULT_MAX_BODY_BYTES)
+    expect(resolved.recordAllResources).toBe(false)
+    expect(DEFAULT_RECORD_DIRECTORY).toBe('net-dumps')
+  })
+
+  it('accepts a full capture section and rejects a cap outside its range', () => {
+    const resolved = Config({
+      recordNetwork: true,
+      recordDir: '/data/dumps',
+      captureBodies: false,
+      maxBodyBytes: 1024,
+      recordAllResources: true,
+    })
+    expect(resolved).toMatchObject({
+      recordNetwork: true,
+      recordDir: '/data/dumps',
+      captureBodies: false,
+      maxBodyBytes: 1024,
+      recordAllResources: true,
+    })
+    expect(() => Config({ maxBodyBytes: -1 })).toThrow()
+    expect(Config({ maxBodyBytes: MAX_BODY_BYTES_CEILING }).maxBodyBytes).toBe(MAX_BODY_BYTES_CEILING)
+    expect(() => Config({ maxBodyBytes: MAX_BODY_BYTES_CEILING + 1024 })).toThrow()
+  })
+
+  it('puts the default dump under <cwd>/net-dumps/<session>, keeping that basename', () => {
+    const dir = effectiveRecordDir({}, 'sess-1', '/work')
+    expect(dir).toBe(join('/work', DEFAULT_RECORD_DIRECTORY, 'sess-1'))
+    expect(dir.endsWith(join('net-dumps', 'sess-1'))).toBe(true)
+    // The configured base replaces net-dumps; the session segment stays.
+    expect(effectiveRecordDir({ recordDir: '/data/dumps' }, 'sess-2', '/work')).toBe(join('/data/dumps', 'sess-2'))
+    expect(effectiveRecordDir({ recordDir: ' relative/base ' }, 'sess-3', '/work')).toBe(join('/work', 'relative/base', 'sess-3'))
+    expect(effectiveRecordDir({ recordDir: '   ' }, 'sess-4', '/work')).toBe(join('/work', DEFAULT_RECORD_DIRECTORY, 'sess-4'))
+  })
+
+  it('resolves the capture plan from the section, with defaults for every missing piece', () => {
+    expect(captureOptionsFor({}, 's1', '/work')).toEqual({
+      enabled: false,
+      dir: join('/work', DEFAULT_RECORD_DIRECTORY, 's1'),
+      captureBodies: true,
+      maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
+      recordAllResources: false,
+    })
+    expect(captureOptionsFor({ recordNetwork: true, recordDir: '/d', captureBodies: false, maxBodyBytes: 0, recordAllResources: true }, 's2', '/work'))
+      .toEqual({ enabled: true, dir: join('/d', 's2'), captureBodies: false, maxBodyBytes: 0, recordAllResources: true })
+    // A non-finite/absent cap falls back to the default rather than capping at NaN.
+    expect(captureOptionsFor({ recordNetwork: true, maxBodyBytes: Number.NaN }, 's3', '/work').maxBodyBytes).toBe(DEFAULT_MAX_BODY_BYTES)
   })
 })
 
