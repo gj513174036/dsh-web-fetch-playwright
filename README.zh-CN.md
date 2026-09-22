@@ -202,7 +202,7 @@ google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome
 
 回退规则及其局限：当某条 extra 没有可用的身份（缺 `:path`/`:authority`，或缺状态码——例如最小实现或合成事件），或有多跳同样匹配时，回退到「到达序号」（该 requestId 的第 N 条 extra 属于第 N 跳，即 Playwright 自身使用的规则）。这只在「该 requestId 之前每一跳都产出了同类 extra」时成立。
 
-显式例外（未覆盖）：某跳的 extra **晚于更后一跳的 extra** 到达、且两者都没有可用身份时——事件层面本地无法区分；以及状态码始终匹配不上任何一跳的响应 extra，它会保持未认领并在短暂保持窗口后以 `unclaimed: true` 落盘。上述范围内的所有情形，`har.json` 与 `network.jsonl` 两个产物结论一致（项目检查里会把两者都喂给 `tools/netdump`）。
+显式例外（未覆盖）：某跳的 extra **晚于更后一跳的 extra** 到达、且两者都没有可用身份时——事件层面本地无法区分；状态码始终匹配不上任何一跳的响应 extra，它会保持未认领并在短暂保持窗口后以 `unclaimed: true` 落盘；以及响应侧只有状态码这一个身份，因此**连续多跳状态码相同**（如 `http→https→www` 连续 301）时会错配：当较早的那一跳没有自己的 responseExtra 时，较晚跳的 responseExtra——以及它携带的 `Set-Cookie`——会被归到较早跳。让响应侧可靠的是状态码彼此不同，而不是跳的顺序。上述范围内的所有情形，`har.json` 与 `network.jsonl` 两个产物结论一致（项目检查里会把两者都喂给 `tools/netdump`）。
 
 录制全程 **best-effort**：CDP 抖动、正文已被回收、目录不可写、事件格式异常——一律吞掉（记录在 recorder report 里），**绝不会让 `web_fetch` 失败**，也不会让页面内容被吞。
 

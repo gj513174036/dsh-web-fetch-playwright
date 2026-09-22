@@ -274,7 +274,12 @@ export function extraMatchesHop(
  * of the response it belongs to (the `statusCode` param, or Chrome's `:status`
  * pseudo-header), so it identifies the hop whose own response has that status.
  * Response headers carry no path, which is why the status is the only identity
- * available on that side.
+ * available on that side — and that single identity is a known limit:
+ * consecutive hops that share a status (an `http→https→www` chain of 301s)
+ * misattribute, because when an earlier hop has no responseExtra of its own, a
+ * later hop's responseExtra — and the `Set-Cookie` it carries — lands on that
+ * earlier hop. What makes the response side safe is distinct statuses, not hop
+ * order. See {@link HopSlots} for the complete exception list.
  *
  * @param extra - the response ExtraInfo slot.
  * @param hop - the base-event exchange (status known once `responseReceived`
@@ -325,13 +330,22 @@ function statusFromHeaders(headers: Record<string, string>): number | undefined 
  * produced its own extra of the same kind; with an omission it can be off by
  * the number of omissions.
  *
- * NOT COVERED (explicit exceptions): a hop's extra arriving AFTER a LATER hop's
- * extra while both carry no usable identity — nothing in the event names its
- * hop, so the two are locally indistinguishable (Playwright has the same
- * limitation); and a response extra whose status never matches any hop stays
- * unclaimed and is flushed as `unclaimed` after the hold window. Neither order
- * could be reproduced against a real browser in this environment (no launchable
- * Chromium), so these are documented limits, not verified behavior.
+ * NOT COVERED (explicit exceptions):
+ *  1. a hop's extra arriving AFTER a LATER hop's extra while both carry no
+ *     usable identity — nothing in the event names its hop, so the two are
+ *     locally indistinguishable (Playwright has the same limitation);
+ *  2. a response extra whose status never matches any hop stays unclaimed and
+ *     is flushed as `unclaimed` after the hold window;
+ *  3. the response side offers only ONE identity — the status code — so
+ *     consecutive hops that share a status (an `http→https→www` chain of 301s)
+ *     misattribute: when an earlier hop has no responseExtra of its own, a
+ *     later hop's responseExtra — and the `Set-Cookie` it carries — lands on
+ *     that earlier hop. What makes the response side safe is distinct
+ *     statuses, not hop order.
+ *
+ * None of these could be reproduced against a real browser in this environment
+ * (no launchable Chromium), so they are documented limits, not verified
+ * behavior.
  */
 interface HopSlots {
   /** The base-event exchanges of this requestId, in hop order. */
