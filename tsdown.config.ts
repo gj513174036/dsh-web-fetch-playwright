@@ -106,6 +106,16 @@ export default [
     fixedExtension: false,
     dts: false,
     clean: false,
+    // The CJS dependencies are BUNDLED, not imported. A profile-managed ESM
+    // module that imports a CJS package by bare name trips this deployment's DSH
+    // resolution router (`createRequire(parent).resolve.paths is not a function`
+    // out of dsh-app-boot), which fails the whole plugin entry with "failed to
+    // import". Bundling leaves only node builtins and ESM peers as imports.
+    // `playwright-core` stays external: it is ~14 MB, it is loaded at fetch time
+    // through an absolute path (never a bare specifier), and its own optional
+    // bare requires make it a poor bundling candidate.
+    external: ['@deepseek-ai/dsh-web', '@deepseek-ai/dsh-settings', '@deepseek-ai/schemastery', 'cordis', 'playwright-core'],
+    noExternal: [/^(jsdom|dompurify|@mozilla\/readability|turndown|@joplin\/turndown-plugin-gfm)(\/.*)?$/],
   },
   clientBundle('client.js'),
 ] satisfies UserConfig[]

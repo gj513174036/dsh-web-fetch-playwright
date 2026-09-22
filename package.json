@@ -1,6 +1,6 @@
 {
   "name": "dsh-web-fetch-playwright",
-  "version": "0.2.7",
+  "version": "0.2.9",
   "description": "Playwright/CDP web-fetch provider for DeepSeek Harness: renders pages in a real browser, denoises them (Readability + DOMPurify), and returns markdown.",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,7 @@
   "files": [
     "lib/index.js",
     "lib/client.js",
+    "lib/xhr-sync-worker.js",
     "lib/types/**/*.d.ts",
     "bin",
     "src",
@@ -32,7 +33,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json --emitDeclarationOnly && tsdown",
+    "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json --emitDeclarationOnly && tsdown && node scripts/emit-jsdom-sync-worker-stub.mjs",
     "prepare": "pnpm run build",
     "prepublishOnly": "pnpm run build",
     "typecheck": "tsc --noEmit",
