@@ -48,8 +48,15 @@ const FAMILY_GROUP_SERVICE = 'webUiSettings'
 /** Required services (cordis fiber inject). */
 export const inject = ['slots', 'locale', 'settingsScope']
 
-/** The loose registration shape both seats accept at runtime. */
-type SeatRegister = (options: Record<string, unknown>, component: unknown) => () => void
+/**
+ * The slot registry, read structurally so this module needs no dependency on the
+ * slots package. `register` is called as a MEMBER of this object: the registry
+ * keeps its context on `this`, so a detached call throws
+ * `Cannot read properties of undefined (reading 'effect')`.
+ */
+interface SeatRegistry {
+  register: (options: Record<string, unknown>, component: unknown) => () => void
+}
 
 /**
  * Whether the family group is loaded in this page. Read structurally (a plain
@@ -79,7 +86,9 @@ export function apply(ctx: Context): void {
     ctx.settingsScope.bind({ namespace: WEB_FETCH_PLAYWRIGHT_NS }),
   )
   const face = () => controller.inject()
-  const register = ctx.slots.register as unknown as SeatRegister
+  // Kept as an OBJECT, not a bare function: `register` must be invoked as its
+  // member so the registry's own `this` survives.
+  const registry = ctx.slots as unknown as SeatRegistry
 
   let dispose: (() => void) | undefined
   let current: string | undefined
@@ -99,8 +108,8 @@ export function apply(ctx: Context): void {
     previous?.()
     try {
       dispose = target === FAMILY_CARD_SEAT
-        ? register({ name: FAMILY_CARD_SEAT, id: WEB_FETCH_PLAYWRIGHT_NS, locale: NS, inject: face }, PlaywrightCard)
-        : register({ name: OFFICIAL_CARD_SEAT, key: WEB_FETCH_PLAYWRIGHT_NS, locale: NS, inject: face }, PlaywrightCard)
+        ? registry.register({ name: FAMILY_CARD_SEAT, id: WEB_FETCH_PLAYWRIGHT_NS, locale: NS, inject: face }, PlaywrightCard)
+        : registry.register({ name: OFFICIAL_CARD_SEAT, key: WEB_FETCH_PLAYWRIGHT_NS, locale: NS, inject: face }, PlaywrightCard)
       current = target
     } catch (error: unknown) {
       // A refused seat must be reported, never swallowed: a silent failure is
