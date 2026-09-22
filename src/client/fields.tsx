@@ -26,6 +26,12 @@ export function ValueField(props: {
   placeholder?: string
   /** Render inside a radio option: no card-level chrome (border, padding). */
   embedded?: boolean
+  /**
+   * Render as a masked password input. The draft still carries the stored
+   * value — so the override/reset semantics stay identical to every other
+   * text field — but the control never shows it as plain text.
+   */
+  secret?: boolean
   onEdit: (text: string) => void
   onReset: () => void
 }) {
@@ -52,7 +58,8 @@ export function ValueField(props: {
       <input
         id={props.id}
         className={props.invalid ? css.inputInvalid : css.input}
-        type="text"
+        type={props.secret === true ? 'password' : 'text'}
+        {...props.secret === true ? { autoComplete: 'new-password' } : {}}
         {...props.invalid ? { 'aria-invalid': true } : {}}
         value={props.text}
         placeholder={props.placeholder ?? ''}
@@ -67,9 +74,32 @@ export function ValueField(props: {
   )
 }
 
+/**
+ * A read-only preview of the command the local launcher would run. Rendered as
+ * a `<pre>` so a long flag list stays readable and copy-pasteable; nothing
+ * here is editable — that is the point, the value is derived from the fields
+ * above it.
+ */
+export function CommandPreview(props: {
+  id: string
+  label: string
+  hint: string
+  command: string
+}) {
+  return (
+    <div className={css.field}>
+      <div className={css.head}>
+        <span className={css.label}>{props.label}</span>
+      </div>
+      <pre id={props.id} className={css.command} tabIndex={0}>{props.command}</pre>
+      <p className={css.hint}>{props.hint}</p>
+    </div>
+  )
+}
+
 /** One radio option's copy, staged value, and nested control. */
 export interface RadioOption {
-  /** The option's stored value ('local' | 'cdp'). */
+  /** The option's stored value ('local' | 'cdp' | 'managed'). */
   value: string
   /** Option label shown beside the radio. */
   label: string

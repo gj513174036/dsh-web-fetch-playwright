@@ -8,6 +8,15 @@
  * @module dsh-web-fetch-playwright/types
  */
 
+/**
+ * Lifecycle events a shared browser handle can report. Declared once so the
+ * two handle shapes (a connected `Browser`, a persistent context) are
+ * structurally interchangeable for the pool; each backend only listens for
+ * the event its handle actually emits — over CDP a connection reports
+ * `disconnected`, a launched persistent context reports `close`.
+ */
+export type PlaywrightBrowserLifecycleEvent = 'disconnected' | 'close'
+
 /** A navigation response, as `page.goto` returns it. */
 export interface PlaywrightResponse {
   status(): number
@@ -81,7 +90,13 @@ export interface PlaywrightRoute {
 
 /** A browser instance (launched locally or connected over CDP). */
 export interface PlaywrightBrowser {
-  newContext(): Promise<PlaywrightContext>
+  /**
+   * Open a fresh isolated context. Absent on the DSH-managed backend's shared
+   * handle: `launchPersistentContext` resolves to a CONTEXT (the persistent
+   * profile itself) which owns pages directly — see
+   * {@link PlaywrightPersistentContext}.
+   */
+  newContext?(): Promise<PlaywrightContext>
   close(): Promise<void>
   /**
    * Contexts visible to this connection. Over CDP the default context — the
@@ -91,12 +106,74 @@ export interface PlaywrightBrowser {
   contexts?(): PlaywrightContext[]
   /** Liveness probe; absent on minimal fakes (assumed live). */
   isConnected?(): boolean
-  /** Optional disconnect notification used to drop a stale shared CDP connection. */
-  on?(event: 'disconnected', listener: () => void): unknown
+  /** Optional disconnect notification used to drop a stale shared connection. */
+  on?(event: PlaywrightBrowserLifecycleEvent, listener: () => void): unknown
+}
+
+/**
+ * What `launchPersistentContext` resolves to: the persistent PROFILE itself.
+ * Playwright models a persistent launch as a context rather than a browser —
+ * it owns pages directly (there is no separate isolated-context layer), and
+ * closing it closes the browser process, which is why the pool treats it as
+ * the shared handle and never releases it per fetch. Structurally it is also a
+ * {@link PlaywrightContext}, so a lease can open its tabs in it unchanged.
+ */
+export interface PlaywrightPersistentContext {
+  newPage(): Promise<PlaywrightPage>
+  route(glob: string, handler: (route: PlaywrightRoute) => Promise<void>): Promise<void>
+  close(): Promise<void>
+  /** Tabs this profile currently has open; absent on minimal fakes. */
+  pages?(): PlaywrightPage[]
+  /** Closed probe — the persistent handle's liveness signal. */
+  isClosed?(): boolean
+  /** Close notification: the browser process went away. */
+  on?(event: PlaywrightBrowserLifecycleEvent, listener: () => void): unknown
+}
+
+/**
+ * The `proxy` launch option: the launched browser process dials every request
+ * through `server` (`http(s)://`, `socks4://`, or `socks5://` — a bare
+ * `host:port` is normalized to `http://` before it gets here), optionally
+ * skipping `bypass` (comma-separated hosts) and authenticating with
+ * `username`/`password`. It is a launch-time property of the browser process:
+ * an already-running browser this plugin merely connects to cannot take one.
+ */
+export interface PlaywrightProxyOption {
+  server: string
+  bypass?: string
+  username?: string
+  password?: string
 }
 
 /** The `chromium` namespace of whichever Playwright module serves a fetch. */
 export interface PlaywrightChromium {
-  launch(options?: { headless?: boolean; executablePath?: string; timeout?: number }): Promise<PlaywrightBrowser>
+  launch(options?: {
+    headless?: boolean
+    executablePath?: string
+    timeout?: number
+    /** Outbound proxy for the launched browser; omitted entirely = direct. */
+    proxy?: PlaywrightProxyOption
+    /** Extra Chromium command-line arguments (already split into argv). */
+    args?: string[]
+  }): Promise<PlaywrightBrowser>
+  /**
+   * Launch a browser on a PERSISTENT profile directory (the DSH-managed
+   * backend): logins, cookies, and localStorage live in `userDataDir` and
+   * survive across fetches, plugin restarts, and `dsh web` restarts.
+   *
+   * @param userDataDir - the profile directory (never a throwaway temp dir
+   *   when persistence is the point).
+   * @param options - headless switch, browser binary, proxy, extra args, budget.
+   * @returns the persistent context (also the pool's shared handle).
+   */
+  launchPersistentContext(userDataDir: string, options?: {
+    headless?: boolean
+    executablePath?: string
+    timeout?: number
+    /** Outbound proxy for the launched browser; omitted entirely = direct. */
+    proxy?: PlaywrightProxyOption
+    /** Extra Chromium command-line arguments (already split into argv). */
+    args?: string[]
+  }): Promise<PlaywrightPersistentContext>
   connectOverCDP(endpointURL: string, options?: { timeout?: number }): Promise<PlaywrightBrowser>
 }

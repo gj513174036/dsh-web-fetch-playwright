@@ -1,16 +1,24 @@
 /**
- * The Playwright plugin-configuration card: backend radio group (each option
- * carrying its backend-specific inputs nested inside — local path under Local
- * Playwright, CDP endpoint and shared-context checkbox under Remote CDP) plus
- * the denoise checkbox, staged and saved through the card form like the
- * built-in plugin cards.
+ * The Playwright plugin-configuration card: backend radio group — `Local
+ * Playwright` (path), `DSH-managed persistent browser` (headless,
+ * user-data-dir, launch args), `Remote CDP endpoint` (endpoint, shared
+ * context), each carrying its own inputs — the outbound-proxy fields (address,
+ * bypass list, username, a masked password), the read-only launcher command
+ * preview derived from those drafts, the denoise checkbox, and the numeric
+ * limits, all staged and saved through the card form like the built-in plugin
+ * cards.
+ *
+ * The proxy fields and the preview sit at card level rather than under one
+ * backend option: a proxy applies to every browser this plugin launches, and
+ * in CDP mode it shapes the launcher's `--proxy-server` flag, so it must stay
+ * visible (and resettable) whichever backend runs.
  *
  * @module dsh-web-fetch-playwright/client/card
  */
 
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { PluginCard } from './PluginCard.tsx'
-import { CheckboxField, RadioGroupField, ValueField } from './fields.tsx'
+import { CheckboxField, CommandPreview, RadioGroupField, ValueField } from './fields.tsx'
 import type { PlaywrightCardFace, PlaywrightCardState } from './controller.ts'
 
 /** Props the renderer binds for the Playwright card. */
@@ -28,7 +36,11 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
   const { t } = props
   const state = props.usePlaywrightCard(snapshot => snapshot)
   const disabled = !state.writable
-  const backend = state.backend.text === 'cdp' ? 'cdp' : 'local'
+  // Which backend option's nested fields are live: the draft when it is a
+  // known value, else the schema default (local).
+  const backend = state.backend.text === 'cdp'
+    ? 'cdp'
+    : state.backend.text === 'managed' ? 'managed' : 'local'
   return (
     <PluginCard
       copy={{
@@ -69,6 +81,56 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
                 onEdit={(text) => { props.edit('playwrightPath', text) }}
                 onReset={() => { props.resetField('playwrightPath') }}
               />
+            ),
+          },
+          {
+            value: 'managed',
+            label: t('backendManaged'),
+            hint: t('backendManagedHint'),
+            content: (
+              <>
+                <CheckboxField
+                  embedded
+                  id="plugin-config-playwright-headless"
+                  label={t('headless')}
+                  hint={t('headlessHint')}
+                  checked={state.headless.text !== 'false'}
+                  overridden={state.headless.overridden}
+                  overriddenLabel={t('overridden')}
+                  resetLabel={t('reset')}
+                  disabled={disabled || backend !== 'managed'}
+                  onEdit={(text) => { props.edit('headless', text) }}
+                  onReset={() => { props.resetField('headless') }}
+                />
+                <ValueField
+                  embedded
+                  id="plugin-config-playwright-user-data-dir"
+                  label={t('userDataDir')}
+                  hint={t('userDataDirHint')}
+                  placeholder={t('userDataDirPlaceholder')}
+                  overriddenLabel={t('overridden')}
+                  resetLabel={t('reset')}
+                  invalidLabel={t('invalidText')}
+                  disabled={disabled || backend !== 'managed'}
+                  {...state.userDataDir}
+                  onEdit={(text) => { props.edit('userDataDir', text) }}
+                  onReset={() => { props.resetField('userDataDir') }}
+                />
+                <ValueField
+                  embedded
+                  id="plugin-config-playwright-launch-args"
+                  label={t('launchArgs')}
+                  hint={t('launchArgsHint')}
+                  placeholder={t('launchArgsPlaceholder')}
+                  overriddenLabel={t('overridden')}
+                  resetLabel={t('reset')}
+                  invalidLabel={t('invalidText')}
+                  disabled={disabled || backend !== 'managed'}
+                  {...state.launchArgs}
+                  onEdit={(text) => { props.edit('launchArgs', text) }}
+                  onReset={() => { props.resetField('launchArgs') }}
+                />
+              </>
             ),
           },
           {
@@ -115,6 +177,63 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         disabled={disabled}
         onEdit={(text) => { props.edit('backend', text) }}
         onReset={() => { props.resetField('backend') }}
+      />
+      <ValueField
+        id="plugin-config-playwright-proxy-server"
+        label={t('proxyServer')}
+        hint={t('proxyServerHint')}
+        placeholder={t('proxyServerPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.proxyServer}
+        onEdit={(text) => { props.edit('proxyServer', text) }}
+        onReset={() => { props.resetField('proxyServer') }}
+      />
+      <ValueField
+        id="plugin-config-playwright-proxy-bypass"
+        label={t('proxyBypass')}
+        hint={t('proxyBypassHint')}
+        placeholder={t('proxyBypassPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.proxyBypass}
+        onEdit={(text) => { props.edit('proxyBypass', text) }}
+        onReset={() => { props.resetField('proxyBypass') }}
+      />
+      <ValueField
+        id="plugin-config-playwright-proxy-username"
+        label={t('proxyUsername')}
+        hint={t('proxyUsernameHint')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.proxyUsername}
+        onEdit={(text) => { props.edit('proxyUsername', text) }}
+        onReset={() => { props.resetField('proxyUsername') }}
+      />
+      <ValueField
+        id="plugin-config-playwright-proxy-password"
+        secret
+        label={t('proxyPassword')}
+        hint={t('proxyPasswordHint')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.proxyPassword}
+        onEdit={(text) => { props.edit('proxyPassword', text) }}
+        onReset={() => { props.resetField('proxyPassword') }}
+      />
+      <CommandPreview
+        id="plugin-config-playwright-launcher-preview"
+        label={t('launcherPreview')}
+        hint={t('launcherPreviewHint')}
+        command={state.launcherCommand}
       />
       <CheckboxField
         id="plugin-config-playwright-denoise"

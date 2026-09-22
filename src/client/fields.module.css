@@ -138,6 +138,28 @@
   margin-left: 26px;
 }
 
+/* Rolled-out command preview (the launcher's line): monospace, wrapped, and
+   clearly non-interactive — the value is derived from the fields above. */
+.command {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px dashed var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--dsw-alias-label-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+}
+
+.command:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
+
 /* ── radio group ──────────────────────────────────────────────────────── */
 
 .radioGroup {

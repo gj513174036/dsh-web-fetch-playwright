@@ -4,17 +4,146 @@
  * queue (gated sessions), the CDP context modes (profile closing only its
  * tab, isolated closing page + context, abort leaving the shared default
  * context intact, the popup guard), plus one real-socket case for the CDP
- * connect failure path — and the bounded Cloudflare-challenge wait (A/B
+ * connect failure path — the bounded Cloudflare-challenge wait (A/B
  * baseline vs feature on, SPA clears, same-page retries, hard blocks,
- * aborts).
+ * aborts) — and the outbound proxy: launch-option injection, the
+ * WEB_FETCH_PROXY mapping, password redaction, and the CDP refusal.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { ResolvedConfig } from '../src/config.ts'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
-import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
+import type { ResolvedPlaywright } from '../src/playwright-resolve.ts'
+import { CDP_PROXY_POLICY, PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE, WEB_FETCH_PROXY_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
-import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightResponse } from '../src/types.ts'
+import type { PlaywrightBrowser, PlaywrightChromium, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightResponse } from '../src/types.ts'
+
+/**
+ * Controllable seam over the LOCAL backend resolution. With no hook installed
+ * the real resolution runs (the CDP real-socket case below needs its
+ * sibling), while a test installs a hook to observe the `launch` options
+ * without a browser, or to make the launch fail.
+ */
+const localBackendHook = vi.hoisted(() => ({
+  current: undefined as undefined | ((path: string) => Promise<ResolvedPlaywright>),
+}))
+
+vi.mock('../src/playwright-resolve.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/playwright-resolve.ts')>()
+  return {
+    ...actual,
+    resolvePlaywrightBackend: async (path: string): Promise<ResolvedPlaywright> => {
+      const hook = localBackendHook.current
+      return hook === undefined ? await actual.resolvePlaywrightBackend(path) : await hook(path)
+    },
+  }
+})
+
+/** Observable state of a fake persistent context (the managed backend). */
+interface FakePersistentState {
+  /** close() was called on the context (the whole browser going away). */
+  closed: boolean
+  /** Tabs handed out by newPage(). */
+  pagesOpened: number
+  /** Tabs whose close() was called. */
+  pagesClosed: number
+  /** Close listeners registered through on('close'). */
+  closeListeners: Array<() => void>
+}
+
+/** A fake persistent context: owns pages directly, tracks its own close. */
+function fakePersistentContext(spec: FakePageSpec = {}): { handle: PlaywrightPersistentContext; state: FakePersistentState } {
+  const state: FakePersistentState = { closed: false, pagesOpened: 0, pagesClosed: 0, closeListeners: [] }
+  const handle: PlaywrightPersistentContext = {
+    newPage: async () => {
+      state.pagesOpened++
+      const pageState: FakePageState = { pageClosed: false, gotos: 0 }
+      const page = makeFakePage(spec, pageState)
+      const close = page.close.bind(page)
+      return {
+        ...page,
+        close: async () => {
+          if (!pageState.pageClosed) state.pagesClosed++
+          await close()
+        },
+      }
+    },
+    route: async () => {},
+    close: async () => { state.closed = true },
+    pages: () => [],
+    isClosed: () => state.closed,
+    on: (event: 'disconnected' | 'close', listener: () => void) => {
+      if (event === 'close') state.closeListeners.push(listener)
+    },
+  }
+  return { handle, state }
+}
+
+/** What a fake backend recorded, for assertions. */
+interface FakeBackend {
+  /** `launch` option objects, in call order (the per-fetch local backend). */
+  launches: Array<Parameters<PlaywrightChromium['launch']>[0]>
+  /** `launchPersistentContext` calls: profile directory plus options. */
+  persistentLaunches: Array<{ userDataDir: string; options: Parameters<PlaywrightChromium['launchPersistentContext']>[1] }>
+  /** The persistent contexts those calls produced (one per launch). */
+  persistentContexts: Array<{ handle: PlaywrightPersistentContext; state: FakePersistentState }>
+}
+
+/**
+ * Install a fake local backend: every `launch`/`launchPersistentContext` call
+ * is recorded (options included, so the proxy/args/headless passthrough is
+ * observable) and the failure switches make it reject the way a real
+ * browser/proxy failure would.
+ */
+function installFakeLocalBackend(behavior: { failLaunch?: Error; failPersistentLaunch?: Error } = {}): FakeBackend {
+  const record: FakeBackend = { launches: [], persistentLaunches: [], persistentContexts: [] }
+  const chromium: PlaywrightChromium = {
+    launch: async (options) => {
+      record.launches.push(options)
+      if (behavior.failLaunch !== undefined) throw behavior.failLaunch
+      const pageState: FakePageState = { pageClosed: false, gotos: 0 }
+      const page = makeFakePage({}, pageState)
+      const context: PlaywrightContext = {
+        newPage: async () => page,
+        route: async () => {},
+        close: async () => {},
+      }
+      return { newContext: async () => context, close: async () => {} }
+    },
+    launchPersistentContext: async (userDataDir, options) => {
+      record.persistentLaunches.push({ userDataDir, options })
+      if (behavior.failPersistentLaunch !== undefined) throw behavior.failPersistentLaunch
+      const context = fakePersistentContext()
+      record.persistentContexts.push(context)
+      return context.handle
+    },
+    connectOverCDP: async () => { throw new Error('the local backend never connects over CDP') },
+  }
+  localBackendHook.current = async () => ({ chromium, source: 'fake test chromium' })
+  return record
+}
+
+/** A complete resolved section: optional fields blank unless overridden. */
+function resolvedConfig(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
+  return {
+    backend: 'local',
+    playwrightPath: '',
+    cdpEndpoint: '',
+    shareBrowserContext: true,
+    denoise: true,
+    maxConcurrency: 4,
+    challengeWaitMs: 0,
+    challengeRetries: 0,
+    proxyServer: '',
+    proxyBypass: '',
+    proxyUsername: '',
+    proxyPassword: '',
+    headless: true,
+    userDataDir: '',
+    launchArgs: '',
+    ...over,
+  }
+}
 
 /** Everything a fake navigation can be told to produce. */
 interface FakePageSpec {
@@ -474,6 +603,25 @@ describe('PlaywrightFetchProvider concurrency queue', () => {
     expect((error as WebError).message).toContain('waiting for a free rendering slot')
   })
 
+  it('drains a queue longer than the limit instead of stranding its tail', async () => {
+    // Regression: release() used to hand a slot to the next waiter WITHOUT
+    // dropping the finished holder's count, so `active` drifted one above the
+    // limit and only every other release freed a slot — a queue longer than
+    // the limit stranded its tail until the 20s queue timeout.
+    const provider = new GatedProvider({ maxConcurrency: 2 })
+    let releaseGate: (() => void) | undefined
+    provider.blockOn(new Promise<void>(resolve => { releaseGate = resolve }))
+    const fetches = Array.from({ length: 6 }, (_, index) =>
+      provider.fetch({ url: `https://example.com/queued-${String(index)}` }))
+    await flush()
+    expect(provider.started).toEqual([0, 1]) // two slots busy, four queued
+
+    releaseGate?.()
+    const results = await Promise.all(fetches)
+    expect(results.every(result => result.statusCode === 200)).toBe(true)
+    expect(provider.started).toHaveLength(6) // every waiter eventually ran
+  })
+
   it('does not release a phantom slot when a queued fetch fails', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const provider = new GatedProvider({ maxConcurrency: 1 })
@@ -811,5 +959,305 @@ describe('PlaywrightFetchProvider cloudflare challenge wait', () => {
     expect(result.statusCode).toBe(200)
     expect(bodyOf(result)).toContain('World')
     expect(counters(provider).gotos).toBe(2)
+  })
+})
+
+/** The P0 outbound proxy: injection, diagnosis, and the CDP refusal. */
+describe('PlaywrightFetchProvider outbound proxy', () => {
+  /** Read the rejection as a WebError (fails loudly on a surprise success). */
+  async function failureOf(promise: Promise<unknown>): Promise<WebError> {
+    const error = await promise.then(() => { throw new Error('expected the fetch to reject') }, (thrown: unknown) => thrown)
+    expect(error).toBeInstanceOf(WebError)
+    return error as WebError
+  }
+
+  afterEach(() => {
+    // Back to the real resolution for the next describe/test.
+    localBackendHook.current = undefined
+  })
+
+  it('passes the configured proxy (loopback bypass merged) to the local launch', async () => {
+    const { launches } = installFakeLocalBackend()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      proxyServer: '127.0.0.1:7890',
+      proxyBypass: '*.corp',
+    }))
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+    expect(launches).toHaveLength(1)
+    expect(launches[0]?.headless).toBe(true)
+    expect(launches[0]?.proxy).toEqual({
+      server: 'http://127.0.0.1:7890',
+      bypass: '*.corp,127.0.0.1,localhost,::1',
+    })
+  })
+
+  it('omits the proxy key entirely when no proxy is configured', async () => {
+    const { launches } = installFakeLocalBackend()
+    await new PlaywrightFetchProvider(() => resolvedConfig()).fetch({ url: 'https://example.com/docs' })
+    expect(launches).toHaveLength(1)
+    // A direct connection is expressed by the ABSENCE of the key, never by a
+    // blank proxy object.
+    expect(launches[0]).not.toHaveProperty('proxy')
+  })
+
+  it('carries the proxy credentials through to the launch', async () => {
+    const { launches } = installFakeLocalBackend()
+    await new PlaywrightFetchProvider(() => resolvedConfig({
+      proxyServer: 'http://proxy.corp:3128',
+      proxyUsername: 'proxyuser',
+      proxyPassword: 'p@ss word',
+    })).fetch({ url: 'https://example.com/docs' })
+    expect(launches[0]?.proxy).toEqual({
+      server: 'http://proxy.corp:3128',
+      bypass: '127.0.0.1,localhost,::1',
+      username: 'proxyuser',
+      password: 'p@ss word',
+    })
+  })
+
+  it('maps a launch failure with a proxy configured to WEB_FETCH_PROXY, naming the proxy and where it came from', async () => {
+    installFakeLocalBackend({ failLaunch: new Error('net::ERR_PROXY_CONNECTION_FAILED at http://127.0.0.1:7890') })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ proxyServer: '127.0.0.1:7890' }))
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe(WEB_FETCH_PROXY_CODE)
+    expect(error.message).toContain('127.0.0.1:7890') // the proxy address
+    expect(error.message).toContain('proxyServer') // the settings field it was resolved from
+    expect(error.message).toContain('fake test chromium') // the browser-backend provenance
+    expect(error.message).toContain('ERR_PROXY_CONNECTION_FAILED') // the upstream cause is kept
+  })
+
+  it('never lets the proxy password reach that message, even when the launch error quotes it', async () => {
+    installFakeLocalBackend({ failLaunch: new Error('proxy authentication failed for secret "p@ss word"') })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      proxyServer: 'http://user:s3cret@proxy.corp:3128',
+      proxyUsername: 'user',
+      proxyPassword: 'p@ss word',
+    }))
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe(WEB_FETCH_PROXY_CODE)
+    // Neither the password the launch error quoted nor the one embedded in
+    // the server field may survive into the diagnostic.
+    expect(error.message).not.toContain('p@ss word')
+    expect(error.message).not.toContain('s3cret')
+    expect(error.message).toContain('***')
+    expect(error.message).toContain('proxy.corp:3128')
+  })
+
+  it('keeps a plain launch failure as WEB_PROVIDER_ERROR when no proxy is configured', async () => {
+    installFakeLocalBackend({ failLaunch: new Error('no executable found') })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig())
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe('WEB_PROVIDER_ERROR')
+    expect((error as WebError).message).toContain('no executable found')
+  })
+
+  it('maps an unusable proxy server value to WEB_FETCH_PROXY without echoing it', async () => {
+    installFakeLocalBackend()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      proxyServer: 'ftp://user:sup3r-secret@proxy.corp:21',
+    }))
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe(WEB_FETCH_PROXY_CODE)
+    expect(error.message).toContain('proxyServer')
+    expect(error.message).not.toContain('sup3r-secret')
+  })
+
+  it('does NOT enforce a configured proxy on the CDP backend: the fetch runs', async () => {
+    // The semantics is hint-only (CDP_PROXY_POLICY): a proxy belongs to the
+    // browser process that was started elsewhere, so the settings value drives
+    // the launcher command/card preview and the explanation — never a refusal.
+    expect(CDP_PROXY_POLICY).toBe('hint-only')
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      backend: 'cdp',
+      cdpEndpoint: '127.0.0.1:9222',
+      proxyServer: 'http://127.0.0.1:7890',
+      proxyBypass: '*.corp',
+    }), pool)
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+    expect(state.connects).toBe(1)
+    expect(state.pagesClosed).toBe(1)
+  })
+
+  it('names the --proxy-server remedy in a CDP connect failure', async () => {
+    const pool = new CdpConnectionPool(async () => { throw new Error('connect ECONNREFUSED') })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      backend: 'cdp',
+      cdpEndpoint: '127.0.0.1:9222',
+      proxyServer: 'http://127.0.0.1:7890',
+    }), pool)
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe('WEB_PROVIDER_ERROR')
+    expect(error.message).toContain('--proxy-server')
+    expect(error.message).toContain('already-running browser')
+    expect(error.message).toContain('ECONNREFUSED')
+  })
+
+  it('leaves the CDP backend untouched when no proxy is configured', async () => {
+    const { state, pool } = fakeCdpConnection()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ backend: 'cdp', cdpEndpoint: '' }), pool)
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+    expect(state.connects).toBe(1)
+  })
+})
+
+/** The P1 DSH-managed persistent backend: one browser, many tabs. */
+describe('PlaywrightFetchProvider managed backend', () => {
+  /** Read the rejection as a WebError (fails loudly on a surprise success). */
+  async function failureOf(promise: Promise<unknown>): Promise<WebError> {
+    const error = await promise.then(() => { throw new Error('expected the fetch to reject') }, (thrown: unknown) => thrown)
+    expect(error).toBeInstanceOf(WebError)
+    return error as WebError
+  }
+
+  afterEach(() => {
+    localBackendHook.current = undefined
+  })
+
+  it('launches ONE persistent browser (profile, headless, proxy, args) and reuses it as tabs', async () => {
+    const backend = installFakeLocalBackend()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      backend: 'managed',
+      userDataDir: '/data/chrome-profile',
+      headless: true,
+      launchArgs: '--lang=zh-CN --disable-gpu',
+      proxyServer: '127.0.0.1:7890',
+    }))
+
+    const first = await provider.fetch({ url: 'https://example.com/a' })
+    const second = await provider.fetch({ url: 'https://example.com/b' })
+    expect(first.statusCode).toBe(200)
+    expect(second.statusCode).toBe(200)
+
+    // ONE launch for both fetches, with every managed launch input.
+    expect(backend.launches).toHaveLength(0) // no per-fetch browser at all
+    expect(backend.persistentLaunches).toHaveLength(1)
+    expect(backend.persistentLaunches[0]?.userDataDir).toBe('/data/chrome-profile')
+    expect(backend.persistentLaunches[0]?.options).toMatchObject({
+      headless: true,
+      proxy: { server: 'http://127.0.0.1:7890', bypass: '127.0.0.1,localhost,::1' },
+      args: ['--lang=zh-CN', '--disable-gpu'],
+    })
+
+    // Two tabs opened and closed; the persistent context (the browser) never.
+    const state = backend.persistentContexts[0]?.state
+    expect(state?.pagesOpened).toBe(2)
+    expect(state?.pagesClosed).toBe(2)
+    expect(state?.closed).toBe(false)
+
+    // Plugin teardown is what closes the browser (the profile stays on disk).
+    await provider.dispose()
+    expect(state?.closed).toBe(true)
+  })
+
+  it('omits headless/args/proxy keys the settings left unset (headless still defaults on)', async () => {
+    const backend = installFakeLocalBackend()
+    await new PlaywrightFetchProvider(() => resolvedConfig({ backend: 'managed', userDataDir: '/data/p' }))
+      .fetch({ url: 'https://example.com/docs' })
+    const options = backend.persistentLaunches[0]?.options
+    expect(options).toMatchObject({ headless: true })
+    expect(options).not.toHaveProperty('proxy')
+    expect(options).not.toHaveProperty('args')
+    expect(options).not.toHaveProperty('executablePath')
+  })
+
+  it('honours headless=false and a resolvable default profile directory', async () => {
+    const backend = installFakeLocalBackend()
+    await new PlaywrightFetchProvider(() => resolvedConfig({ backend: 'managed', headless: false }))
+      .fetch({ url: 'https://example.com/docs' })
+    expect(backend.persistentLaunches[0]?.options?.headless).toBe(false)
+    // Blank userDataDir resolves to the DSH-managed default, never ''.
+    expect(backend.persistentLaunches[0]?.userDataDir).toMatch(/web-fetch-playwright[\\/]profile$/)
+  })
+
+  it('replaces the browser when a launch setting changes, closing the old one', async () => {
+    const backend = installFakeLocalBackend()
+    let userDataDir = '/data/one'
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ backend: 'managed', userDataDir }))
+
+    await provider.fetch({ url: 'https://example.com/a' })
+    userDataDir = '/data/two'
+    await provider.fetch({ url: 'https://example.com/b' })
+
+    expect(backend.persistentLaunches.map(launch => launch.userDataDir)).toEqual(['/data/one', '/data/two'])
+    expect(backend.persistentContexts[0]?.state.closed).toBe(true) // the old browser is gone
+    expect(backend.persistentContexts[1]?.state.closed).toBe(false)
+  })
+
+  it('maps a managed launch failure with a proxy to WEB_FETCH_PROXY, naming the proxy and the profile', async () => {
+    installFakeLocalBackend({ failPersistentLaunch: new Error('net::ERR_PROXY_CONNECTION_FAILED') })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      backend: 'managed',
+      userDataDir: '/data/p',
+      proxyServer: 'http://127.0.0.1:7890',
+      proxyUsername: 'proxyuser',
+      proxyPassword: 'p@ss word',
+    }))
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe(WEB_FETCH_PROXY_CODE)
+    expect(error.message).toContain('127.0.0.1:7890')
+    expect(error.message).toContain('proxyServer')
+    expect(error.message).toContain('/data/p')
+    expect(error.message).not.toContain('p@ss word')
+  })
+
+  it('reports a managed launch failure without a proxy as WEB_PROVIDER_ERROR naming the profile', async () => {
+    installFakeLocalBackend({ failPersistentLaunch: new Error('Executable doesn\'t exist') })
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ backend: 'managed', userDataDir: '/data/p', headless: false }))
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe('WEB_PROVIDER_ERROR')
+    expect(error.message).toContain('/data/p')
+    expect(error.message).toContain('headful')
+    expect(error.message).toContain("Executable doesn't exist")
+  })
+
+  it('maps an unusable proxy value to WEB_FETCH_PROXY before any launch', async () => {
+    const backend = installFakeLocalBackend()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({
+      backend: 'managed',
+      proxyServer: 'ftp://proxy.corp:21',
+    }))
+    const error = await failureOf(provider.fetch({ url: 'https://example.com/docs' }))
+    expect(error.code).toBe(WEB_FETCH_PROXY_CODE)
+    expect(backend.persistentLaunches).toHaveLength(0)
+  })
+
+  it('relaunches after the persistent context went away (user closed the browser)', async () => {
+    const backend = installFakeLocalBackend()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ backend: 'managed', userDataDir: '/data/p' }))
+    await provider.fetch({ url: 'https://example.com/a' })
+    const first = backend.persistentContexts[0]
+    first?.state.closeListeners.forEach(listener => { listener() })
+    first && (first.state.closed = true)
+
+    await provider.fetch({ url: 'https://example.com/b' })
+    expect(backend.persistentLaunches).toHaveLength(2)
+  })
+
+  it('honours maxConcurrency as a TAB budget on the managed backend', async () => {
+    const backend = installFakeLocalBackend()
+    const provider = new PlaywrightFetchProvider(() => resolvedConfig({ backend: 'managed', userDataDir: '/data/p' }))
+    const results = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+      provider.fetch({ url: `https://example.com/tab-${String(index)}` })))
+    expect(results.every(result => result.statusCode === 200)).toBe(true)
+    // One browser for all twenty tabs — the managed default (50) never queued.
+    expect(backend.persistentLaunches).toHaveLength(1)
+    expect(backend.persistentContexts[0]?.state.pagesOpened).toBe(20)
+  })
+
+  it('passes headless/args to the LOCAL launch too, and omits them when unset', async () => {
+    const configured = installFakeLocalBackend()
+    await new PlaywrightFetchProvider(() => resolvedConfig({ headless: false, launchArgs: '--lang=zh-CN' }))
+      .fetch({ url: 'https://example.com/docs' })
+    expect(configured.launches[0]?.headless).toBe(false)
+    expect(configured.launches[0]?.args).toEqual(['--lang=zh-CN'])
+
+    const bare = installFakeLocalBackend()
+    await new PlaywrightFetchProvider(() => resolvedConfig()).fetch({ url: 'https://example.com/docs' })
+    expect(bare.launches[0]?.headless).toBe(true)
+    expect(bare.launches[0]).not.toHaveProperty('args')
   })
 })

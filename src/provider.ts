@@ -4,23 +4,48 @@
  * error taxonomy (URL hygiene, abort/timeout translation, content-type
  * classification) so the tool layer sees the same codes from either backend.
  *
- * Lifecycle: the local backend launches a browser per fetch and closes it —
- * nothing outlives the call. The CDP backend keeps ONE shared connection to
- * the remote browser for the provider's lifetime; each fetch only opens a
- * page (tab) inside it and closes that on completion — in a throwaway
- * isolated context, or (the default, `shareBrowserContext`) in the remote
- * browser's default context so its profile, cookies, and persistent logins
- * apply; that default context is never closed. The concurrency cap counts
- * tabs, not browsers. Either way, an aborted signal closes the fetch's page.
- * Concurrency is capped at the `maxConcurrency` setting (explicit, or the
- * backend default — {@link DEFAULT_MAX_CONCURRENCY_LOCAL} browsers /
- * {@link DEFAULT_MAX_CONCURRENCY_CDP} tabs); further fetches wait briefly in
- * a queue and fail fast (rather than hang until abort) when no slot frees.
+ * Lifecycle — one row per backend:
+ *
+ * - `local`: launches a browser per fetch and closes it; nothing outlives the
+ *   call. Fresh context, fresh everything.
+ * - `managed` (DSH-hosted persistent browser): launches ONE browser for the
+ *   provider's lifetime over `userDataDir` (`launchPersistentContext`), so
+ *   logins persist across fetches and restarts; each fetch opens a tab in that
+ *   persistent context and closes only the tab. The browser and its profile
+ *   context are never closed per fetch — only on plugin teardown (or when a
+ *   setting that shapes the launch changes, which replaces it).
+ * - `cdp`: keeps ONE shared connection to a browser someone else started; each
+ *   fetch opens a page (tab) inside it and closes that on completion — in a
+ *   throwaway isolated context, or (the default, `shareBrowserContext`) in the
+ *   remote browser's default context so its profile, cookies, and persistent
+ *   logins apply; that default context is never closed.
+ *
+ * Concurrency counts TABS for `cdp` and `managed` (one browser is already
+ * alive; a slot is a tab) and BROWSERS for `local` — hence the backend-priced
+ * defaults ({@link DEFAULT_MAX_CONCURRENCY_LOCAL} /
+ * {@link DEFAULT_MAX_CONCURRENCY_CDP} / {@link DEFAULT_MAX_CONCURRENCY_MANAGED}).
+ * Either way, an aborted signal closes the fetch's page, further fetches wait
+ * briefly in a queue, and a queued fetch fails fast (rather than hanging until
+ * abort) when no slot frees.
  *
  * Private-network and SSRF protection is not implemented (same stance as the
  * shipped HTTP provider); a page this provider can reach is whatever the
- * browser can reach. Profile mode additionally acts WITH the remote
- * browser's logged-in sessions (see the README's risk notes).
+ * browser can reach. Profile-bearing backends (`managed`, CDP `profile` mode)
+ * additionally act WITH the browser's logged-in sessions (see the README's
+ * risk notes).
+ *
+ * Outbound proxy (P0): the proxy configured in the settings is injected into
+ * every browser THIS PLUGIN launches — `local` and `managed` — through
+ * Playwright's `launch({ proxy })` / `launchPersistentContext({ proxy })`;
+ * with no proxy configured the key is not passed at all. A proxy is a
+ * launch-time property of a browser PROCESS, so on the `cdp` backend it
+ * belongs to the browser that was started elsewhere: this plugin can neither
+ * inject it there nor verify it (see {@link CDP_PROXY_NOTE} and
+ * {@link CDP_PROXY_POLICY}), and the local launcher turns the same settings
+ * into that browser's `--proxy-server`. Every proxy failure THIS plugin can
+ * observe (an unusable value, a launch that failed with a proxy configured)
+ * surfaces as {@link WEB_FETCH_PROXY_CODE}, naming the proxy address and where
+ * it came from — and never the password.
  *
  * Cloudflare challenges (issue #2): when a navigation lands on a challenge
  * interstitial, the fetch waits — on the SAME page and in the SAME browser
@@ -41,12 +66,15 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
 import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 import type { ChallengeVerdict } from './challenge.ts'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveMaxConcurrency, normalizeCdpEndpoint } from './config.ts'
-import type { ResolvedConfig } from './config.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveHeadless, effectiveMaxConcurrency, managedLaunchFor, managedLaunchKey, normalizeCdpEndpoint, proxyOptionFor, redactProxyServer } from './config.ts'
+import type { ManagedLaunch, ProxySettings, ResolvedConfig } from './config.ts'
+import { BrowserPool } from './browser-pool.ts'
+import type { BrowserPoolOptions } from './browser-pool.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown } from './markdown.ts'
+import { parseLaunchArgs } from './launch-args.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
-import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightResponse, PlaywrightRoute } from './types.ts'
+import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightProxyOption, PlaywrightResponse, PlaywrightRoute } from './types.ts'
 
 /** Stable id this provider registers under (the bundle patch pins it). */
 export const PLAYWRIGHT_FETCH_PROVIDER_ID = 'playwright'
@@ -59,6 +87,48 @@ export const PLAYWRIGHT_FETCH_PROVIDER_ID = 'playwright'
  * a transport timeout or a provider bug.
  */
 export const WEB_FETCH_CHALLENGE_CODE = 'WEB_FETCH_CHALLENGE'
+
+/**
+ * Error code for a proxy this provider could not apply: an unusable
+ * `proxyServer` value, or a launch through the configured proxy that failed
+ * (`local` / `managed`, the two backends this plugin launches itself).
+ * Provider-specific by the same open-`code` contract as
+ * {@link WEB_FETCH_CHALLENGE_CODE}; the message always names the proxy address
+ * and where it was resolved from, and never the password.
+ */
+export const WEB_FETCH_PROXY_CODE = 'WEB_FETCH_PROXY'
+
+/**
+ * The one fact a user needs when a proxy meets the CDP backend: the proxy is
+ * a launch-time property of the browser PROCESS, so it belongs on the command
+ * that starts that browser (`--proxy-server=...`) — attaching over CDP cannot
+ * retro-fit one, and this plugin cannot verify one either (a hand-started
+ * browser that forgot the flag simply goes direct). Spelled once here and
+ * mirrored by the card's copy (`client/locales.ts`) and the README so the
+ * explanation cannot drift between them.
+ */
+const CDP_PROXY_NOTE = 'a proxy is a launch-time property of that browser: it must have been started with --proxy-server=..., and this plugin cannot inject a proxy into (or verify one on) an already-running browser'
+
+/**
+ * The single switch point for what a configured `proxyServer` means while the
+ * CDP backend is selected — the only place that decision lives.
+ *
+ * `'hint-only'` (shipped): the fetch RUNS. Refusing every proxied CDP fetch
+ * would break exactly the topology the local launcher exists for (the user
+ * configures the proxy in the card, the launcher turns it into
+ * `--proxy-server`, and the plugin then attaches over CDP), so the settings
+ * field instead drives the launcher command and the card preview, and the
+ * relationship is EXPLAINED — {@link CDP_PROXY_NOTE} in the card's copy and in
+ * the CDP error messages — rather than enforced. A browser started without the
+ * flag simply egresses directly; that footgun is documented, not policed.
+ *
+ * `'refuse'` would be the pre-P1 alternative (every CDP fetch fails with
+ * {@link WEB_FETCH_PROXY_CODE} until the field is cleared); switching to it
+ * means changing this constant AND restoring the refusal branch in
+ * {@link PlaywrightFetchProvider.openSession} — nothing else in the provider,
+ * the launcher, the card, or the docs is structured around either choice.
+ */
+export const CDP_PROXY_POLICY: 'hint-only' | 'refuse' = 'hint-only'
 
 /** Maximum accepted request URL length (http-provider parity). */
 const MAX_URL_LENGTH = 2048
@@ -208,14 +278,13 @@ class Semaphore {
   }
 
   release(): void {
-    // Below the limit a freed slot hands straight to the next waiter; above
-    // it (the limit was lowered) the slot disappears instead.
-    const next = this.active <= this.limit ? this.queue.shift() : undefined
-    if (next === undefined) {
-      this.active = Math.max(0, this.active - 1)
-      return
-    }
-    next.start()
+    // A holder finished: give its slot back FIRST, then hand out whatever
+    // capacity that opens. (Accounting this the other way around — starting a
+    // waiter without dropping the finished holder's count — makes `active`
+    // drift one above the limit, so only every other release frees a slot and
+    // a queue longer than the limit strands its tail until the queue timeout.)
+    this.active = Math.max(0, this.active - 1)
+    this.drain()
   }
 
   private drain(): void {
@@ -272,6 +341,48 @@ function translateError(error: unknown, deadline: Deadline): WebError {
   return new WebError(`playwright web fetch failed: ${String(error instanceof Error ? error.message : error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
 }
 
+/** A thrown value's best one-line description, for the diagnostic messages. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * The launch proxy option for a settings section, with an unusable configured
+ * address mapped to {@link WEB_FETCH_PROXY_CODE} (the normalizer's own
+ * message never echoes the value, so a `user:pass@` in the field cannot leak
+ * here).
+ *
+ * @param config - the resolved settings section.
+ * @returns the launch proxy option, or undefined for a direct connection.
+ * @throws {WebError} WEB_FETCH_PROXY when the configured server is unusable.
+ */
+function resolveProxyOption(config: ProxySettings): PlaywrightProxyOption | undefined {
+  try {
+    return proxyOptionFor(config)
+  } catch (error: unknown) {
+    throw new WebError(
+      `the proxy server configured in the web-fetch-playwright settings (field proxyServer) is not usable: ${messageOf(error)}. Use host:port or an http(s)/socks4/socks5 URL, or clear it for a direct connection.`,
+      WEB_FETCH_PROXY_CODE,
+      { cause: error },
+    )
+  }
+}
+
+/**
+ * Scrub a configured proxy password out of a diagnostic. Playwright's launch
+ * errors can quote the credentials the browser was handed, and this
+ * provider's contract is that no proxy error message carries the password.
+ *
+ * @param message - the upstream error message.
+ * @param proxy - the launch proxy option the message may have quoted.
+ * @returns the message with any occurrence of the password replaced.
+ */
+function redactProxyPassword(message: string, proxy: PlaywrightProxyOption): string {
+  const password = proxy.password ?? ''
+  if (password === '') return message
+  return message.split(password).join('***')
+}
+
 /**
  * The Playwright-backed fetch provider. Configuration is read through a thunk
  * so committed settings-section changes apply to the next fetch with no
@@ -286,11 +397,25 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   protected readonly cdpPool: CdpConnectionPool
 
   /**
+   * The DSH-managed persistent browser. The pool key is the launch descriptor
+   * (profile directory, headless, args, proxy, Playwright path), so editing
+   * any of those replaces the browser on the next fetch while everything else
+   * keeps reusing it. Injectable for the suite.
+   */
+  protected readonly managedPool: BrowserPool<ManagedLaunch, PlaywrightPersistentContext>
+
+  /**
    * @param configSource - thunk returning the currently authoritative config.
    * @param cdpPool - optional pool over the CDP backend (tests inject fakes).
+   * @param managedPool - optional pool over the managed persistent backend.
    */
-  constructor(private readonly configSource: () => ResolvedConfig, cdpPool?: CdpConnectionPool) {
+  constructor(
+    private readonly configSource: () => ResolvedConfig,
+    cdpPool?: CdpConnectionPool,
+    managedPool?: BrowserPool<ManagedLaunch, PlaywrightPersistentContext>,
+  ) {
     this.cdpPool = cdpPool ?? new CdpConnectionPool(defaultCdpConnect)
+    this.managedPool = managedPool ?? new BrowserPool(defaultManagedPoolOptions)
   }
 
   /** Cheap and side-effect free; backend problems surface per fetch instead. */
@@ -299,12 +424,17 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   }
 
   /**
-   * Drop the shared CDP connection (plugin teardown). Local browsers need
-   * nothing — they never outlive their fetch. In-flight CDP fetches keep
-   * their leases and close them when they finish.
+   * Drop the shared browser handles (plugin teardown): the CDP connection,
+   * which merely disconnects from a browser someone else owns, and the
+   * managed persistent browser, which this plugin launched and therefore
+   * closes (its profile directory stays on disk — that is what makes the
+   * logins persist to the next start). Local browsers need nothing: they
+   * never outlive their fetch. In-flight fetches keep their leases/pages and
+   * close them when they finish.
    */
   async dispose(): Promise<void> {
     await this.cdpPool.dispose()
+    await this.managedPool.dispose()
   }
 
   async fetch(request: WebFetchRequest, signal?: AbortSignal): Promise<WebFetchResult> {
@@ -354,6 +484,12 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    */
   protected async openSession(config: ResolvedConfig, deadline: Deadline): Promise<BrowserSession> {
     const timeout = Math.min(deadline.remainingMs(), 20_000)
+    // Proxy settings are validated before any launch/connect: an unusable
+    // value deserves its own diagnosis rather than being reported as a
+    // browser problem. On the CDP backend this value is NOT enforced — see
+    // CDP_PROXY_POLICY — it only shapes the launcher command/preview and the
+    // explanation in the CDP messages below.
+    const proxy = resolveProxyOption(config)
     if (config.backend === 'cdp') {
       const endpoint = normalizeCdpEndpoint(config.cdpEndpoint)
       const { source } = await resolveCdpBackend()
@@ -373,17 +509,64 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         }
       } catch (error: unknown) {
         throw new WebError(
-          `cannot connect to the CDP endpoint ${endpoint} (${source}); is the browser started with --remote-debugging-port? ${String(error instanceof Error ? error.message : error)}`,
+          `cannot connect to the CDP endpoint ${endpoint} (${source}); is the browser started with --remote-debugging-port? Note that ${CDP_PROXY_NOTE}. ${messageOf(error)}`,
+          'WEB_PROVIDER_ERROR',
+          { cause: error },
+        )
+      }
+    }
+    if (config.backend === 'managed') {
+      // One persistent browser for the provider's lifetime: `userDataDir`
+      // holds the profile, so logins survive across fetches and restarts, and
+      // every fetch is a tab in it (never a new browser, never a closed
+      // context). headless/args/proxy all belong to the process, so the pool
+      // key covers them: editing any of them replaces the browser.
+      const launch = managedLaunchFor(config, proxy)
+      try {
+        const lease = await this.managedPool.acquire(launch, timeout, 'shared')
+        await installResourceFilter(lease.page)
+        guardPopups(lease.page)
+        return {
+          browser: lease.browser,
+          context: lease.context,
+          page: lease.page,
+          sharedBrowser: true,
+          persistent: true,
+        }
+      } catch (error: unknown) {
+        const detail = messageOf(error)
+        if (proxy !== undefined) {
+          throw new WebError(
+            `cannot launch the managed browser through the configured proxy ${redactProxyServer(proxy.server)} (read from the web-fetch-playwright settings section, field proxyServer; the profile is ${launch.userDataDir}): ${redactProxyPassword(detail, proxy)}. Check that the proxy address, bypass list, username, and password are right and reachable — or clear proxyServer for a direct connection.`,
+            WEB_FETCH_PROXY_CODE,
+            { cause: error },
+          )
+        }
+        throw new WebError(
+          `cannot launch the managed persistent browser on ${launch.userDataDir} (${launch.headless ? 'headless' : 'headful'}): ${detail}. Run \`playwright install chromium\`, point the settings path at a playwright/browser executable, or clear the user-data-dir field to use the default profile directory.`,
           'WEB_PROVIDER_ERROR',
           { cause: error },
         )
       }
     }
     const { chromium, executablePath, source } = await resolvePlaywrightBackend(config.playwrightPath)
+    const newContext = (browser: PlaywrightBrowser): (() => Promise<PlaywrightContext>) | undefined => browser.newContext?.bind(browser)
     let browser: PlaywrightBrowser | undefined
     try {
-      browser = await chromium.launch({ headless: true, ...(executablePath !== undefined ? { executablePath } : {}), timeout })
-      const context = await browser.newContext()
+      const args = parseLaunchArgs(config.launchArgs ?? '')
+      browser = await chromium.launch({
+        headless: effectiveHeadless(config),
+        ...(executablePath !== undefined ? { executablePath } : {}),
+        // With no proxy configured the key stays absent entirely, so a
+        // direct connection is never expressed as a proxy object.
+        ...(proxy !== undefined ? { proxy } : {}),
+        // Same rule for extra arguments: an empty setting adds no key.
+        ...(args.length > 0 ? { args } : {}),
+        timeout,
+      })
+      const create = newContext(browser)
+      if (create === undefined) throw new Error('the resolved playwright backend cannot open a browser context')
+      const context = await create()
       const page = await context.newPage()
       await installResourceFilter(page)
       guardPopups(page)
@@ -393,8 +576,15 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       // must not strand the process — closing the browser takes its
       // contexts and pages with it.
       await browser?.close().catch(() => {})
+      if (proxy !== undefined) {
+        throw new WebError(
+          `cannot launch the local browser through the configured proxy ${redactProxyServer(proxy.server)} (read from the web-fetch-playwright settings section, field proxyServer; the browser backend resolved from ${source}): ${redactProxyPassword(messageOf(error), proxy)}. Check that the proxy address, bypass list, username, and password are right and reachable — or clear proxyServer for a direct connection.`,
+          WEB_FETCH_PROXY_CODE,
+          { cause: error },
+        )
+      }
       throw new WebError(
-        `cannot launch the local browser (${source}); run \`playwright install chromium\` or point the settings path at a playwright/browser executable. ${String(error instanceof Error ? error.message : error)}`,
+        `cannot launch the local browser (${source}); run \`playwright install chromium\` or point the settings path at a playwright/browser executable. ${messageOf(error)}`,
         'WEB_PROVIDER_ERROR',
         { cause: error },
       )
@@ -677,6 +867,43 @@ async function closeWithGrace(closeable: { close(): Promise<void> }): Promise<vo
 async function defaultCdpConnect(endpoint: string, timeoutMs: number): Promise<PlaywrightBrowser> {
   const { chromium } = await resolveCdpBackend()
   return await chromium.connectOverCDP(endpoint, { timeout: timeoutMs })
+}
+
+/**
+ * The managed backend's pool wiring: `launchPersistentContext` opens ONE
+ * browser over the profile directory, and every lease is a tab in that very
+ * context (`shared` mode) — release closes the tab and nothing else, because
+ * closing the persistent context would kill the browser and the logins the
+ * backend exists to keep. Liveness/`watch` use the context's own `close`
+ * signal (`isClosed()`), so a browser the user or the OS killed is relaunched
+ * on the next fetch instead of failing every later lease.
+ */
+const defaultManagedPoolOptions: BrowserPoolOptions<ManagedLaunch, PlaywrightPersistentContext> = {
+  open: defaultManagedLaunch,
+  keyText: managedLaunchKey,
+  acquireContext: handle => ({ context: handle, persistent: true }),
+  isLive: handle => handle.isClosed?.() !== true,
+  watch: (handle, lost) => { handle.on?.('close', lost) },
+}
+
+/**
+ * The real managed launch: whichever Playwright serves this plugin, with a
+ * PERSISTENT profile directory, the configured headless switch, the resolved
+ * proxy, and the extra arguments from `launchArgs`.
+ *
+ * @param launch - the resolved launch descriptor (also the pool's key).
+ * @param timeoutMs - launch budget.
+ * @returns the persistent context the pool keeps alive.
+ */
+async function defaultManagedLaunch(launch: ManagedLaunch, timeoutMs: number): Promise<PlaywrightPersistentContext> {
+  const { chromium, executablePath } = await resolvePlaywrightBackend(launch.playwrightPath)
+  return await chromium.launchPersistentContext(launch.userDataDir, {
+    headless: launch.headless,
+    ...(executablePath !== undefined ? { executablePath } : {}),
+    ...(launch.proxy !== undefined ? { proxy: launch.proxy } : {}),
+    ...(launch.args.length > 0 ? { args: launch.args } : {}),
+    timeout: timeoutMs,
+  })
 }
 
 /**

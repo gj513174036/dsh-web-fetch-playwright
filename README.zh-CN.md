@@ -10,11 +10,13 @@
 
 - **真实浏览器渲染** —— 以用户视角加载页面，SPA 客户端渲染内容也能抓到，而非只有原始 HTML。
 - **降噪管线** —— Mozilla Readability 提取正文，DOMPurify 移除布局/噪音标签（导航、侧边栏、页脚、广告、表单），Turndown + GFM 插件按与内置 `tool-web` 渲染器一致的风格转成 Markdown。内联 `data:` 图片（Docusaurus 等构建工具会把截图以 base64 内嵌进 HTML）会被替换为带大小的占位符，如 `![alt](data:image/png;base64,...8.9KB)`，避免 base64 字符流刷屏。
-- **两种后端** —— 本地启动 Playwright 浏览器，或通过 DevTools 协议（CDP）驱动一个已在运行的浏览器。
+- **三种后端** —— 本地每次抓取启动一次性 Playwright 浏览器；**DSH 托管持久浏览器**（在 `user-data-dir` 上只启动一个浏览器、按标签页复用，headless 由配置决定）；或通过 DevTools 协议（CDP）驱动一个已在运行的浏览器。
+- **出站代理** —— 代理地址、绕过列表、用户名、密码只配一次：本插件启动的每个浏览器（**本地**与 **DSH 托管**）都会注入该代理；对 **CDP** 后端，同一组设置会由随包启动器拼成 `--proxy-server` 命令，供你启动那个浏览器时使用。
 - **浏览器解析** —— 配置路径 → `$PATH` 上的 `playwright` CLI → 插件自带的 `playwright-core`；CDP 模式完全不需要本地浏览器。
-- **共享或隔离会话（CDP）** —— 每次抓取严格限定为一个标签页。本地后端每次抓取启动并关闭自己的浏览器；CDP 后端对远端浏览器保持**一条共享连接**，每次抓取只在其里开一个标签页、用完即关。默认该标签页位于远端浏览器的**真实 profile**（沿用其 cookie、localStorage 与已登录会话，效果类似 `playwright-cli open`）；取消勾选「共享浏览器上下文」则切换为每次抓取全新隔离 context。
+- **共享或隔离会话** —— 每次抓取严格限定为一个标签页。本地后端每次抓取启动并关闭自己的浏览器；DSH 托管后端与 CDP 后端各保持**一个共享浏览器**，每次抓取只在其里开一个标签页、用完即关。CDP 默认该标签页位于远端浏览器的**真实 profile**（沿用其 cookie、localStorage 与已登录会话，效果类似 `playwright-cli open`）；取消勾选「共享浏览器上下文」则切换为每次抓取全新隔离 context。
+- **可视调试用本地启动器** —— `dsh-web-fetch-launch` 复制你的真实 profile、用 `--remote-debugging-port`（并带上配置好的代理）启动你自己的 Chrome，并打印把该端口送到插件宿主机的 `autossh` 反向隧道命令（见 [两种拓扑](#两种拓扑可视浏览器--服务器无头)）。
 - **热配置** —— 「设置 → 插件 → 插件配置」卡片可随时切换后端、上下文模式、降噪开关与并发数，改动对下一次抓取即时生效，无需重启。
-- **预算控制** —— 单次抓取 45s 超时；并发按后端定价（`maxConcurrency`，默认本地 4 个浏览器 / **CDP 50 个标签页**；排队的抓取等不到空位会在 20s 内尽快报错并提示重试，而不是一直挂到被工具层中止）；拦截图片/字体/媒体子请求；返回体 10 万字符封顶。
+- **预算控制** —— 单次抓取 45s 超时；并发按后端定价（`maxConcurrency`，默认本地 4 个浏览器 / CDP 与 DSH 托管后端 **50 个标签页**；排队的抓取等不到空位会在 20s 内尽快报错并提示重试，而不是一直挂到被工具层中止）；拦截图片/字体/媒体子请求；返回体 10 万字符封顶。
 - **Cloudflare 挑战有界等待** —— 导航落到验证中间页（"Just a moment…" 及其多语言同族，通过官方 `cf-mitigated: challenge` 响应头 + 结构性页面标记识别）时，抓取保持**同一标签页与上下文**，等待浏览器自行通过验证：跟踪*最后一次*主 frame 响应（真实页面随后重载进来），并轮询活 DOM 以捕获 SPA 式清除。有界且可配置（`challengeWaitMs`，默认 15s；`0` 恢复旧版首响应行为），附带同标签页有界重试（`challengeRetries`，默认 1）。预算耗尽时以独立的 `WEB_FETCH_CHALLENGE` 错误码明确失败，而不是把中间页当正文返回。全程不点击、不注入验证码答案、不伪造浏览器状态、不导出或复制 cookie。
 
 ## 工作原理
@@ -23,12 +25,15 @@
 | --- | --- | --- |
 | 宿主（服务端） | `src/` | 向 `ctx.web` 注册 fetch provider（id `playwright`）；`cordis.patch.yml` 把 web seam 的 `fetchProvider` 固定为本插件，并启用 `web_fetch` 工具（60s 预算）。 |
 | 浏览器（客户端） | `src/client/` | 注册 *Playwright 网页爬取* 配置卡片，通过 settings 服务把改动热写入 `$DSH_HOME/settings.yaml`。 |
+| 本地启动器 | `bin/launch-browser.mjs` | `dsh-web-fetch-launch`：复制你的 profile、带着 DevTools 端口与配置好的代理启动你的浏览器，并打印隧道命令。 |
 
 ```
 web_fetch (tool-web)
    └─ ctx.web.fetchProvider = playwright
-        ├─ local: 解析（路径 → $PATH → 内置 playwright-core）→ chromium.launch
-        ├─ cdp:   connectOverCDP(endpoint)
+        ├─ local:   解析（路径 → $PATH → 内置 playwright-core）→ chromium.launch（每次抓取一个浏览器）
+        ├─ managed: 解析 → chromium.launchPersistentContext(userDataDir, {headless, proxy, args})
+        │            └─ 整个生命周期只启动一个浏览器；每次抓取是它的一个标签页
+        ├─ cdp:     connectOverCDP(endpoint) → 一条共享连接；每次抓取一个标签页
         ├─ page.goto → 等待稳定（networkidle，尽力而为）→ page.content()
         ├─ 降噪：jsdom → 内联 data: 图片改占位符 → Readability → DOMPurify → Turndown(GFM)
         └─ Markdown（关闭降噪时返回原始 HTML）
@@ -38,7 +43,8 @@ web_fetch (tool-web)
 
 - DSH web profile（`dsh web`），Node.js ≥ 20。
 - **本地**后端：装有 Chromium 的 Playwright、Chromium 系浏览器可执行文件，或默认缓存里有浏览器的 `playwright-core`。
-- **CDP** 后端：任意已带 `--remote-debugging-port` 启动的浏览器（如 `chromium --headless --remote-debugging-port=9222`）。
+- **DSH 托管**后端：与本地后端相同的浏览器解析；由插件在 `user-data-dir` 上启动（默认无头）。
+- **CDP** 后端：任意已带 `--remote-debugging-port` 启动的浏览器（如 `chromium --headless --remote-debugging-port=9222`，或用下方随包启动器）。
 
 ## 安装
 
@@ -66,12 +72,18 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
-| `backend` | `local` | radio：本地 Playwright / 远端 CDP 地址，每个选项内嵌各自的填空。 |
-| `playwrightPath` | 空 | 本地后端：`playwright` 可执行文件或 Chromium 系浏览器二进制路径；留空按 `$PATH` 查找，再回退到内置 `playwright-core`。 |
+| `backend` | `local` | radio：*本地 Playwright*（每次抓取一次性浏览器）/ *DSH 托管持久浏览器*（在 `user-data-dir` 上长期保留一个浏览器）/ *远端 CDP 地址*（你自己启动的浏览器），每个选项内嵌各自的填空。 |
+| `playwrightPath` | 空 | 本地与托管后端：`playwright` 可执行文件或 Chromium 系浏览器二进制路径；留空按 `$PATH` 查找，再回退到内置 `playwright-core`。 |
+| `headless` | `true` | 托管后端（以及本地后端与启动器）：浏览器是否无头运行。桌面环境下可取消勾选，手动登录一次。 |
+| `userDataDir` | 空 | 托管后端：持久 profile 目录——登录态、cookie、扩展都在这里；留空 = `$DSH_HOME/web-fetch-playwright/profile`。**该目录属于凭据数据，插件永不清理。** |
+| `launchArgs` | 空 | 追加到本插件启动的每个浏览器（以及启动器命令）的额外 Chromium 参数，如 `--lang=zh-CN --disable-gpu`；按空格拆分，含空格的值请加引号。 |
 | `cdpEndpoint` | `127.0.0.1:9222` | 远端后端：`host:port`、`http(s)://…` 或 `ws(s)://…`。 |
-| `shareBrowserContext` | `true` | 仅 CDP 后端。**勾选（profile 模式）**：每次抓取是远端浏览器默认 context（真实 profile）里的一个标签页，cookie/localStorage 与之互通、已登录会话直接生效，抓取结束只关标签页；**取消勾选（隔离模式）**：每次抓取使用全新隐身式 context，互不共享。本地后端忽略此字段。 |
+| `shareBrowserContext` | `true` | 仅 CDP 后端。**勾选（profile 模式）**：每次抓取是远端浏览器默认 context（真实 profile）里的一个标签页，cookie/localStorage 与之互通、已登录会话直接生效，抓取结束只关标签页；**取消勾选（隔离模式）**：每次抓取使用全新隐身式 context，互不共享。托管后端始终使用自己的持久 profile；本地后端忽略此字段。 |
+| `proxyServer` | 空 | 出站代理：`host:port` 或 `http(s)/socks4/socks5` 地址；留空 = 直连。**本地/托管**：注入所启动的浏览器；**CDP**：插件不生效（见[出站代理](#出站代理)），只用于生成启动器的 `--proxy-server`。 |
+| `proxyBypass` | 空 | 逗号分隔的绕过主机；回环地址（`127.0.0.1`、`localhost`、`::1`）始终并入；启动器会把它改写成 Chromium 的 `;` 分隔形式。 |
+| `proxyUsername` / `proxyPassword` | 空 | 代理凭据，以 `Proxy-Authorization` 发送；与其他设置一同保存，密码永远不会出现在错误信息里（卡片以掩码显示）。 |
 | `denoise` | `true` | 是否启用降噪；关闭时返回整页渲染 HTML，交由工具层转换。 |
-| `maxConcurrency` | *（自动）* | 同时渲染的页面上限（1–200）。留空按后端取默认：本地 **4**（每个槽位启动一个浏览器）/ CDP **50**（远端浏览器已就位，每个槽位只是一个标签页）。超出的请求短暂排队；20s 内等不到空位则以 `WEB_FETCH_TIMEOUT` 尽快失败并提示重试或调大该值，而不是一直挂起直到工具层预算中止。 |
+| `maxConcurrency` | *（自动）* | 同时渲染的页面上限（1–200）。留空按后端取默认：本地 **4**（每个槽位启动一个浏览器）/ CDP 与 DSH 托管后端 **50 个标签页**（浏览器已在运行，一个并发名额就是一个标签页）。超出的请求短暂排队；20s 内等不到空位则以 `WEB_FETCH_TIMEOUT` 尽快失败并提示重试或调大该值，而不是一直挂起直到工具层预算中止。 |
 | `challengeWaitMs` | `15000` | Cloudflare 挑战的**有界**自然等待上限（毫秒，0–60000），在同一标签页内等待浏览器自行通过验证。`0` 关闭整条挑战处理链路——直接返回首次响应（0.2.5 之前的旧行为）。 |
 | `challengeRetries` | `1` | 一个等待窗口耗尽后的**同标签页**重新导航次数（0–3）；浏览器已拿到的通关 cookie 留在上下文里供重试使用。总耗时始终受 45s 单次抓取预算约束。 |
 
@@ -84,6 +96,57 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 > **Windows 说明** —— `$PATH` 已按平台分隔符（`;`）扫描，但 npm/pnpm 全局安装暴露的 `playwright` 是 `.cmd`/`.ps1` 垫片，从垫片位置向上找不到包根，自动发现可能仍落在第 3 步（内置 core）。要使用指定安装的浏览器注册表，请把 `playwrightPath` 显式指向 `playwright` 包目录或浏览器二进制。
 
 CDP 模式不需要本地浏览器：插件在生命周期内对远端浏览器保持**一条共享连接**（连接断开自动重连，地址改动后自动换连），每次抓取只租用远端浏览器里的一个标签页，抓取结束即关闭。因此并发数按"标签页"计，默认也更高（50）。插件卸载时断开共享连接（绝不会关闭远端浏览器本身）。
+
+### DSH 托管持久浏览器
+
+`backend: managed` 把浏览器交给 DSH 自己管：插件调用一次 `launchPersistentContext(userDataDir, { headless, proxy, args })`，并在整个生命周期内保留这一个浏览器，所以每次抓取都是**同一个**浏览器、**同一个** profile 目录里的一个标签页。登录态、cookie、localStorage、扩展会跨抓取、跨 `dsh web` 重启、跨插件重载保留——在桌面环境取消勾选「无头运行」手动登录一次，再勾回去即可用于生产。
+
+- **并发即标签页。** 浏览器已在运行，因此 `maxConcurrency`（默认 50）表示同时可开多少标签页，与 CDP 后端一致。
+- **改启动设置会换浏览器。** 共享浏览器由启动描述符做键（profile 目录、headless、额外参数、代理、Playwright 路径）：改动其中任意一项，下一次抓取会关闭旧浏览器并启动新的；改 `challengeWaitMs`、`denoise`、`maxConcurrency` 不会。
+- **卸载即关闭。** 卸载插件（或 `dsh web` 退出）会关闭浏览器，profile 目录留在磁盘上；若浏览器被用户手动关掉（`isClosed()`），下一次抓取会自动重启它。
+- **profile 需要你自行保护。** 登录会话产生的缓存与凭据都在该目录里；请把 `userDataDir` 指向你愿意按凭据对待的路径，插件不会清理、导出或复制它。删除它即登出。
+
+### 出站代理
+
+卡片里的代理字段是「一组设置、两种用法」，因为代理本质上属于浏览器**进程**：
+
+| 后端 | 代理设置的作用 |
+| --- | --- |
+| `local` | 通过 Playwright 的 `launch({ proxy })` 注入：每个一次性浏览器都走该代理，并自动并入回环例外。 |
+| `managed` | 同样通过 `launchPersistentContext({ proxy })` 注入到那个持久浏览器上。 |
+| `cdp` | **不注入、也不校验。** 浏览器是别人启动的，代理是它自身的启动期属性：必须用它启动时的 `--proxy-server=…` 指定（下方启动器会用同一组设置替你拼好）。插件不会因此拒绝抓取；若手启时漏了该参数，流量就直连。 |
+
+通用细节：
+
+- `proxyServer` 支持 `host:port`（自动补成 `http://host:port`）或显式的 `http://`、`https://`、`socks4://`、`socks5://`；留空即直连，不可用的值会让抓取以 provider 专属错误码 `WEB_FETCH_PROXY` 失败。
+- 回环地址 `127.0.0.1`、`localhost`、`::1` 始终绕过（`PROXY_LOOPBACK_BYPASS`），并与 `proxyBypass` 里填的内容合并。
+- 凭据走 Playwright 的 `proxy.username` / `proxy.password`，与其他设置一起保存；`WEB_FETCH_PROXY` 消息只会给出代理地址（已剥离 userinfo）与解析来源，**绝不打印密码**。
+- 启动器输出的是 Chromium 的写法：`--proxy-server=<规范化的地址>` 加 `--proxy-bypass-list=<a;b;c>`（分号分隔，含回环例外）。
+- 代理不可达时，本地/托管后端会以 `WEB_FETCH_PROXY` 报出启动失败，消息里写明是哪个代理、来自哪个设置项。
+
+### 两种拓扑（可视浏览器 ↔ 服务器无头）
+
+**（a）纯服务器、无头** —— `backend: managed`：只需把 `headless` 勾上、`userDataDir` 指向持久路径（如 `/data/chrome-dsh-profile`），浏览器由 DSH 自己启动，没有别的要跑。需要手动登录时，在桌面环境临时取消勾选 `headless` 登录一次再勾回。
+
+**（b）浏览器在你本机可见、插件在服务器** —— 浏览器跑在你**看得见**的地方，插件通过反向隧道以 CDP 接管：
+
+```sh
+# 1. 在你本机：复制真实 profile，用 9222 启动有头 Chrome
+dsh-web-fetch-launch --dry-run              # 只打印命令（含代理参数），不启动
+dsh-web-fetch-launch                        # 或直接执行：复制 profile 并启动浏览器
+dsh-web-fetch-launch --headful --profile "$HOME/.config/google-chrome"
+
+# 2. 把该回环端口送到插件所在的服务器
+autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>
+
+# 3. 在插件宿主机：设置卡片 → 后端选「远端 CDP 地址」，cdpEndpoint 填 127.0.0.1:9222
+```
+
+启动器即 `bin/launch-browser.mjs`，对外命令名 `dsh-web-fetch-launch`；它读取卡片写入的同一个 `web-fetch-playwright` 设置段（`$DSH_HOME/settings.yaml`），所以你在 UI 里配的代理、`headless`、`userDataDir`、`launchArgs` 就是它用的值。命令行参数优先于设置（`--proxy`、`--profile`、`--user-data-dir`、`--headless`/`--headful`、`--launch-args`、`--port`、`--address`、`--settings`），`--no-copy` 跳过 profile 复制，`--dry-run` 只打印。
+
+profile 复制是**刻意不完整**的：`SingletonLock`/`SingletonCookie`/`SingletonSocket`（在运行浏览器的锁）、大缓存（`Cache`、`Code Cache`、`GPUCache`、`Service Worker`、`Media Cache`、各类 shader cache）与崩溃/遥测残留都会被排除；cookie、`Login Data`、`Local Storage`、`Preferences`、扩展会保留。目标目录上存在 `SingletonLock`（说明有浏览器正在用它）时会拒绝复制；目标已存在时除非显式要求，否则不会覆盖。在源码检出中使用需先 `pnpm build`（`bin/` 要 import 构建产物）；npm 安装包自带 `lib/`。
+
+`autossh -R 9222:127.0.0.1:9222` 把远端端口绑到客户端回环——请保持这样（启动器已把 DevTools 绑在 `127.0.0.1`），并把该隧道视为「对你已登录浏览器的访问权限」。插件的安全立场不变：不做 SSRF 防护，因此能调用 `web_fetch` 的一方就能访问那个浏览器能访问的一切。
 
 ### CDP 上下文模式（是否共享浏览器 profile）
 
@@ -114,7 +177,7 @@ google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome
 3. **有界重试** —— 窗口耗尽后，同一标签页默认再导航一次（`challengeRetries`），上下文里已有的通关 cookie 继续生效。
 4. **明确失败** —— 返回独立的 `WEB_FETCH_CHALLENGE` 错误码（web seam 的 `code` 是开放字符串，允许 provider 专属码），消息中写明站点、等待预算与最后一次挑战响应的状态。
 
-安全边界（刻意为之）：不点击 Turnstile、不解验证码、不注入 token、不伪装指纹/UA、不轮换代理、不导出 cookie——隔离模式下本次抓取挣到的通关态随其 context 一起销毁；profile 模式下它留在远端浏览器自己的 profile 里，插件从不复制或清理。等待始终受 `challengeWaitMs` 与 45s 单次抓取预算双重约束，永不无限阻塞。
+安全边界（刻意为之）：不点击 Turnstile、不解验证码、不注入 token、不伪装指纹/UA、不做代理**轮换**（配置的代理是单一的静态出口，绝不会按请求切换以绕过挑战）、不导出 cookie——隔离模式下本次抓取挣到的通关态随其 context 一起销毁；profile 模式下它留在远端浏览器自己的 profile 里，插件从不复制或清理。等待始终受 `challengeWaitMs` 与 45s 单次抓取预算双重约束，永不无限阻塞。
 
 ## 开发
 
@@ -130,12 +193,18 @@ pnpm build       # tsc 声明 + tsdown（宿主 ESM + 客户端 module-registrat
 ```
 src/
 ├── index.ts               # 宿主入口：注册 provider 与设置段
-├── config.ts              # schemastery schema、CDP 端点归一化
+├── config.ts              # schemastery schema、CDP/代理归一化、托管启动描述符
 ├── provider.ts            # WebFetchProvider：导航、超时、信号量、截断
+├── browser-pool.ts        # 共享浏览器池（租约/存活/替换），两个共享型后端共用
+├── cdp-pool.ts            # 该池的 CDP 实例化
+├── launcher.ts            # 本地启动器逻辑：设置段读取、命令拼装、profile 复制
+├── launch-args.ts         # 无依赖的参数拼装（宿主 + 卡片预览 + 启动器共用）
 ├── markdown.ts            # 降噪管线（Readability + DOMPurify + Turndown/GFM）
 ├── playwright-resolve.ts  # 本地后端发现（路径 / $PATH / 内置 core）
 ├── types.ts               # Playwright 结构化类型（运行时模块动态发现）
-└── client/                # 浏览器半端：设置卡片、表单模型、多语言
+└── client/                # 浏览器半端：设置卡片、表单模型、多语言、命令预览
+bin/
+└── launch-browser.mjs     # dsh-web-fetch-launch（见上方拓扑手册）
 tests/                     # 单元 + provider + 浏览器集成（可自跳过）
 ```
 
@@ -143,7 +212,10 @@ tests/                     # 单元 + provider + 浏览器集成（可自跳过�
 
 ## 安全边界
 
-与内置 HTTP provider 同立场：**未实现 SSRF/私网防护**——浏览器能访问的目标，本 provider 就能抓。CDP 地址由设置页配置，不做回环限制，请在可信环境暴露设置页。抓取仅在本地渲染，除目标页面自身外不会向任何地方发送数据——但 profile 模式下请求（以及恶意页面诱导 agent 触发的状态变更）会携带远端浏览器的登录会话，见上文风险须知。
+与内置 HTTP provider 同立场：**未实现 SSRF/私网防护**——浏览器能访问的目标，本 provider 就能抓。CDP 地址与本地启动器都由设置页配置，不做回环限制，请在可信环境暴露设置页。抓取仅在本地渲染，除目标页面自身外不会向任何地方发送数据——但有两点例外：
+
+- **配置的代理是第二个目的地。** 一旦设置 `proxyServer`，浏览器的请求（含目标 URL 与请求头）都会经过该跳，该代理的运营者能看到它们；`PROXY_LOOPBACK_BYPASS` 只让回环流量不走代理，其余不做过滤。
+- **带 profile 的后端会以你的登录身份行动。** DSH 托管后端用其 `userDataDir` 里的登录态抓取，CDP profile 模式（默认）用远端浏览器的真实 profile；被诱导的状态变更请求会带上这些 cookie，同一 jar 下某次抓取的登出/`Set-Cookie` 也会影响其他抓取。按后端区分的威胁模型见 [SECURITY.md](./SECURITY.md)。
 
 ## 许可证
 

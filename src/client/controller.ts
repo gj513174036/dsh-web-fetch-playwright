@@ -7,6 +7,7 @@
  */
 
 import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import { launcherPreview } from './command.ts'
 import { CardForm, checkboxField, numberField, radioField, textField } from './form.ts'
 import type { CardShell, CardFieldState, CardActions, SnapshotStore } from './form.ts'
 
@@ -39,6 +40,32 @@ export interface PlaywrightSettings {
    * same tab (0–60000); 0 = off (return the first response as-is).
    */
   challengeWaitMs?: number
+  /**
+   * Outbound proxy for the browser this plugin launches: `host:port` or an
+   * `http(s)/socks4/socks5` URL. Blank = direct connection. In CDP mode it
+   * does not apply to the fetch (that browser is started elsewhere) — it
+   * shapes the launcher command instead, see the card's hint.
+   */
+  proxyServer?: string
+  /** Comma-separated hosts that skip the proxy; loopback is always bypassed. */
+  proxyBypass?: string
+  /** Proxy username; blank = an open proxy. */
+  proxyUsername?: string
+  /**
+   * Proxy password; never echoed back in an error message. In CDP mode it
+   * only feeds the launcher command below (the browser that gets attached to
+   * must have been started with `--proxy-server`).
+   */
+  proxyPassword?: string
+  /**
+   * Managed backend: run the browser this plugin launches without a window.
+   * Also drives the launcher's `--headless=new`.
+   */
+  headless?: boolean
+  /** Managed backend: the persistent profile directory (blank = DSH default). */
+  userDataDir?: string
+  /** Extra browser arguments for plugin-launched browsers and the launcher. */
+  launchArgs?: string
 }
 
 /** What the Playwright card renders. */
@@ -57,6 +84,25 @@ export interface PlaywrightCardState extends CardShell {
   maxConcurrency: CardFieldState
   /** Challenge wait input (draft decimal integer of milliseconds). */
   challengeWaitMs: CardFieldState
+  /** Proxy server input (host:port or scheme URL). */
+  proxyServer: CardFieldState
+  /** Proxy bypass-list input (comma-separated hosts). */
+  proxyBypass: CardFieldState
+  /** Proxy username input. */
+  proxyUsername: CardFieldState
+  /** Proxy password input (rendered masked, never as plain text). */
+  proxyPassword: CardFieldState
+  /** Managed-backend headless checkbox (draft 'true'/'false'). */
+  headless: CardFieldState
+  /** Managed-backend profile directory input. */
+  userDataDir: CardFieldState
+  /** Extra browser arguments input (shell-style quoted). */
+  launchArgs: CardFieldState
+  /**
+   * Read-only preview of the local launcher's command, derived from the
+   * drafts above (never staged, never saved).
+   */
+  launcherCommand: string
 }
 
 /** The registration-side face the card's slot entry injects. */
@@ -79,13 +125,20 @@ export class PlaywrightCardController {
     this.form = new CardForm(
       scope,
       [
-        radioField('backend', ['local', 'cdp']),
+        radioField('backend', ['local', 'cdp', 'managed']),
         textField('playwrightPath'),
         textField('cdpEndpoint'),
         checkboxField('shareBrowserContext'),
         checkboxField('denoise'),
         numberField('maxConcurrency', 1, 200),
         numberField('challengeWaitMs', 0, 60_000),
+        textField('proxyServer'),
+        textField('proxyBypass'),
+        textField('proxyUsername'),
+        textField('proxyPassword'),
+        checkboxField('headless'),
+        textField('userDataDir'),
+        textField('launchArgs'),
       ],
     )
     this.store = this.form.bind(() => this.projection())
@@ -101,7 +154,26 @@ export class PlaywrightCardController {
       denoise: this.form.field('denoise'),
       maxConcurrency: this.form.field('maxConcurrency'),
       challengeWaitMs: this.form.field('challengeWaitMs'),
+      proxyServer: this.form.field('proxyServer'),
+      proxyBypass: this.form.field('proxyBypass'),
+      proxyUsername: this.form.field('proxyUsername'),
+      proxyPassword: this.form.field('proxyPassword'),
+      headless: this.form.field('headless'),
+      userDataDir: this.form.field('userDataDir'),
+      launchArgs: this.form.field('launchArgs'),
+      launcherCommand: this.preview(),
     }
+  }
+
+  /** The launcher line for the CURRENT drafts (staged edits included). */
+  private preview(): string {
+    return launcherPreview({
+      headless: this.form.field('headless').text,
+      userDataDir: this.form.field('userDataDir').text,
+      launchArgs: this.form.field('launchArgs').text,
+      proxyServer: this.form.field('proxyServer').text,
+      proxyBypass: this.form.field('proxyBypass').text,
+    })
   }
 
   /**

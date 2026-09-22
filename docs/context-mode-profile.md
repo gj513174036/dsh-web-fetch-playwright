@@ -567,3 +567,53 @@ await browser.close()                                // 仅断开连接(F7),远�
 
 行号会随版本漂移;定位方式:在 bundle 内搜索 `"close-browser"`、`_defaultContext`、
 `BrowserDispatcher`、`Target.createBrowserContext` 等符号。
+
+---
+
+## 8. P1 增补:托管持久浏览器、本地启动器与共享浏览器池(Unreleased 起)
+
+本节的三个能力建立在本文的既有结论之上,不改动第 3 节的不变量(尤其 I 系列:profile 模式的默认
+context 永不关闭、每次 fetch 只关闭自己的标签页)。
+
+### 8.1 后端矩阵
+
+| backend | 浏览器由谁启动 | 生命周期 | 代理注入 | 并发语义 |
+| --- | --- | --- | --- | --- |
+| `local` | 插件,每次 fetch | 随 fetch 生灭 | `launch({ proxy })` | 并发**浏览器**数(默认 4) |
+| `managed`(新) | 插件,首次 fetch | 全进程共享,直到卸载或启动设置变化 | `launchPersistentContext({ proxy })` | 并发**标签页**数(默认 50) |
+| `cdp` | 用户/启动器 | 插件只连接 | 不注入、不校验(见 §8.3) | 并发**标签页**数(默认 50) |
+
+`managed` 用 `chromium.launchPersistentContext(userDataDir, { headless, proxy, args })` 启动;返回值是
+**context 本身**(Playwright 以 context 建模持久启动),因此 `src/types.ts` 新增
+`PlaywrightPersistentContext`,并把 `PlaywrightBrowser.newContext` 改为可选 —— 持久 context 没有
+"再开一个隔离 context"的层次,它直接拥有页面。租约形态仍是本文 §3 的 `persistent` 租约:
+`acquireContext` 返回该 context 自身、`persistent: true`,于是 `release()` 只关标签页。
+
+### 8.2 池的泛化(`src/browser-pool.ts`)
+
+`CdpConnectionPool` 的租约/存活/替换机器被提取为 `BrowserPool<K, H>`,差异全部注入:
+
+- `open(key, timeoutMs)`:CDP 是 `connectOverCDP(endpoint)`,managed 是 `launchPersistentContext(...)`;
+- `keyText(key)`:CDP 用端点 URL,managed 用启动描述符(`managedLaunchKey`:profile 目录、headless、
+  参数、Playwright 路径、代理);
+- `acquireContext(handle, mode)`:CDP 实现 `isolated`(新建一次性 context,release 关闭)与 `profile`
+  (`contexts()[0]`,release 只关标签页);managed 恒为 `shared`(handle 即 context);
+- 可选 `isLive` / `watch` / `close`:managed 用 `isClosed()` 与 `close` 事件(用户关掉浏览器后可自动重启),
+  CDP 保持 `isConnected()` 与 `disconnected` 事件。
+
+`src/cdp-pool.ts` 现在是该池的 CDP 实例化,公开 API 与行为不变(其 15 个用例未改动即通过)。
+
+### 8.3 代理与 CDP 的语义(单点决策)
+
+代理是浏览器**进程**的启动期属性。CDP 接管的是别人启动的浏览器,插件既无法注入也无法校验,因此
+`src/provider.ts` 的 `CDP_PROXY_POLICY = 'hint-only'` 明确选择"解释而不拦截":抓取照常执行,代理字段
+改为驱动启动器命令与卡片预览;手启浏览器漏掉 `--proxy-server` 时流量直连(README 与卡片 hint 已写明)。
+`WEB_FETCH_PROXY` 只保留插件能观测到的两条路径:不可用的代理值、本地/托管后端因代理而启动失败。
+
+### 8.4 本地启动器(`bin/launch-browser.mjs`,命令名 `dsh-web-fetch-launch`)
+
+读取卡片写入的同一个设置段,复制真实 profile(排除 `Singleton*`、大缓存、崩溃残留),拼出
+`--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --user-data-dir=<副本> [--headless=new]
+[--proxy-server=… --proxy-bypass-list=…] <launchArgs>`,再打印
+`autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>`。参数拼装的唯一实现位于无依赖的
+`src/launch-args.ts`,宿主启动器与卡片只读预览调用同一函数,`tests/launcher.spec.ts` 断言两者逐字符一致。

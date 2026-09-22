@@ -24,6 +24,7 @@
     "lib/index.js",
     "lib/client.js",
     "lib/types/**/*.d.ts",
+    "bin",
     "src",
     "cordis.patch.yml",
     "README.md",
@@ -81,11 +82,14 @@
     "permissions": [
       "network:fetch (renders the URLs the user requests in a local browser)",
       "network:connect (user-configured CDP endpoint, default 127.0.0.1:9222)",
+      "network:connect (user-configured outbound PROXY: traffic from the browser this plugin launches — or from a CDP browser started with --proxy-server — egresses through that hop, whose operator sees it)",
       "fs:read (user-configured playwright/browser executable path)",
+      "fs:write (DSH-managed backend: the persistent browser profile under the configured user-data-dir — cookies, localStorage, logins — which this plugin never cleans)",
+      "process:spawn (bin/launch-browser.mjs only: the local GUI launcher runs the browser it is pointed at, after copying the profile to a throwaway directory)",
       "network:fetch (CDP profile mode: renders the URLs the user requests WITH the remote browser's logged-in sessions)"
     ],
     "jurisdiction": [],
-    "retention": "none (profile mode: site data lands in the remote browser's own persistent user-data-dir, which this plugin never cleans)"
+    "retention": "none for rendered content; the DSH-managed backend keeps its user-data-dir profile on disk (cookies, localStorage, logins) until you delete it; the local launcher's profile COPY is yours and is never cleaned by this plugin; CDP profile mode leaves site data in the remote browser's own user-data-dir"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": ">=3.18.2 <4",
@@ -128,5 +132,8 @@
     "tsdown": "^0.22.2",
     "typescript": "^5.8.0",
     "vitest": "^4.1.8"
+  },
+  "bin": {
+    "dsh-web-fetch-launch": "./bin/launch-browser.mjs"
   }
 }
