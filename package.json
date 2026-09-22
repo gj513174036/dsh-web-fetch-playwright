@@ -85,6 +85,7 @@
       "network:connect (user-configured outbound PROXY: traffic from the browser this plugin launches — or from a CDP browser started with --proxy-server — egresses through that hop, whose operator sees it)",
       "fs:read (user-configured playwright/browser executable path)",
       "fs:write (DSH-managed backend: the persistent browser profile under the configured user-data-dir — cookies, localStorage, logins — which this plugin never cleans)",
+      "fs:write (network capture, when recordNetwork is on: writes network.jsonl and a HAR 1.2 har.json into the configured recordDir — default <cwd>/net-dumps/<sessionId>, directory 0700 / files 0600 — containing PLAINTEXT Cookie/Token/Authorization headers and response bodies, kept until you delete them)",
       "process:spawn (bin/launch-browser.mjs only: the local GUI launcher runs the browser it is pointed at, after copying the profile to a throwaway directory)",
       "network:fetch (CDP profile mode: renders the URLs the user requests WITH the remote browser's logged-in sessions)"
     ],
