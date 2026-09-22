@@ -90,7 +90,7 @@
       "network:fetch (CDP profile mode: renders the URLs the user requests WITH the remote browser's logged-in sessions)"
     ],
     "jurisdiction": [],
-    "retention": "none for rendered content; the DSH-managed backend keeps its user-data-dir profile on disk (cookies, localStorage, logins) until you delete it; the local launcher's profile COPY is yours and is never cleaned by this plugin; CDP profile mode leaves site data in the remote browser's own user-data-dir"
+    "retention": "none for rendered content; the DSH-managed backend keeps its user-data-dir profile on disk (cookies, localStorage, logins) until you delete it; the local launcher's profile COPY is yours and is never cleaned by this plugin; CDP profile mode leaves site data in the remote browser's own user-data-dir; network capture, when recordNetwork is on, keeps network.jsonl and har.json in the configured recordDir — default <cwd>/net-dumps/<sessionId>, directory 0700 / files 0600 — with PLAINTEXT Cookie/Token/Authorization headers and response bodies until you delete them"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": ">=3.18.2 <4",
