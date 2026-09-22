@@ -7,12 +7,14 @@
  * Filesystem-touching cases run in a throwaway temp directory; nothing here
  * launches a browser.
  */
+import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildCdpLaunchArgs, LAUNCHER_CDP_ADDRESS, LAUNCHER_CDP_PORT, mergeProxyBypass, parseLaunchArgs, renderCommand } from '../src/launch-args.ts'
-import type { LauncherFlags } from '../src/launcher.ts'
+import type { LauncherFlags, LauncherRunResult } from '../src/launcher.ts'
 import {
   copyProfile,
   defaultProfileCandidates,
@@ -25,8 +27,10 @@ import {
   PROFILE_COPY_EXCLUDES,
   profileCopyExcluded,
   isLoopbackAddress,
+  normalizeBindAddress,
   readSettingsSection,
   resolveSettingsPath,
+  runLauncher,
   scrubCredentials,
 } from '../src/launcher.ts'
 import { launcherPreview } from '../src/client/command.ts'
@@ -503,62 +507,68 @@ describe('launcher CLI contract', () => {
   }
 
   /**
-   * The exact path `bin/launch-browser.mjs` takes (it is argv → parse → read
-   * settings → planLauncher → copyProfile), so the CLI's wiring is what is
-   * under test — not just the functions it calls.
+   * Drive the CLI's REAL entry path. `runLauncher` is the function
+   * `bin/launch-browser.mjs` calls — the shim only supplies `spawn` and
+   * `console` — so anything this test observes is the shipped call sequence:
+   * a refactor that drops the `{ force }` argument, skips the copy, or
+   * forgets a warning breaks these cases instead of silently passing.
    */
-  function runCli(argv: string[], env: NodeJS.ProcessEnv): { plan: ReturnType<typeof planLauncher>; report?: ReturnType<typeof copyProfile> } {
-    const parsed = parseLauncherArgs(argv)
-    const { settings } = readSettingsSection(parsed.settingsFile ?? join(root, 'settings.yaml'))
-    const plan = planLauncher(parsed, settings, env)
-    const source = plan.profileSource
-    const report = plan.copyProfile && source !== undefined
-      ? copyProfile(source, plan.userDataDir, { force: parsed.force === true })
-      : undefined
-    return { plan, report }
+  async function runCli(argv: string[], env: NodeJS.ProcessEnv): Promise<{ result: LauncherRunResult; stdout: string; stderr: string; ran: Array<{ executable: string; args: readonly string[] }> }> {
+    const out: string[] = []
+    const err: string[] = []
+    const ran: Array<{ executable: string; args: readonly string[] }> = []
+    const result = await runLauncher(argv, env, {
+      out: line => { out.push(line) },
+      err: line => { err.push(line) },
+      run: async (executable, args) => { ran.push({ executable, args }); return 0 },
+    })
+    return { result, stdout: out.join('\n'), stderr: err.join('\n'), ran }
   }
 
-  it('(a) refuses an existing target without --force and leaves it untouched', () => {
+  it('(a) refuses an existing target without --force and leaves it untouched', async () => {
     const { settingsFile, profile, browser, userDataDir } = makeEnv()
     const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
     // First run populates the copy target.
-    const first = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
-    expect(first.report?.destination).toBe(userDataDir)
+    const first = await runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
+    expect(first.result.code).toBe(0)
+    expect(first.result.copy?.destination).toBe(userDataDir)
     const marker = join(userDataDir, 'Default', 'Cookies')
     expect(readFileSync(marker, 'utf8')).toBe('cookie-db')
 
     // A second run must refuse, and must not touch what is already there.
     writeFileSync(marker, 'edited-by-hand')
-    expect(() => runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env))
-      .toThrow(/already exists; pass --force/)
+    const second = await runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
+    expect(second.result.code).toBe(2)
+    expect(second.stderr).toContain('already exists; pass --force')
     expect(readFileSync(marker, 'utf8')).toBe('edited-by-hand')
   })
 
-  it('(b) overwrites the existing target with --force', () => {
+  it('(b) overwrites the existing target with --force', async () => {
     const { settingsFile, profile, browser, userDataDir } = makeEnv()
     const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
-    runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
+    await runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
     const marker = join(userDataDir, 'Default', 'Cookies')
     writeFileSync(marker, 'edited-by-hand')
 
-    const forced = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--force'], env)
-    expect(forced.report?.destination).toBe(userDataDir)
+    const forced = await runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--force'], env)
+    expect(forced.result.code).toBe(0)
+    expect(forced.result.copy?.destination).toBe(userDataDir)
     expect(readFileSync(marker, 'utf8')).toBe('cookie-db') // re-copied
     expect(parseLauncherArgs(['--force']).force).toBe(true)
     expect(launcherUsage()).toContain('--force')
   })
 
-  it('passes the settings section through the same path the CLI uses', () => {
+  it('passes the settings section through the real entry path', async () => {
     const { settingsFile, profile, browser, userDataDir } = makeEnv()
     const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
-    const { plan } = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
-    expect(plan.headless).toBe(false) // from the settings section
-    expect(plan.args).toContain('--user-data-dir=' + userDataDir)
-    expect(plan.args).not.toContain('--headless=new')
-    expect(plan.warnings).toEqual([])
+    const { result } = await runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--dry-run'], env)
+    expect(result.plan?.headless).toBe(false) // from the settings section
+    expect(result.plan?.args).toContain('--user-data-dir=' + userDataDir)
+    expect(result.plan?.args).not.toContain('--headless=new')
+    expect(result.plan?.warnings).toEqual([])
   })
 
-  it('warns that proxy credentials cannot ride the command line', () => {
+  it('warns that proxy credentials cannot ride the command line', async () => {
     const { settingsFile, profile, browser, userDataDir } = makeEnv()
     writeFileSync(settingsFile, [
       'web-fetch-playwright:',
@@ -568,34 +578,59 @@ describe('launcher CLI contract', () => {
       '',
     ].join('\n'))
     const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
-    const { plan } = runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile], env)
-    expect(plan.args).toContain('--proxy-server=http://127.0.0.1:7890')
-    expect(plan.warnings.join('\n')).toContain('proxyUsername/proxyPassword are set')
-    expect(plan.warnings.join('\n')).toContain('NOT sent to the browser')
-    // The credentials never reach the command line.
-    expect(plan.command).not.toContain('proxyuser')
-    expect(plan.command).not.toContain('p@ss word')
+    const { result, stdout, stderr } = await runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--dry-run'], env)
+    expect(result.plan?.args).toContain('--proxy-server=http://127.0.0.1:7890')
+    expect(result.plan?.warnings.join('\n')).toContain('proxyUsername/proxyPassword are set')
+    expect(result.plan?.warnings.join('\n')).toContain('NOT sent to the browser')
+    // The credentials never reach the command line or the console.
+    expect(result.plan?.command).not.toContain('proxyuser')
+    expect(result.plan?.command).not.toContain('p@ss word')
+    expect(`${stdout}\n${stderr}`).toContain('warning:')
+    expect(`${stdout}\n${stderr}`).not.toContain('p@ss word')
 
     // No credentials configured → no warning.
     writeFileSync(settingsFile, 'web-fetch-playwright:\n  proxyServer: http://127.0.0.1:7890\n')
     // --force: the target already exists from the run above.
-    expect(runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--force'], env).plan.warnings).toEqual([])
+    const quiet = await runCli(['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--force'], env)
+    expect(quiet.result.plan?.warnings).toEqual([])
   })
 
-  it('refuses a non-loopback --address and accepts the loopback spellings', () => {
+  it('refuses a non-loopback --address and accepts the loopback spellings', async () => {
     const { settingsFile, profile, browser, userDataDir } = makeEnv()
     const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
     const base = ['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile]
-    expect(() => runCli([...base, '--address', '0.0.0.0'], env)).toThrow(/not a loopback address/)
-    expect(() => runCli([...base, '--address', '192.168.1.10'], env)).toThrow(/full control of this browser/)
+    const refused = await runCli([...base, '--address', '0.0.0.0'], env)
+    expect(refused.result.code).toBe(2)
+    expect(refused.stderr).toContain('not a loopback address')
+    expect((await runCli([...base, '--address', '192.168.1.10'], env)).stderr).toContain('full control of this browser')
     for (const address of ['127.0.0.1', '127.0.0.5', '::1', 'localhost']) {
       // --no-copy: these cases only assert the generated flags.
-      expect(runCli([...base, '--address', address, '--no-copy'], env).plan.args, address)
-        .toContain(`--remote-debugging-address=${address}`)
+      const { result } = await runCli([...base, '--address', address, '--no-copy'], env)
+      expect(result.plan?.args, address).toContain(`--remote-debugging-address=${address}`)
     }
     expect(isLoopbackAddress('127.0.0.1')).toBe(true)
     expect(isLoopbackAddress('127.9.9.9')).toBe(true)
     expect(isLoopbackAddress('10.0.0.1')).toBe(false)
+  })
+
+  it('normalizes a bracketed IPv6 --address to the form Chromium accepts (R4)', async () => {
+    const { settingsFile, profile, browser, userDataDir } = makeEnv()
+    const env: NodeJS.ProcessEnv = { PATH: join(root, 'bin') }
+    const base = ['--browser', browser, '--profile', profile, '--user-data-dir', userDataDir, '--settings', settingsFile, '--no-copy']
+    const { result } = await runCli([...base, '--address', '[::1]'], env)
+    expect(result.code).toBe(0)
+    // `[::1]` is how a URL spells it; Chromium refuses that in
+    // --remote-debugging-address, so the brackets must be gone.
+    expect(result.plan?.args).toContain('--remote-debugging-address=::1')
+    expect(result.plan?.args.join(' ')).not.toContain('[')
+    expect(result.plan?.endpoint).toBe('::1:9222')
+    expect(normalizeBindAddress('[::1]')).toBe('::1')
+    expect(normalizeBindAddress('  ::1  ')).toBe('::1')
+    expect(isLoopbackAddress('[::1]')).toBe(true)
+    // A bracketed NON-loopback address is still refused (after normalization).
+    const refused = await runCli([...base, '--address', '[::2]'], env)
+    expect(refused.result.code).toBe(2)
+    expect(refused.stderr).toContain('not a loopback address')
   })
 
   it('never echoes credentials from argv in an error message', () => {
@@ -634,5 +669,110 @@ web-fetch-playwright:
     expect(settings.proxyPassword).toBe(String.raw`a\b "quoted" tab` + '\t' + 'end')
     // Single-quoted: taken literally (YAML semantics) — no decoding at all.
     expect(settings.proxyUsername).toBe(String.raw`raw\nnot-decoded`)
+  })
+})
+
+/**
+ * R1: no echo path may print a credential. The six vectors below are the ones
+ * a review reproduced on the live tree (plus the combined `/` + `@` password);
+ * each asserts the SECRET STRING itself is absent from BOTH streams, driven
+ * through the real entry function AND through a real `node bin/…` process.
+ */
+describe('launcher credential scrubbing (R1)', () => {
+  let root: string
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'dsh-launcher-secret-'))
+    // A fake browser so planning succeeds and reaches the value validations.
+    const bin = join(root, 'bin')
+    mkdirSync(bin)
+    writeFileSync(join(bin, 'google-chrome'), '#!/bin/sh\n')
+  })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  /** The argv vectors, with the secret each one must not leak. */
+  const VECTORS: Array<{ name: string; argv: string[]; secret: string }> = [
+    { name: '(a) unknown flag, password contains a slash', argv: ['--proxyy=http://user:pa/ss@proxy.corp:1080'], secret: 'pa/ss' },
+    { name: '(b) unknown flag, no scheme', argv: ['--proxyy=user:secretpw@proxy.corp:1080'], secret: 'secretpw' },
+    { name: '(c) --port carrying userinfo', argv: ['--port=user:secretpw@x'], secret: 'secretpw' },
+    { name: '(d) --address carrying userinfo', argv: ['--address=user:secretpw@1.2.3.4'], secret: 'secretpw' },
+    { name: '(e) password contains an at-sign (regression)', argv: ['--proxyy=http://user:p@ss@proxy.corp:1080'], secret: 'p@ss' },
+    { name: '(f) password contains BOTH a slash and an at-sign', argv: ['--proxyy=http://user:pa/ss@word@proxy.corp:1080'], secret: 'pa/ss@word' },
+  ]
+
+  /** Run the real entry function with captured streams. */
+  async function run(argv: string[]): Promise<{ code: number; combined: string }> {
+    const out: string[] = []
+    const err: string[] = []
+    const result = await runLauncher(argv, { PATH: join(root, 'bin'), DSH_HOME: root }, {
+      out: line => { out.push(line) },
+      err: line => { err.push(line) },
+    })
+    return { code: result.code, combined: `${out.join('\n')}\n${err.join('\n')}` }
+  }
+
+  it('never prints a secret from any argv echo path', async () => {
+    for (const vector of VECTORS) {
+      const { code, combined } = await run(vector.argv)
+      expect(code, vector.name).toBe(2) // a usage/config error, not a crash
+      expect(combined, `${vector.name}: the secret must not be echoed`).not.toContain(vector.secret)
+      expect(combined, vector.name).toContain('error:')
+    }
+  })
+
+  it('keeps the flag name and the rest of the message readable', async () => {
+    const { combined } = await run(VECTORS[2]?.argv ?? [])
+    expect(combined).toContain('--port needs a port number')
+    const address = await run(VECTORS[3]?.argv ?? [])
+    expect(address.combined).toContain('not a loopback address')
+  })
+
+  it('scrubs credentials in every token, not just the first', () => {
+    expect(scrubCredentials('--proxyy=http://user:pa/ss@proxy.corp:1080')).toBe('--proxyy=http://proxy.corp:1080')
+    expect(scrubCredentials('--proxyy=user:secretpw@proxy.corp:1080')).toBe('--proxyy=proxy.corp:1080')
+    expect(scrubCredentials('--proxyy=http://user:pa/ss@word@proxy.corp:1080')).toBe('--proxyy=http://proxy.corp:1080')
+    expect(scrubCredentials('a http://u:p@h:1 b')).toBe('a http://h:1 b')
+    expect(scrubCredentials('no credentials here')).toBe('no credentials here')
+    expect(scrubCredentials('')).toBe('')
+  })
+
+  /**
+   * The real shim: `node bin/launch-browser.mjs …` must behave identically, or
+   * the bin and the tested entry function may have drifted apart. Skipped when
+   * the plugin has not been built yet (the shim imports lib/index.js), with the
+   * reason printed so a user can run it themselves.
+   */
+  const binPath = fileURLToPath(new URL('../bin/launch-browser.mjs', import.meta.url))
+  const libPath = fileURLToPath(new URL('../lib/index.js', import.meta.url))
+  const libBuilt = existsSync(libPath)
+  if (!libBuilt) {
+    console.warn(`skipping the real-bin probe: ${libPath} does not exist (run \`pnpm build\` and re-run)`)
+  }
+
+  it.skipIf(!libBuilt)('the real bin process leaks no secret either', { timeout: 60_000 }, () => {
+    const probe = spawnSync(process.execPath, [binPath, '--help'], { encoding: 'utf8' })
+    if (probe.status !== 0) {
+      console.warn(`skipping the real-bin probe: the shim exited ${String(probe.status)} (${probe.stderr.trim()})`)
+      return
+    }
+    for (const vector of VECTORS) {
+      const run = spawnSync(process.execPath, [binPath, ...vector.argv, '--settings', join(root, 'missing.yaml')], { encoding: 'utf8' })
+      const combined = `${run.stdout}\n${run.stderr}`
+      expect(run.status, vector.name).toBe(2)
+      expect(combined, `${vector.name}: the secret must not appear in stdout/stderr`).not.toContain(vector.secret)
+    }
+  })
+})
+
+/** R2: YAML single-quoted scalars fold a doubled quote. */
+describe('settings parsing escapes (R2)', () => {
+  it("folds '' to ' inside a single-quoted scalar", () => {
+    const settings = parseSettingsSection([
+      'web-fetch-playwright:',
+      String.raw`  proxyPassword: 'it''s a secret'`,
+      String.raw`  proxyUsername: 'plain'`,
+      '',
+    ].join('\n'))
+    expect(settings.proxyPassword).toBe("it's a secret")
+    expect(settings.proxyUsername).toBe('plain')
   })
 })

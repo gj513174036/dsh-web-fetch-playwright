@@ -6,10 +6,16 @@
  * DevTools port, and (printed for you) the reverse tunnel command that carries
  * that port to the server the plugin runs on.
  *
- * The whole decision logic lives in the plugin's own `src/launcher.ts`, so the
- * card's read-only preview and this command can never disagree; this file is
- * only argv → plan → copy → spawn. It imports the BUILT plugin (`lib/index.js`),
- * which the published package ships and a checkout produces with `pnpm build`.
+ * This file is a SHIM and nothing else: every decision — parsing argv, reading
+ * the settings section, planning, copying the profile (including the `--force`
+ * intent), and running the browser — happens in `runLauncher` in the plugin's
+ * `src/launcher.ts`. Keeping the entry path in the library is what makes it
+ * testable: the suite drives `runLauncher`, and (when a build exists) this very
+ * script, so a refactor that drifts from the tested call sequence fails a test
+ * instead of hiding behind a hand-copied one.
+ *
+ * It imports the BUILT plugin (`lib/index.js`), which the published package
+ * ships and a checkout produces with `pnpm build`.
  *
  *   node bin/launch-browser.mjs --dry-run
  *   node bin/launch-browser.mjs --profile "$HOME/.config/google-chrome"
@@ -31,65 +37,26 @@ try {
   process.exit(1)
 }
 
-let flags
-try {
-  flags = api.parseLauncherArgs(process.argv.slice(2))
-} catch (error) {
-  console.error(`error: ${error instanceof Error ? error.message : String(error)}`)
-  process.exit(2)
-}
-if (flags.help) {
-  console.log(api.launcherUsage())
-  process.exit(0)
+if (typeof api.runLauncher !== 'function') {
+  // A lib/ built before this shim's entry function existed: say so instead of
+  // dying with a TypeError that looks like a plugin bug.
+  console.error('the installed lib/ is stale (it does not export runLauncher): run `pnpm build` in this checkout, or reinstall the package.')
+  process.exit(1)
 }
 
-const settingsFile = flags.settingsFile ?? api.resolveSettingsPath()
-const { settings, found } = api.readSettingsSection(settingsFile)
-
-let plan
-try {
-  plan = api.planLauncher(flags, settings)
-} catch (error) {
-  console.error(`error: ${error instanceof Error ? error.message : String(error)}`)
-  process.exit(2)
-}
-
-console.error(`settings: ${settingsFile} ${found ? '(read)' : '(not found — running on flags and defaults)'}`)
-for (const note of plan.notes) console.error(`  ${note}`)
-for (const warning of plan.warnings) console.error(`warning: ${warning}`)
-
-if (plan.copyProfile) {
-  try {
-    const report = api.copyProfile(plan.profileSource, plan.userDataDir, { force: flags.force === true })
-    console.error(`profile copy: ${report.source} → ${report.destination} (locks, caches, and crash dumps excluded)`)
-    if (report.sourceInUse) {
-      console.error('warning: the source profile looks like it is in use (SingletonLock present) — the copy may be inconsistent; close that browser for a clean snapshot.')
-    }
-  } catch (error) {
-    console.error(`error: ${error instanceof Error ? error.message : String(error)}`)
-    process.exit(2)
-  }
-} else {
-  console.error(`profile: using ${plan.userDataDir} as-is`)
-}
-
-if (flags.dryRun) {
-  console.log(plan.command)
-  console.error(`would expose CDP on ${plan.endpoint}; from the plugin host, reach it with:`)
-  console.error(`  ${api.TUNNEL_HINT}`)
-  process.exit(0)
-}
-
-console.error(`launching ${plan.executable} · ${plan.headless ? 'headless' : 'headful'} · CDP ${plan.endpoint} · profile ${plan.userDataDir}`)
-console.error('from the plugin host, reach this browser with:')
-console.error(`  ${api.TUNNEL_HINT}`)
-
-const child = spawn(plan.executable, plan.args, { stdio: 'inherit' })
-child.on('error', (error) => {
-  console.error(`error: cannot run ${plan.executable}: ${error.message}`)
-  process.exitCode = 2
+const result = await api.runLauncher(process.argv.slice(2), process.env, {
+  out: line => { console.log(line) },
+  err: line => { console.error(line) },
+  run: (executable, args) => new Promise(resolve => {
+    const child = spawn(executable, args, { stdio: 'inherit' })
+    child.on('error', (error) => {
+      console.error(`error: cannot run ${executable}: ${error.message}`)
+      resolve(2)
+    })
+    child.on('exit', (code, signal) => {
+      if (signal !== null) console.error(`browser stopped by ${signal}`)
+      resolve(code ?? 0)
+    })
+  }),
 })
-child.on('exit', (code, signal) => {
-  if (signal !== null) console.error(`browser stopped by ${signal}`)
-  process.exitCode = code ?? 0
-})
+process.exitCode = result.code

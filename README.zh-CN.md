@@ -153,7 +153,9 @@ autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>
 两点必须在信任该浏览器之前知道：
 
 - **这里不会下发 `proxyUsername`/`proxyPassword`。** Chromium 命令行无处承载代理凭据，启动器也绝不会把它们拼进 `--proxy-server`——检测到设置卡片里填了它们时会打印明确警告。若代理要求鉴权，请在它前面放一跳免鉴权入口（`ssh -D 1080 user@host`，再用 `--proxy socks5://127.0.0.1:1080`，或在代理侧做 IP 白名单），或先以有头方式启动并手动应答一次鉴权。CDP 后端整体也是同一限制：对不是本插件启动的浏览器，插件既无法注入也无法校验代理。
-- **DevTools 端口只留在回环。** `--address` 只接受 `127.0.0.1`、`127.0.0.0/8` 其余地址、`::1`、`localhost`，其他值直接报错并说明原因（该端口等于浏览器的完全控制权 **加上** profile 里的登录凭据）。远程访问交给反向隧道。
+- **DevTools 端口只留在回环。** `--address` 只接受 `127.0.0.1`、`127.0.0.0/8` 其余地址、`::1`、`localhost`，其他值直接报错并说明原因（该端口等于浏览器的完全控制权 **加上** profile 里的登录凭据）。带方括号的 IPv6 写法（`[::1]`）会被接受并归一化为 Chromium 需要的裸 `::1`——绝不会把方括号形式传下去。远程访问交给反向隧道。
+
+报错与用法回显的是你的参数，而不是你的凭据：任何内容进入 stdout/stderr 之前，启动器都会把每个 token 里的 `user:pass@` userinfo 剥离（未知 flag、`--port`、`--address` 以及规划失败路径一律如此），所以把 `--proxyy=http://user:secret@proxy:1080` 拼错时只会打印 `--proxyy=http://proxy:1080`。
 
 profile 复制是**刻意不完整**的：`SingletonLock`/`SingletonCookie`/`SingletonSocket`（在运行浏览器的锁）、大缓存（`Cache`、`Code Cache`、`GPUCache`、`Service Worker`、`Media Cache`、各类 shader cache）与崩溃/遥测残留都会被排除；cookie、`Login Data`、`Local Storage`、`Preferences`、扩展会保留。目标目录上存在 `SingletonLock`（说明有浏览器正在用它）时会拒绝复制；目标目录**已存在**时除非显式传 `--force`，否则一律拒绝——复制目标是真实 profile 数据的快照，静默合并进去从来不是本意。在源码检出中使用需先 `pnpm build`（`bin/` 要 import 构建产物）；npm 安装包自带 `lib/`。
 

@@ -108,15 +108,62 @@ function unescapeDoubleQuoted(value: string): string {
 }
 
 /**
- * Strip `user:pass@` userinfo out of a string before it is echoed back to the
- * user (an argv token, an error message). Anything without that shape is
- * returned unchanged.
+ * Strip userinfo out of a string before it is echoed back to the user (an argv
+ * token, an error message, a diagnostic).
+ *
+ * A credential-bearing token is stripped per WHITESPACE-DELIMITED TOKEN, from
+ * the start of its userinfo through the LAST `@` in that token. The userinfo
+ * starts after `scheme://` when the value has a scheme, after the `=` of a
+ * `--flag=value` token when it does not (so the flag name survives and the
+ * message stays readable), and at the token start otherwise. Two details make
+ * that the correct rule rather than a regex guess:
+ *
+ * - the password may contain `/` (very common) — a `[^/@]*` class would stop
+ *   early and print the rest of the password;
+ * - the password may contain `@` — the userinfo terminator is therefore the
+ *   LAST `@`, not the first, or the tail of the password survives.
+ *
+ * Over-scrubbing a non-URL token that happens to contain `@` (an email address
+ * in an error message) is deliberate: dropping text is always safer than
+ * printing a secret, and these strings are diagnostics, not data.
  *
  * @param text - the text about to be printed.
- * @returns the same text with any `//user:pass@` reduced to `//`.
+ * @returns the text with every token's userinfo removed.
  */
 export function scrubCredentials(text: string): string {
-  return text.replace(/\/\/[^\s/@]*@/g, '//')
+  return text
+    .split(/(\s+)/)
+    .map(part => part === '' || /^\s+$/.test(part) ? part : scrubToken(part))
+    .join('')
+}
+
+/** One token's userinfo removal (see {@link scrubCredentials}). */
+function scrubToken(token: string): string {
+  const at = token.lastIndexOf('@')
+  if (at === -1) return token
+  const scheme = token.indexOf('://')
+  let userinfoStart = scheme === -1 ? 0 : scheme + 3
+  if (scheme === -1 && token.startsWith('-')) {
+    // `--flag=user:pass@host`: keep the flag, drop the value's userinfo.
+    const equals = token.indexOf('=')
+    if (equals !== -1) userinfoStart = equals + 1
+  }
+  // No userinfo to remove (or the `@` sits before it): leave the token alone.
+  if (at <= userinfoStart) return token
+  return `${token.slice(0, userinfoStart)}${token.slice(at + 1)}`
+}
+
+/**
+ * The bind address in the form Chromium accepts: IPv6 literals WITHOUT the
+ * square brackets a URL/`netstat` listing uses, because
+ * `--remote-debugging-address=[::1]` makes Chromium refuse to start.
+ *
+ * @param address - the raw `--address` value.
+ * @returns the normalized address (still to be loopback-validated).
+ */
+export function normalizeBindAddress(address: string): string {
+  const value = address.trim()
+  return value.startsWith('[') && value.endsWith(']') ? value.slice(1, -1).trim() : value
 }
 
 /**
@@ -129,8 +176,8 @@ export function scrubCredentials(text: string): string {
  * @returns true for `127.0.0.1`, the rest of `127.0.0.0/8`, `::1`, `localhost`.
  */
 export function isLoopbackAddress(address: string): boolean {
-  const value = address.trim().toLowerCase()
-  if (value === 'localhost' || value === '::1' || value === '[::1]') return true
+  const value = normalizeBindAddress(address).toLowerCase()
+  if (value === 'localhost' || value === '::1') return true
   const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value)
   if (match === null) return false
   return Number(match[1]) === 127
@@ -169,9 +216,10 @@ export function resolveSettingsPath(env: NodeJS.ProcessEnv = process.env): strin
  *
  * A DOUBLE-quoted value is unescaped the way YAML spells the handful of
  * characters that must be escaped (`\\`, `\"`, `\n`, `\t`, `\r`); a
- * single-quoted value is taken literally (YAML semantics). That matters for a
- * proxy password containing a backslash or a quote: without it the launcher
- * would dial a different password than the plugin does.
+ * single-quoted value is literal EXCEPT for the doubled quote (`''` → `'`),
+ * which is how YAML escapes a quote inside that form. Both matter for a proxy
+ * password containing a backslash or a quote: without them the launcher would
+ * dial a different password than the plugin does.
  *
  * @param text - the settings file contents.
  * @param namespace - the section to read (defaults to this plugin's).
@@ -199,7 +247,10 @@ export function parseSettingsSection(text: string, namespace: string = LAUNCHER_
       // with a quote/backslash/tab survives the round trip.
       value = unescapeDoubleQuoted(raw.slice(1, -1))
     } else if (raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'")) {
-      value = raw.slice(1, -1)
+      // YAML single-quoted scalars escape a quote by DOUBLING it: `'it''s'` is
+      // the string `it's`. Without folding, a password with a quote would be
+      // read with two of them.
+      value = raw.slice(1, -1).replace(/''/g, "'")
     } else {
       value = raw.replace(/\s+#.*$/, '').trim()
     }
@@ -509,8 +560,10 @@ export function planLauncher(
   // loopback-bound reverse tunnel (see the README), so this is a hard refusal
   // rather than a warning.
   if (flags.address !== undefined && !isLoopbackAddress(flags.address)) {
+    // Echoed through the scrubber: this path used to print the raw value, so a
+    // `--address=user:secret@host` typo leaked the password.
     throw new Error(
-      `--address ${flags.address} is not a loopback address: the DevTools port grants full control of this browser and access to the logins in its profile, so binding it to a network interface would expose both. `
+      `--address ${scrubCredentials(flags.address)} is not a loopback address: the DevTools port grants full control of this browser and access to the logins in its profile, so binding it to a network interface would expose both. `
       + `Use the default ${LAUNCHER_CDP_ADDRESS} and reach it over a reverse tunnel (${TUNNEL_HINT}).`,
     )
   }
@@ -559,10 +612,10 @@ export function planLauncher(
     ...(proxyBypass === undefined ? {} : { proxyBypassList: proxyBypass }),
     ...(launchArgs === undefined ? {} : { launchArgs }),
     ...(flags.port === undefined ? {} : { port: flags.port }),
-    ...(flags.address === undefined ? {} : { address: flags.address }),
+    ...(flags.address === undefined ? {} : { address: normalizeBindAddress(flags.address) }),
   })
   const port = flags.port ?? LAUNCHER_CDP_PORT
-  const address = flags.address ?? LAUNCHER_CDP_ADDRESS
+  const address = flags.address === undefined ? LAUNCHER_CDP_ADDRESS : normalizeBindAddress(flags.address)
   return {
     executable,
     args,
@@ -654,4 +707,131 @@ export function copyProfile(source: string, destination: string, options: { forc
     throw new Error(`copying the profile from ${source} to ${destination} failed: ${error instanceof Error ? error.message : String(error)}. Check the permissions of both directories, and close the source browser (a live profile copies inconsistently).`)
   }
   return { source, destination, sourceInUse }
+}
+
+/** Where {@link runLauncher} writes: the CLI passes its own streams. */
+export interface LauncherIo {
+  /** Human-facing output (the command in `--dry-run`, the usage text). */
+  out: (line: string) => void
+  /** Diagnostics, notes, warnings, and errors. */
+  err: (line: string) => void
+  /**
+   * Runs the planned browser command and resolves with its exit code. The CLI
+   * passes a real spawn; a test passes a recorder so the whole entry path —
+   * argv → settings → plan → copy → run — is exercised without a browser.
+   */
+  run?: (executable: string, args: readonly string[]) => Promise<number>
+}
+
+/** What one {@link runLauncher} invocation resolved to. */
+export interface LauncherRunResult {
+  /** The exit code the CLI should use. */
+  code: number
+  /** The parsed flags. */
+  flags: LauncherFlags
+  /** Where the settings came from. */
+  settingsFile: string
+  /** Whether that settings file was found. */
+  settingsFound: boolean
+  /** The plan, when planning succeeded. */
+  plan?: LauncherPlan
+  /** The profile copy report, when a copy ran. */
+  copy?: ProfileCopyReport
+  /** The browser exit code, when the browser was actually run. */
+  browserExitCode?: number
+}
+
+/**
+ * The launcher's WHOLE entry path, callable from a test: parse argv, read the
+ * settings section, plan, copy the profile, and (unless `--dry-run`) run the
+ * browser. `bin/launch-browser.mjs` is a thin shim over this function, so a
+ * test that drives `runLauncher` exercises the real call sites — a refactor
+ * that drops the `{ force }` argument, skips the copy, or forgets a warning
+ * fails those tests instead of passing a hand-copied sequence.
+ *
+ * @param argv - arguments after the script name.
+ * @param env - environment for defaults and `$DSH_HOME` (defaults to `process.env`).
+ * @param io - output sinks plus the browser runner (defaults to `console`).
+ * @returns the exit code and everything the run resolved to.
+ */
+export async function runLauncher(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+  io: LauncherIo = {
+    out: line => { console.log(line) },
+    err: line => { console.error(line) },
+  },
+): Promise<LauncherRunResult> {
+  let flags: LauncherFlags
+  try {
+    flags = parseLauncherArgs(argv)
+  } catch (error: unknown) {
+    io.err(`error: ${scrubCredentials(describeError(error))}`)
+    return { code: 2, flags: { help: false, dryRun: false, copyProfile: true, force: false }, settingsFile: '', settingsFound: false }
+  }
+  if (flags.help) {
+    io.out(launcherUsage())
+    return { code: 0, flags, settingsFile: '', settingsFound: false }
+  }
+
+  const settingsFile = flags.settingsFile ?? resolveSettingsPath(env)
+  const { settings, found } = readSettingsSection(settingsFile)
+  let plan: LauncherPlan
+  try {
+    plan = planLauncher(flags, settings, env)
+  } catch (error: unknown) {
+    // NOT scrubbed as a whole: every user-supplied value in a plan error is
+    // scrubbed where it is interpolated (see the `--address` check), while the
+    // message also carries STATIC text — the `autossh … <user@server>`
+    // reminder — that a blanket scrub would mangle into `… server>`.
+    io.err(`error: ${describeError(error)}`)
+    return { code: 2, flags, settingsFile, settingsFound: found }
+  }
+
+  io.err(`settings: ${settingsFile} ${found ? '(read)' : '(not found — running on flags and defaults)'}`)
+  for (const note of plan.notes) io.err(`  ${note}`)
+  for (const warning of plan.warnings) io.err(`warning: ${warning}`)
+
+  let copy: ProfileCopyReport | undefined
+  if (plan.copyProfile) {
+    const source = plan.profileSource
+    try {
+      if (source === undefined) throw new Error('no profile source was resolved')
+      // The `--force` intent is wired HERE, in the code the CLI runs.
+      copy = copyProfile(source, plan.userDataDir, { force: flags.force === true })
+      io.err(`profile copy: ${copy.source} → ${copy.destination} (locks, caches, and crash dumps excluded)`)
+      if (copy.sourceInUse) {
+        io.err('warning: the source profile looks like it is in use (SingletonLock present) — the copy may be inconsistent; close that browser for a clean snapshot.')
+      }
+    } catch (error: unknown) {
+      io.err(`error: ${scrubCredentials(describeError(error))}`)
+      return { code: 2, flags, settingsFile, settingsFound: found, plan }
+    }
+  } else {
+    io.err(`profile: using ${plan.userDataDir} as-is`)
+  }
+
+  if (flags.dryRun) {
+    io.out(plan.command)
+    io.err(`would expose CDP on ${plan.endpoint}; from the plugin host, reach it with:`)
+    io.err(`  ${TUNNEL_HINT}`)
+    return { code: 0, flags, settingsFile, settingsFound: found, plan, ...(copy === undefined ? {} : { copy }) }
+  }
+
+  io.err(`launching ${plan.executable} · ${plan.headless ? 'headless' : 'headful'} · CDP ${plan.endpoint} · profile ${plan.userDataDir}`)
+  io.err('from the plugin host, reach this browser with:')
+  io.err(`  ${TUNNEL_HINT}`)
+  if (io.run === undefined) return { code: 0, flags, settingsFile, settingsFound: found, plan, ...(copy === undefined ? {} : { copy }) }
+  try {
+    const browserExitCode = await io.run(plan.executable, plan.args)
+    return { code: browserExitCode, flags, settingsFile, settingsFound: found, plan, ...(copy === undefined ? {} : { copy }), browserExitCode }
+  } catch (error: unknown) {
+    io.err(`error: cannot run ${plan.executable}: ${scrubCredentials(describeError(error))}`)
+    return { code: 2, flags, settingsFile, settingsFound: found, plan }
+  }
+}
+
+/** A thrown value's one-line description, for the CLI's messages. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
