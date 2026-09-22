@@ -3,3 +3,8 @@ lib/
 *.tsbuildinfo
 .pnpm-store/
 test-results/
+
+# Local network-capture dumps (contain live cookies/tokens — never commit)
+net-dumps/
+__pycache__/
+*.pyc
