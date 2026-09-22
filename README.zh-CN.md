@@ -187,7 +187,7 @@ google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome
 
 | 文件 | 内容 |
 | --- | --- |
-| `network.jsonl` | 每行一个 JSON 对象，**抓取进行中持续追加**——先是 `session` 头行，然后每个请求依次 `request` / `response` / `responseBody` / `finished`（失败则 `failed`）、承载权威 header+cookie 集的 `requestExtra` / `responseExtra` 行（重定向跳会单独定稿为一对 `response`/`finished`，因此 301→200 产出两条记录），以及 `websocketCreated` / `websocketFrame` / `websocketClosed`。可边跑边读、中断也不丢，也是离线流水线的输入格式。单个坏 URL 或坏记录只会降级为那一条：导出绝不会丢掉整份文档。 |
+| `network.jsonl` | 每行一个 JSON 对象，**抓取进行中持续追加**——先是 `session` 头行，然后每个请求依次 `request` / `response` / `responseBody` / `finished`（失败则 `failed`）、承载权威 header+cookie 集、并按「跳」配对的 `requestExtra` / `responseExtra` 行（重定向跳会单独定稿为一对 `response`/`finished`，因此 301→200 产出两条记录，且即使 ExtraInfo 早于它那一跳的基础事件到达，每跳也各自保有本跳的 cookie/header），以及 `websocketCreated` / `websocketFrame` / `websocketClosed`。可边跑边读、中断也不丢，也是离线流水线的输入格式。单个坏 URL 或坏记录只会降级为那一条：导出绝不会丢掉整份文档。 |
 | `har.json` | 抓取结束时导出的 HAR 1.2——正常结束、抛错、被 abort 三条路径都会写（插件卸载也会 flush）。WebSocket 流量按 Chrome 的 `_webSocketMessages` 扩展挂在 entry 上。 |
 
 > **抓包产物含明文凭据。** `Cookie`、`Set-Cookie`、`Authorization`、token 与请求/响应正文都按原样保存——这是刻意设计，因为「复现已登录会话」正是它的用途——所以请把 dump 目录当作密码文件对待。默认值做了防护：目录 `0700`、文件 `0600`，且 `net-dumps/` 已在本仓库 `.gitignore` 中。但一旦你把目录复制出去或提交，这些防护就失效了：切勿外发、发布或作为附件分享。

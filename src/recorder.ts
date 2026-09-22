@@ -27,10 +27,16 @@
  *   - `finished` — `requestId`, `url`, `status`, `mimeType`, `durationMs`
  *     (plus the body SIZES, never the body again);
  *   - `failed` — `requestId`, `url`, `errorText`, `canceled`;
- *   - `requestExtra` / `responseExtra` — `requestId`, `url`, and the
- *     AUTHORITATIVE `headers` set from CDP's ExtraInfo events (plus the
- *     associated cookies); the base events' headers are only a fallback, and
- *     the offline pipeline merges these rows by `requestId`;
+ *   - `requestExtra` / `responseExtra` — `requestId`, `url`, the AUTHORITATIVE
+ *     `headers` set from CDP's ExtraInfo events (plus the associated cookies),
+ *     and `hop` (which hop of that `requestId` it belongs to). Pairing is by
+ *     hop — index among that requestId's extras against index among its base
+ *     events, Playwright's own rule — NOT by "the exchange currently in
+ *     flight", because a redirect reuses the requestId and CDP does not
+ *     promise that a hop's ExtraInfo arrives after that hop's base event.
+ *     A slot whose base event never arrives is flushed after
+ *     {@link DEFAULT_EXTRA_HOLD_MS} and marked `unclaimed` (no `url`), while a
+ *     requestId the static filter dropped never produces a line at all;
  *   - `websocketCreated` / `websocketFrame` / `websocketClosed` — `requestId`,
  *     `url`, and for a frame `direction` (`sent`/`received`), `opcode`,
  *     `payloadData`;
@@ -156,6 +162,14 @@ export interface RecorderOptions {
   /** Clock, injectable for deterministic tests. */
   now?: () => number
   /**
+   * How long an ExtraInfo slot whose base event never arrived is held before
+   * its JSONL line is flushed anyway (ms). Short windows keep the stream live;
+   * a base event that DOES arrive inside the window still owns the slot, and a
+   * base event that shows the resource was dropped as static discards it
+   * without a line ever being written.
+   */
+  extraHoldMs?: number
+  /**
    * Where a swallowed recorder error is reported (diagnostics only — the
    * fetch never sees it). Absent = collected in {@link NetworkRecorder.report}.
    */
@@ -184,6 +198,64 @@ export interface RecorderReport {
 export type RecordedEvent = Record<string, unknown>
 
 /**
+ * How long an ExtraInfo slot whose base event never showed up is held before
+ * its line is flushed anyway. Short on purpose: the JSONL is meant to be
+ * readable while the fetch runs, and a base event either arrives promptly or
+ * never does.
+ */
+export const DEFAULT_EXTRA_HOLD_MS = 250
+
+/**
+ * One ExtraInfo event, parked until the hop it belongs to is known. The INDEX
+ * is its position among its requestId's extras of the same kind, which is how
+ * it is paired with a hop (see {@link NetworkRecorder}).
+ */
+interface ExtraSlot {
+  /** `0` for the first extra of this requestId, `1` for the redirect hop, … */
+  index: number
+  /** `request` for `requestWillBeSentExtraInfo`, `response` for the response side. */
+  kind: 'request' | 'response'
+  /** The authoritative header set (with a synthesized `cookie` when needed). */
+  headers: Record<string, string>
+  /** Cookies decoded from `associatedCookies` (request) or `Set-Cookie` (response). */
+  cookies: HarCookie[]
+  /** Response extras only: the status from `responseReceivedExtraInfo`. */
+  status?: number
+  /** Epoch milliseconds of arrival. */
+  at: number
+  /** Request extras only: the `:path` pseudo-header, for hop matching. */
+  path?: string
+  /** Request extras only: the `:authority` pseudo-header. */
+  authority?: string
+  /** True once a hop took it (or the hold window flushed it). */
+  claimed?: boolean
+}
+
+/**
+ * One requestId's hop slots: base-event hops plus the ExtraInfo they claim.
+ *
+ * PAIRING RULE: the Nth extra of a requestId belongs to its Nth hop — the rule
+ * Playwright's own tracker uses (coreBundle.js `ResponseExtraInfoTracker` keeps
+ * three parallel arrays per requestId and patches them by index). That is
+ * correct for every arrival order in which a hop's own ExtraInfo does not
+ * arrive AFTER a LATER hop's ExtraInfo: the racy "next hop's extra first"
+ * order, and the "this hop's extra after the redirect" order, both land on the
+ * right hop. The remaining inversion (extra of hop 1 arriving after the extra
+ * of hop 2) is locally indistinguishable — nothing in the event names its hop *
+ * — and matches what Playwright does as well; each slot therefore also keeps
+ * the `:path`/`:authority` pseudo-headers Chrome sends, so a future refinement
+ * can use them if a real capture ever exhibits that order.
+ */
+interface HopSlots {
+  /** The base-event exchanges of this requestId, in hop order. */
+  hops: RecordedHttpExchange[]
+  /** Request ExtraInfo slots, in arrival order (index ↔ hop index). */
+  requestExtras: ExtraSlot[]
+  /** Response ExtraInfo slots, in arrival order (index ↔ hop index). */
+  responseExtras: ExtraSlot[]
+}
+
+/**
  * A capture session over one page's CDP session. Create it with
  * {@link NetworkRecorder.create}, end it with {@link NetworkRecorder.finish}.
  */
@@ -200,10 +272,17 @@ export class NetworkRecorder {
   private readonly recorded: RecordedHttpExchange[] = []
   private readonly skipped = new Set<string>()
   private readonly sockets = new Map<string, RecordedWebSocket>()
-  /** ExtraInfo request headers/cookies that may arrive before OR after the base event. */
-  private readonly requestExtras = new Map<string, { headers: Record<string, string>; cookies: HarCookie[] }>()
-  /** ExtraInfo response headers/status, same both-orders handling. */
-  private readonly responseExtras = new Map<string, { headers: Record<string, string>; status?: number; cookies: HarCookie[] }>()
+  /**
+   * Per-requestId HopSlots: the base-event hops in order, plus the ExtraInfo
+   * slots in order. Pairing is BY INDEX (Playwright's own
+   * `ResponseExtraInfoTracker` does the same with three parallel arrays) — NOT
+   * by "whatever exchange is in flight", which misattributes the next hop's
+   * early ExtraInfo to the hop that is still open on a redirect.
+   */
+  private readonly slots = new Map<string, HopSlots>()
+  /** ExtraInfo that arrived before its hop existed, awaiting (or holding) a claim. */
+  private readonly heldExtras: ExtraSlot[] = []
+  private holdTimer: ReturnType<typeof setTimeout> | undefined
   private finished: Promise<RecorderReport> | undefined
   private writes: Promise<void> = Promise.resolve()
   private stopped = false
@@ -300,6 +379,13 @@ export class NetworkRecorder {
 
   private async complete(): Promise<RecorderReport> {
     this.stopped = true
+    if (this.holdTimer !== undefined) {
+      clearTimeout(this.holdTimer)
+      this.holdTimer = undefined
+    }
+    // Anything still on hold has no hop to belong to: flush it (unless its
+    // requestId was dropped as static) so the stream is not silently short.
+    this.flushHeldExtras()
     await this.settleWrites()
     const report: RecorderReport = {
       dir: this.dir,
@@ -379,20 +465,24 @@ export class NetworkRecorder {
       return
     }
     if (redirectResponse !== undefined) this.finalizeRedirect(requestId, redirectResponse)
-    const extra = this.requestExtras.get(requestId)
-    const baseHeaders = headers(request['headers'])
+    const slots = this.slotsFor(requestId)
     const exchange: RecordedHttpExchange = {
       requestId,
       startedAtMs: this.now(),
       ...(resourceType === undefined ? {} : { resourceType }),
       method: text(request['method']) || 'GET',
       url: text(request['url']),
-      // ExtraInfo headers win when they are already known; the base event's
-      // headers are the fallback (and a late ExtraInfo merges into the record).
-      requestHeaders: extra === undefined ? baseHeaders : { ...baseHeaders, ...extra.headers },
-      ...(extra === undefined ? {} : { requestCookies: extra.cookies }),
+      // The ExtraInfo set for THIS hop is authoritative when it is known; the
+      // base event's headers are the fallback until (or unless) it arrives.
+      requestHeaders: headers(request['headers']),
       ...(typeof request['postData'] === 'string' ? { postData: request['postData'] } : {}),
     }
+    const hopIndex = slots.hops.length
+    slots.hops.push(exchange)
+    // A hop that starts NOW may already have its ExtraInfo on hold (CDP does
+    // not promise which of the two arrives first) — claim it for this hop.
+    const held = this.claimHeldExtra(requestId, hopIndex)
+    if (held !== undefined) this.applyRequestExtra(exchange, held)
     this.http.set(requestId, exchange)
     this.recorded.push(exchange)
     this.append({
@@ -417,6 +507,8 @@ export class NetworkRecorder {
   private finalizeRedirect(requestId: string, redirectResponse: Record<string, unknown>): void {
     const hop = this.http.get(requestId)
     if (hop === undefined) return
+    // The hop keeps the ExtraInfo already claimed for it: the index pairing
+    // never wrote a later hop's set into this record.
     const shape = redirectShape(redirectResponse)
     if (shape.status !== undefined) hop.status = shape.status
     if (shape.statusText !== undefined) hop.statusText = shape.statusText
@@ -447,10 +539,20 @@ export class NetworkRecorder {
     this.http.delete(requestId)
   }
 
-  /** `Network.requestWillBeSentExtraInfo`: the authoritative request headers/cookies. */
+  /**
+   * `Network.requestWillBeSentExtraInfo`: the authoritative request
+   * headers/cookies for ONE hop.
+   *
+   * The slot is indexed by arrival among this requestId's request extras, and
+   * claimed when a hop with that index exists — so an extra that arrives
+   * BEFORE its own hop (the redirect race) is held, not written into the hop
+   * that happens to be open. Claiming is also what writes the JSONL line, so a
+   * requestId the static filter drops never leaves an orphan line behind.
+   */
   private onRequestExtra(params: Record<string, unknown>): void {
     const requestId = text(params['requestId'])
     if (requestId === '') return
+    // Known-static: the base event already decided this resource is dropped.
     if (this.skipped.has(requestId)) return
     const extraHeaders = headers(params['headers'])
     const cookies = associatedCookies(params['associatedCookies'])
@@ -458,21 +560,29 @@ export class NetworkRecorder {
     // CDP's extra-info headers are the complete set the browser sent, including
     // the cookies it attached; the base event is frequently missing them.
     const cookieHeader = cookieHeaderFor(extraHeaders, cookies)
-    const headersWithCookies = cookieHeader === undefined ? extraHeaders : { ...extraHeaders, cookie: cookieHeader }
-    this.requestExtras.set(requestId, { headers: headersWithCookies, cookies })
-    const exchange = this.http.get(requestId)
-    if (exchange !== undefined) {
-      exchange.requestHeaders = { ...exchange.requestHeaders, ...headersWithCookies }
-      exchange.requestCookies = cookies
+    const merged = cookieHeader === undefined ? extraHeaders : { ...extraHeaders, cookie: cookieHeader }
+    const slots = this.slotsFor(requestId)
+    const slot: ExtraSlot = {
+      kind: 'request',
+      index: slots.requestExtras.length,
+      headers: merged,
+      cookies,
+      at: this.now(),
     }
-    this.append({
-      kind: 'requestExtra',
-      ...this.stamps(this.now()),
-      requestId,
-      ...(exchange === undefined ? {} : { url: exchange.url }),
-      headers: headersWithCookies,
-      cookieCount: cookies.length,
-    })
+    const path = merged[':path']
+    if (path !== undefined) slot.path = path
+    const authority = merged[':authority']
+    if (authority !== undefined) slot.authority = authority
+    slots.requestExtras.push(slot)
+    const hop = slots.hops[slot.index]
+    if (hop === undefined) {
+      // Its hop has not started yet (the next redirect hop, or a hop whose base
+      // event never comes): hold it, and start the flush window.
+      this.heldExtras.push(slot)
+      this.armHoldTimer()
+      return
+    }
+    this.claimExtra(requestId, slot, hop)
   }
 
   /** `Network.responseReceivedExtraInfo`: authoritative response headers/status. */
@@ -484,22 +594,125 @@ export class NetworkRecorder {
     const statusCode = typeof params['statusCode'] === 'number' ? params['statusCode'] : undefined
     if (Object.keys(extraHeaders).length === 0 && statusCode === undefined) return
     const cookies = cookieHeaders(extraHeaders, ['set-cookie', 'Set-Cookie'])
-    this.responseExtras.set(requestId, { headers: extraHeaders, ...(statusCode === undefined ? {} : { status: statusCode }), cookies })
-    const exchange = this.http.get(requestId)
-    if (exchange !== undefined) {
-      exchange.responseHeaders = { ...exchange.responseHeaders, ...extraHeaders }
-      if (cookies.length > 0) exchange.responseCookies = cookies
-      if (exchange.status === undefined && statusCode !== undefined) exchange.status = statusCode
+    const slots = this.slotsFor(requestId)
+    const slot: ExtraSlot = {
+      kind: 'response',
+      index: slots.responseExtras.length,
+      headers: extraHeaders,
+      cookies,
+      at: this.now(),
+      ...(statusCode === undefined ? {} : { status: statusCode }),
     }
+    slots.responseExtras.push(slot)
+    const hop = slots.hops[slot.index]
+    if (hop === undefined) {
+      this.heldExtras.push(slot)
+      this.armHoldTimer()
+      return
+    }
+    this.claimExtra(requestId, slot, hop)
+  }
+
+  /** Claim a held slot for the hop that has just appeared. */
+  private claimHeldExtra(requestId: string, hopIndex: number): ExtraSlot | undefined {
+    const position = this.heldExtras.findIndex(slot => slot.index === hopIndex && !slot.claimed && this.slots.get(requestId)?.requestExtras.includes(slot) === true)
+    if (position === -1) return undefined
+    const slot = this.heldExtras.splice(position, 1)[0]
+    if (slot === undefined) return undefined
+    const hop = this.slots.get(requestId)?.hops[hopIndex]
+    if (hop === undefined) return undefined
+    this.claimExtra(requestId, slot, hop)
+    return slot
+  }
+
+  /** Apply a slot to its hop (authoritative) and write its JSONL line. */
+  private claimExtra(requestId: string, slot: ExtraSlot, hop: RecordedHttpExchange): void {
+    slot.claimed = true
+    const held = this.heldExtras.indexOf(slot)
+    if (held !== -1) this.heldExtras.splice(held, 1)
+    if (slot.kind === 'request') {
+      this.applyRequestExtra(hop, slot)
+      this.append({
+        kind: 'requestExtra',
+        ...this.stamps(slot.at),
+        requestId,
+        url: hop.url,
+        headers: slot.headers,
+        cookieCount: slot.cookies.length,
+        hop: slot.index,
+      })
+      return
+    }
+    this.applyResponseExtra(hop, slot)
     this.append({
       kind: 'responseExtra',
-      ...this.stamps(this.now()),
+      ...this.stamps(slot.at),
       requestId,
-      ...(exchange === undefined ? {} : { url: exchange.url }),
-      statusCode,
-      headers: extraHeaders,
-      cookieCount: cookies.length,
+      url: hop.url,
+      statusCode: slot.status,
+      headers: slot.headers,
+      cookieCount: slot.cookies.length,
+      hop: slot.index,
     })
+  }
+
+  /** The request-side effect of a claimed slot: headers + cookies win. */
+  private applyRequestExtra(hop: RecordedHttpExchange, slot: ExtraSlot): void {
+    hop.requestHeaders = { ...hop.requestHeaders, ...slot.headers }
+    hop.requestCookies = slot.cookies
+  }
+
+  /** The response-side effect of a claimed slot: headers + status win. */
+  private applyResponseExtra(hop: RecordedHttpExchange, slot: ExtraSlot): void {
+    hop.responseHeaders = { ...hop.responseHeaders, ...slot.headers }
+    if (slot.cookies.length > 0) hop.responseCookies = slot.cookies
+    if (hop.status === undefined && slot.status !== undefined) hop.status = slot.status
+  }
+
+  private slotsFor(requestId: string): HopSlots {
+    const existing = this.slots.get(requestId)
+    if (existing !== undefined) return existing
+    const created: HopSlots = { hops: [], requestExtras: [], responseExtras: [] }
+    this.slots.set(requestId, created)
+    return created
+  }
+
+  /** Start the flush window for held slots whose base event may never arrive. */
+  private armHoldTimer(): void {
+    if (this.holdTimer !== undefined || this.stopped) return
+    const window = this.options.extraHoldMs ?? DEFAULT_EXTRA_HOLD_MS
+    this.holdTimer = setTimeout(() => {
+      this.holdTimer = undefined
+      this.flushHeldExtras()
+    }, window)
+    // Never keep the host process alive just for a diagnostic line.
+    this.holdTimer.unref?.()
+  }
+
+  /**
+   * Write the line for every slot still held: its base event never arrived
+   * inside the window, so the slot is reported on its own (no `url`), which is
+   * what "the base event is missing" looks like to the offline pipeline.
+   */
+  private flushHeldExtras(): void {
+    for (const slot of [...this.heldExtras]) {
+      if (slot.claimed) continue
+      const requestId = this.ownerOf(slot)
+      if (requestId === undefined || this.skipped.has(requestId)) continue
+      slot.claimed = true
+      this.heldExtras.splice(this.heldExtras.indexOf(slot), 1)
+      this.append(slot.kind === 'request'
+        ? { kind: 'requestExtra', ...this.stamps(slot.at), requestId, headers: slot.headers, cookieCount: slot.cookies.length, hop: slot.index, unclaimed: true }
+        : { kind: 'responseExtra', ...this.stamps(slot.at), requestId, statusCode: slot.status, headers: slot.headers, cookieCount: slot.cookies.length, hop: slot.index, unclaimed: true })
+    }
+  }
+
+  /** Which requestId owns a held slot (its index within that id's arrays). */
+  private ownerOf(target: ExtraSlot): string | undefined {
+    for (const [requestId, slots] of this.slots) {
+      if (slots.requestExtras.includes(target) || slots.responseExtras.includes(target)) return requestId
+    }
+    return undefined
   }
 
   /** `Network.responseReceived`: attach status/headers/mimeType. */
@@ -512,13 +725,23 @@ export class NetworkRecorder {
     if (status !== undefined) exchange.status = status
     if (typeof response['statusText'] === 'string') exchange.statusText = response['statusText']
     if (typeof response['mimeType'] === 'string') exchange.mimeType = response['mimeType']
-    // ExtraInfo headers (which carry the true `Set-Cookie` set) win; the base
-    // event's are the fallback, and a missing responseExtra never loses them.
-    const extra = this.responseExtras.get(exchange.requestId)
-    const responseHeaders = { ...headers(response['headers']), ...(extra?.headers ?? {}) }
+    // ExtraInfo headers (which carry the true `Set-Cookie` set) win when that
+    // hop's slot was claimed; otherwise this hop's own slot may still be on
+    // hold (held until its hop's response pair is complete) and is applied then.
+    const responseHeaders = headers(response['headers'])
     if (Object.keys(responseHeaders).length > 0) exchange.responseHeaders = responseHeaders
-    if (extra !== undefined && extra.cookies.length > 0) exchange.responseCookies = extra.cookies
-    if (exchange.status === undefined && extra?.status !== undefined) exchange.status = extra.status
+    const slots = this.slots.get(exchange.requestId)
+    const hopIndex = slots?.hops.indexOf(exchange) ?? -1
+    if (slots !== undefined && hopIndex !== -1) {
+      const slot = slots.responseExtras[hopIndex]
+      if (slot === undefined) {
+        // A held response slot for this hop, if one arrived early.
+        const held = this.claimHeldExtra(exchange.requestId, hopIndex)
+        void held
+      } else if (slot.claimed !== true) {
+        this.claimExtra(exchange.requestId, slot, exchange)
+      }
+    }
     this.append({
       kind: 'response',
       ...this.stamps(this.now()),

@@ -986,3 +986,180 @@ describe('NetworkRecorder real-browser capture (self-skipping)', () => {
     }
   })
 })
+
+/**
+ * t15/R1: ExtraInfo belongs to a HOP, not to "whatever is in flight". A
+ * redirect reuses the requestId, and CDP does not promise that a hop's
+ * requestWillBeSentExtraInfo arrives after that hop's requestWillBeSent — so
+ * pairing is by arrival index per requestId (the same rule Playwright's own
+ * ResponseExtraInfoTracker uses), with a claim whenever a hop with that index
+ * exists.
+ */
+describe('NetworkRecorder per-hop ExtraInfo pairing (t15/R1)', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-hop-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  /** The two hops' ExtraInfo events, each with its own cookie. */
+  const EXTRA_HOP1 = {
+    requestId: '1',
+    headers: { ':authority': 'app.example.com', ':path': '/old' },
+    associatedCookies: [{ cookie: { name: 'hop1', value: 'cookie-one', domain: 'app.example.com', path: '/' }, blockedReasons: [] }],
+  }
+  const EXTRA_HOP2 = {
+    requestId: '1',
+    headers: { ':authority': 'api.example.com', ':path': '/v1/items', 'x-hop': 'two' },
+    associatedCookies: [{ cookie: { name: 'hop2', value: 'cookie-two', domain: 'api.example.com', path: '/' }, blockedReasons: [] }],
+  }
+  const BASE_HOP1 = requestEvent({ requestId: '1', url: 'http://app.example.com/old', method: 'GET', headers: { accept: 'text/html' } })
+  const BASE_HOP2 = {
+    requestId: '1',
+    type: 'Fetch',
+    redirectResponse: {
+      url: 'http://app.example.com/old',
+      status: 301,
+      statusText: 'Moved Permanently',
+      mimeType: 'text/html',
+      headers: { location: 'https://api.example.com/v1/items' },
+    },
+    request: { url: 'https://api.example.com/v1/items', method: 'GET', headers: { accept: 'application/json' } },
+  }
+
+  /** Replay one chain in the given event order and return the HAR. */
+  async function chain(order: Array<Record<string, unknown>>, name: string): Promise<HarDocument> {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{"ok":true}' } } })
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => name, url: 'http://app.example.com/old',
+      captureBodies: true, maxBodyBytes: 1024, recordAllResources: false,
+    })
+    expect(recorder).toBeDefined()
+    for (const event of order) {
+      const kind = String(event['__event'])
+      const payload = { ...event }
+      delete payload['__event']
+      session.emit(kind, payload)
+    }
+    session.emit('Network.responseReceived', responseEvent({ requestId: '1', status: 200, mimeType: 'application/json' }))
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    await recorder?.finish()
+    return JSON.parse(readFileSync(join(root, name, HAR_FILE), 'utf8')) as HarDocument
+  }
+
+  /** Assert each hop kept its OWN cookie and headers. */
+  function expectHopOwnership(har: HarDocument, label: string): void {
+    expect(har.log.entries, label).toHaveLength(2)
+    const [hop1, hop2] = har.log.entries
+    expect(hop1?.response.status, label).toBe(301)
+    expect(hop1?.request.cookies?.map(cookie => cookie.name), label).toEqual(['hop1'])
+    expect(hop1?.request.headers.some(header => header.name === 'x-hop'), label).toBe(false)
+    expect(hop2?.response.status, label).toBe(200)
+    expect(hop2?.request.cookies?.map(cookie => cookie.name), label).toEqual(['hop2'])
+    expect(hop2?.request.headers).toEqual(expect.arrayContaining([{ name: 'x-hop', value: 'two' }]))
+    // The 301 hop never inherits the destination's headers.
+    expect(hop1?.request.headers).toEqual(expect.arrayContaining([{ name: ':authority', value: 'app.example.com' }]))
+  }
+
+  it('keeps each hop\'s own ExtraInfo — canonical order (base, extra, base, extra)', async () => {
+    const har = await chain([
+      { __event: 'Network.requestWillBeSent', ...BASE_HOP1 },
+      { __event: 'Network.requestWillBeSentExtraInfo', ...EXTRA_HOP1 },
+      { __event: 'Network.requestWillBeSent', ...BASE_HOP2 },
+      { __event: 'Network.requestWillBeSentExtraInfo', ...EXTRA_HOP2 },
+    ], 'canonical')
+    expectHopOwnership(har, 'canonical')
+  })
+
+  it('keeps each hop\'s own ExtraInfo when the next hop\'s ExtraInfo arrives EARLY (the race)', async () => {
+    const har = await chain([
+      { __event: 'Network.requestWillBeSent', ...BASE_HOP1 },
+      { __event: 'Network.requestWillBeSentExtraInfo', ...EXTRA_HOP1 },
+      // hop2's extra BEFORE hop2's base event — the reported race.
+      { __event: 'Network.requestWillBeSentExtraInfo', ...EXTRA_HOP2 },
+      { __event: 'Network.requestWillBeSent', ...BASE_HOP2 },
+    ], 'early')
+    expectHopOwnership(har, 'early')
+  })
+
+  it('keeps each hop\'s own ExtraInfo when a hop\'s ExtraInfo arrives LATE (after the redirect)', async () => {
+    const har = await chain([
+      { __event: 'Network.requestWillBeSent', ...BASE_HOP1 },
+      { __event: 'Network.requestWillBeSent', ...BASE_HOP2 },
+      { __event: 'Network.requestWillBeSentExtraInfo', ...EXTRA_HOP1 },
+      { __event: 'Network.requestWillBeSentExtraInfo', ...EXTRA_HOP2 },
+    ], 'late')
+    expectHopOwnership(har, 'late')
+  })
+
+  it('pairs response ExtraInfo with its own hop as well', async () => {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{}' } } })
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'resp', url: 'http://app.example.com/old',
+      captureBodies: true, maxBodyBytes: 1024, recordAllResources: false,
+    })
+    session.emit('Network.requestWillBeSent', BASE_HOP1)
+    session.emit('Network.responseReceivedExtraInfo', { requestId: '1', statusCode: 301, headers: { location: 'https://api.example.com/v1/items', 'set-cookie': 'hop1=one; Path=/' } })
+    session.emit('Network.requestWillBeSent', BASE_HOP2)
+    session.emit('Network.responseReceived', responseEvent({ requestId: '1', status: 200, mimeType: 'application/json' }))
+    session.emit('Network.responseReceivedExtraInfo', { requestId: '1', statusCode: 200, headers: { 'content-type': 'application/json', 'set-cookie': 'hop2=two; Path=/' } })
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    await recorder?.finish()
+
+    const har = JSON.parse(readFileSync(join(root, 'resp', HAR_FILE), 'utf8')) as HarDocument
+    expect(har.log.entries).toHaveLength(2)
+    expect(har.log.entries[0]?.response.cookies?.map(cookie => cookie.name)).toEqual(['hop1'])
+    expect(har.log.entries[1]?.response.cookies?.map(cookie => cookie.name)).toEqual(['hop2'])
+  })
+})
+
+/** t15/R2: ExtraInfo for a request the static filter drops leaves no line. */
+describe('NetworkRecorder ExtraInfo vs the static filter (t15/R2)', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-static-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  function readJsonl(dir: string): Array<Record<string, unknown>> {
+    return readFileSync(join(dir, NETWORK_JSONL_FILE), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+  }
+
+  it('writes NO line when ExtraInfo arrives before a base event that proves it static', async () => {
+    const session = new FakeCdpSession()
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'static', url: 'https://app.example.com/',
+      captureBodies: true, maxBodyBytes: 64, recordAllResources: false,
+    })
+    // ExtraInfo FIRST (no base event yet), then the base event that drops it.
+    session.emit('Network.requestWillBeSentExtraInfo', {
+      requestId: 'img',
+      headers: { ':authority': 'cdn.example.com', ':path': '/logo.png' },
+      associatedCookies: [{ cookie: { name: 'cdn', value: 'secret-cookie' }, blockedReasons: [] }],
+    })
+    session.emit('Network.requestWillBeSent', requestEvent({ requestId: 'img', type: 'Image', url: 'https://cdn.example.com/logo.png' }))
+    session.emit('Network.responseReceivedExtraInfo', { requestId: 'img', statusCode: 200, headers: { 'content-type': 'image/png' } })
+    const report = await recorder?.finish()
+
+    expect(report?.httpCount).toBe(0)
+    const kinds = readJsonl(join(root, 'static')).map(line => line['kind'])
+    expect(kinds).toEqual(['session']) // no orphan requestExtra/responseExtra line
+    expect(readFileSync(join(root, 'static', NETWORK_JSONL_FILE), 'utf8')).not.toContain('secret-cookie')
+  })
+
+  it('flushes a held slot whose base event never arrives, marked unclaimed', async () => {
+    const session = new FakeCdpSession()
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'orphan', url: 'https://app.example.com/',
+      captureBodies: true, maxBodyBytes: 64, recordAllResources: false, extraHoldMs: 10,
+    })
+    session.emit('Network.requestWillBeSentExtraInfo', {
+      requestId: 'ghost',
+      headers: { ':authority': 'api.example.com', ':path': '/v1/ghost' },
+      associatedCookies: [{ cookie: { name: 'g', value: 'v' }, blockedReasons: [] }],
+    })
+    await new Promise(resolve => { setTimeout(resolve, 40) }) // past the hold window
+    await recorder?.finish()
+
+    const lines = readJsonl(join(root, 'orphan'))
+    const extra = lines.find(line => line['kind'] === 'requestExtra')
+    expect(extra).toMatchObject({ requestId: 'ghost', unclaimed: true, cookieCount: 1 })
+    expect(extra).not.toHaveProperty('url') // no hop to name
+  })
+})

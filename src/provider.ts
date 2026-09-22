@@ -375,6 +375,83 @@ function translateError(error: unknown, deadline: Deadline): WebError {
   return new WebError(`playwright web fetch failed: ${String(error instanceof Error ? error.message : error)}`, 'WEB_PROVIDER_ERROR', { cause: error })
 }
 
+/**
+ * How many distinct capture-failure kinds are remembered for de-duplication,
+ * and for how long. Bounded and time-limited on purpose: a wedged capture can
+ * produce a distinct message per request (each carrying its own requestId), and
+ * the outlet must neither spam once per request nor grow without bound.
+ */
+export const CAPTURE_ERROR_KINDS_MAX = 64
+
+/** How long a remembered kind suppresses a repeat of itself (ms). */
+export const CAPTURE_ERROR_TTL_MS = 10 * 60_000
+
+/**
+ * The de-duplication key of a capture failure: the message with its VOLATILE
+ * parts removed — parenthesised values (a requestId like `(1000.1)`) and bare
+ * numbers — so "getResponseBody(1000.1) failed: …" and
+ * "getResponseBody(2000.2) failed: …" are the same KIND and warn once.
+ *
+ * @param message - the failure text.
+ * @returns the stable key.
+ */
+export function captureErrorKey(message: string): string {
+  return message
+    .replace(/\([^)]*\)/g, '()')
+    .replace(/\d[\d.:-]*/g, '#')
+    .trim()
+    .slice(0, 200)
+}
+
+/**
+ * The bounded, TTL'd "have I warned about this already?" set behind the capture
+ * failure outlet. Kept as its own class so the policy — one warning per kind,
+ * eviction instead of unbounded growth, and eventual re-warning — is unit
+ * testable without a browser or a fetch.
+ */
+export class CaptureErrorReporter {
+  private readonly kinds = new Map<string, number>()
+
+  /**
+   * @param warn - called with the ORIGINAL message the first time a kind appears.
+   * @param options - the bound, the TTL, and an injectable clock.
+   */
+  constructor(
+    private readonly warn: (message: string) => void,
+    private readonly options: { maxKinds?: number; ttlMs?: number; now?: () => number } = {},
+  ) {}
+
+  /** How many kinds are currently remembered (never above the bound). */
+  get size(): number {
+    return this.kinds.size
+  }
+
+  /**
+   * Report a failure: warn when this KIND has not been reported recently.
+   * @param message - the failure text.
+   * @returns true when it warned.
+   */
+  report(message: string): boolean {
+    const now = this.options.now?.() ?? Date.now()
+    const ttl = this.options.ttlMs ?? CAPTURE_ERROR_TTL_MS
+    for (const [kind, at] of [...this.kinds]) {
+      if (now - at > ttl) this.kinds.delete(kind)
+    }
+    const key = captureErrorKey(message)
+    if (this.kinds.has(key)) return false
+    const max = this.options.maxKinds ?? CAPTURE_ERROR_KINDS_MAX
+    if (this.kinds.size >= max) {
+      // Evict the oldest kind so a genuinely new failure still gets its say
+      // while the set stays bounded.
+      const oldest = [...this.kinds.entries()].sort(([, left], [, right]) => left - right)[0]
+      if (oldest !== undefined) this.kinds.delete(oldest[0])
+    }
+    this.kinds.set(key, now)
+    this.warn(message)
+    return true
+  }
+}
+
 /** A thrown value's best one-line description, for the diagnostic messages. */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -451,7 +528,13 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    * this is the ONE visible outlet, and it carries the error text only (never
    * a header, a body, or a URL from the dump).
    */
-  private readonly reportedCaptureErrors = new Set<string>()
+  private readonly captureErrors = new CaptureErrorReporter(message => {
+    try {
+      console.warn(`dsh-web-fetch-playwright: network capture problem (the fetch is unaffected): ${message}`)
+    } catch {
+      // a console that refuses to warn must not break the fetch either
+    }
+  })
 
   /**
    * The session id generator captures use. Protected so a test (or an embedder)
@@ -481,19 +564,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   }
 
   /**
-   * Report a capture failure exactly once per distinct message. Recording must
-   * never fail a fetch, but it must not be silent either: `console.warn` (the
-   * only channel available to a provider that gets no logger) carries the
-   * error TEXT and nothing from the dump — no header, no body, no URL.
+   * Report a capture failure once per KIND (see {@link CaptureErrorReporter}).
+   * Recording must never fail a fetch, but it must not be silent either.
    */
   private reportCaptureError(message: string): void {
-    if (this.reportedCaptureErrors.has(message)) return
-    this.reportedCaptureErrors.add(message)
-    try {
-      console.warn(`dsh-web-fetch-playwright: network capture problem (the fetch is unaffected): ${message}`)
-    } catch {
-      // a console that refuses to warn must not break the fetch either
-    }
+    this.captureErrors.report(message)
   }
 
   /**

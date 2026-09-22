@@ -17,7 +17,7 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import type { ResolvedConfig } from '../src/config.ts'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import type { ResolvedPlaywright } from '../src/playwright-resolve.ts'
-import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE, WEB_FETCH_PROXY_CODE } from '../src/provider.ts'
+import { CAPTURE_ERROR_KINDS_MAX, captureErrorKey, CaptureErrorReporter, PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE, WEB_FETCH_PROXY_CODE } from '../src/provider.ts'
 import type { BrowserSession } from '../src/provider.ts'
 import type { CdpSession, PlaywrightBrowser, PlaywrightChromium, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightResponse } from '../src/types.ts'
 
@@ -1670,6 +1670,95 @@ describe('PlaywrightFetchProvider capture failure outlet', () => {
       await provider.fetch({ url: 'https://example.com/docs' })
       expect(warning).not.toHaveBeenCalled()
       expect(existsSync(join(root, 'fixed-session', 'har.json'))).toBe(true)
+    } finally {
+      warning.mockRestore()
+    }
+  })
+})
+
+/** t15/R3: the capture failure outlet de-duplicates by KIND and stays bounded. */
+describe('capture failure outlet policy (t15/R3)', () => {
+  it('warns once for the same failure KIND across different request ids', () => {
+    const warned: string[] = []
+    const reporter = new CaptureErrorReporter(message => { warned.push(message) })
+    // The volatile part is the requestId in the parentheses.
+    expect(reporter.report('getResponseBody(1000.1) failed: No resource with given identifier found (1000.1)')).toBe(true)
+    expect(reporter.report('getResponseBody(2000.2) failed: No resource with given identifier found (2000.2)')).toBe(false)
+    expect(reporter.report('getResponseBody(3000.3) failed: No resource with given identifier found (3000.3)')).toBe(false)
+    expect(warned).toHaveLength(1)
+    expect(reporter.size).toBe(1)
+
+    // A genuinely different kind still gets through.
+    expect(reporter.report('writing har.json failed: EISDIR')).toBe(true)
+    expect(warned).toHaveLength(2)
+  })
+
+  it('normalizes the de-duplication key', () => {
+    expect(captureErrorKey('getResponseBody(1000.1) failed: ENOENT')).toBe(captureErrorKey('getResponseBody(2000.2) failed: ENOENT'))
+    expect(captureErrorKey('could not start a capture session under /tmp/net-dumps')).toContain('/tmp/net-dumps')
+    expect(captureErrorKey('something happened at 12:30:45')).toBe(captureErrorKey('something happened at 01:02:03'))
+  })
+
+  it('keeps the remembered kinds bounded under a flood of distinct failures', () => {
+    const warned: string[] = []
+    const reporter = new CaptureErrorReporter(message => { warned.push(message) }, { maxKinds: 8 })
+    // Alphabetic kinds on purpose: a numeric one would be normalized into the
+    // same key as its siblings (which is the point of the normalizer).
+    const word = (index: number): string => {
+      let value = index + 1
+      let text = ''
+      while (value > 0) {
+        text = String.fromCharCode(97 + ((value - 1) % 26)) + text
+        value = Math.floor((value - 1) / 26)
+      }
+      return text
+    }
+    for (let index = 0; index < 200; index++) {
+      reporter.report(`kind-${word(index)} failed somewhere`)
+    }
+    expect(reporter.size).toBeLessThanOrEqual(8)
+    // Every distinct kind warned as it arrived (bounded by eviction, not by
+    // silencing new kinds).
+    expect(warned).toHaveLength(200)
+  })
+
+  it('forgets a kind after the TTL so a recurrence is reported again', () => {
+    let now = 1_000_000
+    const warned: string[] = []
+    const reporter = new CaptureErrorReporter(message => { warned.push(message) }, { ttlMs: 1_000, now: () => now })
+    expect(reporter.report('Network.enable failed: boom')).toBe(true)
+    expect(reporter.report('Network.enable failed: boom')).toBe(false)
+    now += 1_500 // past the TTL
+    expect(reporter.report('Network.enable failed: boom')).toBe(true)
+    expect(warned).toHaveLength(2)
+  })
+
+  it('reports a flood of per-request capture failures through the provider ONCE', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      // Three requests whose bodies cannot be read: each failure carries its
+      // own requestId in the text, which is exactly what used to spam.
+      const events: Array<{ event: string; params: Record<string, unknown> }> = []
+      for (const requestId of ['1000.1', '1000.2', '1000.3']) {
+        events.push(
+          { event: 'Network.requestWillBeSent', params: { requestId, type: 'XHR', request: { url: `https://api.example.com/v1/${requestId}`, method: 'GET', headers: {} } } },
+          { event: 'Network.responseReceived', params: { requestId, response: { status: 200, statusText: 'OK', mimeType: 'application/json', headers: {} } } },
+          { event: 'Network.loadingFinished', params: { requestId } },
+        )
+      }
+      // No bodies scripted → every getResponseBody read fails.
+      installFakeLocalBackend({ capture: { events } })
+      const root = mkdtempSync(join(tmpdir(), 'dsh-capture-dedupe-'))
+      try {
+        const provider = new PlaywrightFetchProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+        const result = await provider.fetch({ url: 'https://example.com/docs' })
+        expect(result.statusCode).toBe(200)
+        const captureWarnings = warning.mock.calls.map(call => String(call[0])).filter(message => message.includes('network capture problem'))
+        expect(captureWarnings).toHaveLength(1)
+        expect(captureWarnings[0]).toContain('getResponseBody')
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
     } finally {
       warning.mockRestore()
     }
