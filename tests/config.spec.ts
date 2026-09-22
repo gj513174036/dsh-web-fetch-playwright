@@ -26,6 +26,7 @@ import {
   effectiveContextMode,
   effectiveHeadless,
   effectiveMaxConcurrency,
+  effectiveRecordBase,
   effectiveRecordDir,
   effectiveUserDataDir,
   captureOptionsFor,
@@ -241,17 +242,29 @@ describe('network capture settings', () => {
   })
 
   it('resolves the capture plan from the section, with defaults for every missing piece', () => {
-    expect(captureOptionsFor({}, 's1', '/work')).toEqual({
+    // The plan carries the BASE directory: the recorder claims the per-session
+    // subdirectory itself (non-recursive mkdir + collision retry).
+    expect(captureOptionsFor({}, '/work')).toEqual({
       enabled: false,
-      dir: join('/work', DEFAULT_RECORD_DIRECTORY, 's1'),
+      baseDir: join('/work', DEFAULT_RECORD_DIRECTORY),
       captureBodies: true,
       maxBodyBytes: DEFAULT_MAX_BODY_BYTES,
       recordAllResources: false,
     })
-    expect(captureOptionsFor({ recordNetwork: true, recordDir: '/d', captureBodies: false, maxBodyBytes: 0, recordAllResources: true }, 's2', '/work'))
-      .toEqual({ enabled: true, dir: join('/d', 's2'), captureBodies: false, maxBodyBytes: 0, recordAllResources: true })
+    expect(captureOptionsFor({ recordNetwork: true, recordDir: '/d', captureBodies: false, maxBodyBytes: 0, recordAllResources: true }, '/work'))
+      .toEqual({ enabled: true, baseDir: '/d', captureBodies: false, maxBodyBytes: 0, recordAllResources: true })
     // A non-finite/absent cap falls back to the default rather than capping at NaN.
-    expect(captureOptionsFor({ recordNetwork: true, maxBodyBytes: Number.NaN }, 's3', '/work').maxBodyBytes).toBe(DEFAULT_MAX_BODY_BYTES)
+    expect(captureOptionsFor({ recordNetwork: true, maxBodyBytes: Number.NaN }, '/work').maxBodyBytes).toBe(DEFAULT_MAX_BODY_BYTES)
+  })
+
+  it('keeps the configured base, defaults the last segment to net-dumps, and passes a 0 cap through', () => {
+    expect(effectiveRecordBase({}, '/work')).toBe(join('/work', DEFAULT_RECORD_DIRECTORY))
+    expect(effectiveRecordBase({ recordDir: '/data/dumps' }, '/work')).toBe('/data/dumps')
+    expect(effectiveRecordBase({ recordDir: 'rel/dir' }, '/work')).toBe(join('/work', 'rel/dir'))
+    expect(effectiveRecordBase({ recordDir: '  ' }, '/work')).toBe(join('/work', DEFAULT_RECORD_DIRECTORY))
+    expect(effectiveRecordDir({}, 'sess', '/work')).toBe(join('/work', DEFAULT_RECORD_DIRECTORY, 'sess'))
+    // 0 = no cap: the plan must hand the recorder a literal 0, not the default.
+    expect(captureOptionsFor({ recordNetwork: true, maxBodyBytes: 0 }, '/work').maxBodyBytes).toBe(0)
   })
 })
 

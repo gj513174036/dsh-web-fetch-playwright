@@ -9,7 +9,7 @@
  * aborts) — and the outbound proxy: launch-option injection, the
  * WEB_FETCH_PROXY mapping, password redaction, and the CDP refusal.
  */
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -1594,5 +1594,84 @@ describe('PlaywrightFetchProvider network capture', () => {
 
     controller.abort()
     expect(await pending).toBeInstanceOf(WebError)
+  })
+})
+
+/** The capture failure outlet: visible, bounded, and never fatal. */
+describe('PlaywrightFetchProvider capture failure outlet', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-capture-warn-')) })
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true })
+    localBackendHook.current = undefined
+  })
+
+  /** A provider whose capture session id is pinned, so the test knows the path. */
+  class FixedCaptureIdProvider extends PlaywrightFetchProvider {
+    protected nextCaptureSessionId(): string { return 'fixed-session' }
+  }
+
+  it('reports a capture that cannot even start (filesystem), error text only, fetch still succeeds', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      installFakeLocalBackend({
+        capture: {
+          events: [
+            { event: 'Network.requestWillBeSent', params: { requestId: '1', type: 'XHR', request: { url: 'https://api.example.com/v1/login', method: 'POST', headers: { cookie: 'session=abc123', authorization: 'Bearer tok-123' }, postData: '{"user":"u","pw":"p"}' } } },
+          ],
+        },
+      })
+      // The pinned session directory already exists, so the (non-recursive)
+      // claim cannot succeed and the capture never starts: a filesystem-level
+      // recording failure the caller must be able to see.
+      mkdirSync(join(root, 'fixed-session'))
+
+      const provider = new FixedCaptureIdProvider(() => resolvedConfig({
+        recordNetwork: true,
+        recordDir: root,
+        captureBodies: true,
+      }))
+      const result = await provider.fetch({ url: 'https://example.com/docs' })
+      expect(result.statusCode).toBe(200) // recording never fails a fetch
+
+      const messages = warning.mock.calls.map(call => String(call[0]))
+      expect(messages).toHaveLength(1) // reported once, not per fetch
+      expect(messages[0]).toContain('network capture problem')
+      expect(messages[0]).toContain('could not start a capture session')
+      expect(messages[0]).not.toContain('abc123')
+      expect(messages[0]).not.toContain('tok-123')
+      expect(messages[0]).not.toContain('{"user"')
+      expect(existsSync(join(root, 'fixed-session', 'network.jsonl'))).toBe(false)
+    } finally {
+      warning.mockRestore()
+    }
+  })
+
+  it('reports a capture that cannot attach its CDP session, without leaking dump content', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      installFakeLocalBackend({ capture: { sessionError: new Error('no CDP session on this page') } })
+      const provider = new FixedCaptureIdProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+      const result = await provider.fetch({ url: 'https://example.com/docs' })
+      expect(result.statusCode).toBe(200)
+      const messages = warning.mock.calls.map(call => String(call[0]))
+      expect(messages.join('\n')).toContain('could not attach a capture session')
+      expect(messages.join('\n')).toContain('no CDP session on this page')
+    } finally {
+      warning.mockRestore()
+    }
+  })
+
+  it('stays quiet when the capture is healthy', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      installFakeLocalBackend({})
+      const provider = new FixedCaptureIdProvider(() => resolvedConfig({ recordNetwork: true, recordDir: root }))
+      await provider.fetch({ url: 'https://example.com/docs' })
+      expect(warning).not.toHaveBeenCalled()
+      expect(existsSync(join(root, 'fixed-session', 'har.json'))).toBe(true)
+    } finally {
+      warning.mockRestore()
+    }
   })
 })

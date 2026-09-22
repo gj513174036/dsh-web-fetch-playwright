@@ -17,6 +17,13 @@
  * structure can be asserted without a browser, a CDP session, or the
  * filesystem.
  *
+ * ROBUSTNESS CONTRACT: one malformed URL or one unconvertible record may never
+ * cost the whole document. Every percent-decode falls back to the raw text
+ * ({@link queryStringOf}), and {@link buildHar} converts each entry behind its
+ * own guard — a failing entry is emitted in a degraded shape (URL, method,
+ * status where known, and the reason in `_error`) instead of aborting the
+ * export.
+ *
  * @module dsh-web-fetch-playwright/har
  */
 
@@ -60,6 +67,17 @@ export interface RecordedHttpExchange {
   body?: string
   /** True when CDP returned the body base64-encoded (binary payloads). */
   bodyBase64Encoded?: boolean
+  /**
+   * Request cookies decoded from `Network.requestWillBeSentExtraInfo`'s
+   * `associatedCookies` — the authoritative set (the `Cookie` header is only a
+   * fallback, because the base `requestWillBeSent` often omits it).
+   */
+  requestCookies?: HarCookie[]
+  /**
+   * Response cookies from `Network.responseReceivedExtraInfo`'s headers (the
+   * authoritative `Set-Cookie` set; the base event's headers are the fallback).
+   */
+  responseCookies?: HarCookie[]
   /** True when `maxBodyBytes` cut the body. */
   bodyTruncated?: boolean
   /** Original body size in bytes, before truncation. */
@@ -197,19 +215,47 @@ export function cookiesFromHeader(value: string): HarCookie[] {
   return cookies
 }
 
-/** Query-string pairs of a URL, as HAR spells them. */
+/**
+ * Query-string pairs of a URL, as HAR spells them.
+ *
+ * A malformed pair (`%zz`, a bare `%`, an invalid UTF-8 sequence) must not cost
+ * the export: each half is decoded behind its own guard and falls back to the
+ * RAW text, so the query is still reported verbatim instead of being dropped or
+ * throwing out of the whole HAR build. The fragment is not part of the query.
+ *
+ * @param url - the recorded URL.
+ * @returns the name/value pairs, decoded where decoding succeeds.
+ */
 export function queryStringOf(url: string): HarHeader[] {
   const query = url.indexOf('?')
   if (query === -1) return []
+  const hash = url.indexOf('#', query)
+  const raw = url.slice(query + 1, hash === -1 ? undefined : hash)
   const pairs: HarHeader[] = []
-  for (const part of url.slice(query + 1).split('&')) {
+  for (const part of raw.split('&')) {
     if (part === '') continue
     const equals = part.indexOf('=')
     pairs.push(equals === -1
-      ? { name: decodeURIComponent(part), value: '' }
-      : { name: decodeURIComponent(part.slice(0, equals)), value: decodeURIComponent(part.slice(equals + 1)) })
+      ? { name: safeDecode(part), value: '' }
+      : { name: safeDecode(part.slice(0, equals)), value: safeDecode(part.slice(equals + 1)) })
   }
   return pairs
+}
+
+/**
+ * `decodeURIComponent` that never throws: on failure the input is returned
+ * unchanged (the raw text is the honest representation of a value that is not
+ * valid percent-encoding).
+ *
+ * @param text - the raw (possibly encoded) text.
+ * @returns the decoded text, or the raw text when decoding fails.
+ */
+export function safeDecode(text: string): string {
+  try {
+    return decodeURIComponent(text)
+  } catch {
+    return text
+  }
 }
 
 /** The elapsed milliseconds of one exchange (0 for missing/reversed stamps). */
@@ -221,14 +267,31 @@ export function millisecondsBetween(startMs: number | undefined, endMs: number |
 /**
  * Build the HAR 1.2 document for a capture session.
  *
+ * Each record is converted behind its own guard: an entry that cannot be shaped
+ * (a NaN timestamp, a value the converter did not anticipate) is written in a
+ * DEGRADED form — URL, method, status where known, and the reason in `_error` —
+ * so one bad record never takes the other entries down with it. This function
+ * never throws.
+ *
  * @param input - the recorded exchanges and sockets.
  * @returns a HAR 1.2 document (`log.version`, `log.creator`, `log.entries`).
  */
 export function buildHar(input: HarInput): HarDocument {
-  const entries: HarEntry[] = [
-    ...input.http.map(toHttpEntry),
-    ...input.webSockets.map(toWebSocketEntry),
-  ]
+  const entries: HarEntry[] = []
+  for (const exchange of input.http) {
+    try {
+      entries.push(toHttpEntry(exchange))
+    } catch (error: unknown) {
+      entries.push(degradedHttpEntry(exchange, error))
+    }
+  }
+  for (const socket of input.webSockets) {
+    try {
+      entries.push(toWebSocketEntry(socket))
+    } catch (error: unknown) {
+      entries.push(degradedWebSocketEntry(socket, error))
+    }
+  }
   entries.sort((left, right) => Date.parse(left.startedDateTime) - Date.parse(right.startedDateTime))
   return {
     log: {
@@ -236,6 +299,78 @@ export function buildHar(input: HarInput): HarDocument {
       creator: input.creator ?? { ...HAR_CREATOR },
       entries,
     },
+  }
+}
+
+/** An ISO timestamp that cannot throw, whatever the recorded clock says. */
+function safeIso(epochMs: number): string {
+  return Number.isFinite(epochMs) ? new Date(epochMs).toISOString() : new Date(0).toISOString()
+}
+
+/** The degraded shape of an exchange whose conversion failed. */
+function degradedHttpEntry(exchange: RecordedHttpExchange, error: unknown): HarEntry {
+  return {
+    startedDateTime: safeIso(exchange.startedAtMs),
+    time: 0,
+    request: {
+      method: exchange.method === '' ? 'GET' : exchange.method,
+      url: exchange.url,
+      httpVersion: 'HTTP/1.1',
+      cookies: [],
+      headers: [],
+      queryString: [],
+      headersSize: -1,
+      bodySize: 0,
+    },
+    response: {
+      status: exchange.status ?? 0,
+      statusText: exchange.statusText ?? '',
+      httpVersion: 'HTTP/1.1',
+      cookies: [],
+      headers: [],
+      content: { size: 0, mimeType: exchange.mimeType ?? 'x-unknown' },
+      redirectURL: '',
+      headersSize: -1,
+      bodySize: 0,
+    },
+    cache: {},
+    timings: { send: 0, wait: 0, receive: 0 },
+    ...(exchange.resourceType === undefined ? {} : { _resourceType: exchange.resourceType }),
+    _error: `entry conversion failed: ${error instanceof Error ? error.message : String(error)}`,
+  }
+}
+
+/** The degraded shape of a WebSocket whose conversion failed. */
+function degradedWebSocketEntry(socket: RecordedWebSocket, error: unknown): HarEntry {
+  return {
+    startedDateTime: safeIso(socket.startedAtMs),
+    time: 0,
+    request: {
+      method: 'GET',
+      url: socket.url,
+      httpVersion: 'HTTP/1.1',
+      cookies: [],
+      headers: [],
+      queryString: [],
+      headersSize: -1,
+      bodySize: 0,
+    },
+    response: {
+      status: 0,
+      statusText: '',
+      httpVersion: 'HTTP/1.1',
+      cookies: [],
+      headers: [],
+      content: { size: 0, mimeType: 'x-unknown' },
+      redirectURL: '',
+      headersSize: -1,
+      bodySize: 0,
+    },
+    cache: {},
+    timings: { send: 0, wait: 0, receive: 0 },
+    _resourceType: 'WebSocket',
+    _webSocketMessages: [],
+    _error: `entry conversion failed: ${error instanceof Error ? error.message : String(error)}`,
   }
 }
 
@@ -254,13 +389,15 @@ function toHttpEntry(exchange: RecordedHttpExchange): HarEntry {
   const startedAt = exchange.startedAtMs
   const time = millisecondsBetween(startedAt, exchange.finishedAtMs)
   return {
-    startedDateTime: new Date(startedAt).toISOString(),
+    startedDateTime: safeIso(startedAt),
     time,
     request: {
       method: exchange.method,
       url: exchange.url,
       httpVersion: 'HTTP/1.1',
-      cookies: cookieHeaders(exchange.requestHeaders, ['cookie', 'Cookie']),
+      // The ExtraInfo-derived set is authoritative; the Cookie header is the
+      // fallback for a capture where that event never arrived.
+      cookies: exchange.requestCookies ?? cookieHeaders(exchange.requestHeaders, ['cookie', 'Cookie']),
       headers: requestHeaders,
       queryString: queryStringOf(exchange.url),
       headersSize: -1,
@@ -273,7 +410,7 @@ function toHttpEntry(exchange: RecordedHttpExchange): HarEntry {
       status: exchange.status ?? 0,
       statusText: exchange.statusText ?? '',
       httpVersion: 'HTTP/1.1',
-      cookies: cookieHeaders(exchange.responseHeaders, ['set-cookie', 'Set-Cookie']),
+      cookies: exchange.responseCookies ?? cookieHeaders(exchange.responseHeaders, ['set-cookie', 'Set-Cookie']),
       headers: responseHeaders,
       content,
       redirectURL: exchange.responseHeaders?.['location'] ?? exchange.responseHeaders?.['Location'] ?? '',
@@ -298,7 +435,7 @@ function toWebSocketEntry(socket: RecordedWebSocket): HarEntry {
   }))
   const lastAt = socket.frames.length === 0 ? socket.startedAtMs : socket.frames[socket.frames.length - 1]?.atMs ?? socket.startedAtMs
   return {
-    startedDateTime: new Date(socket.startedAtMs).toISOString(),
+    startedDateTime: safeIso(socket.startedAtMs),
     time: millisecondsBetween(socket.startedAtMs, lastAt),
     request: {
       method: 'GET',

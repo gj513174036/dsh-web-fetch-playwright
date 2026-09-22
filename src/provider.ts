@@ -77,7 +77,7 @@ import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERV
 import type { ChallengeVerdict } from './challenge.ts'
 import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, captureOptionsFor, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveHeadless, effectiveMaxConcurrency, managedLaunchFor, managedLaunchKey, normalizeCdpEndpoint, proxyOptionFor, redactProxyServer } from './config.ts'
 import type { ManagedLaunch, ProxySettings, ResolvedConfig } from './config.ts'
-import { NetworkRecorder, newCaptureSessionId } from './recorder.ts'
+import { NetworkRecorder, nextCaptureSessionId as recorderSessionId } from './recorder.ts'
 import { BrowserPool } from './browser-pool.ts'
 import type { BrowserPoolOptions } from './browser-pool.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
@@ -446,6 +446,22 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   private readonly activeRecorders = new Set<NetworkRecorder>()
 
   /**
+   * Capture failures already reported, so a broken dump directory does not
+   * warn once per fetch. Recording is best-effort and invisible otherwise —
+   * this is the ONE visible outlet, and it carries the error text only (never
+   * a header, a body, or a URL from the dump).
+   */
+  private readonly reportedCaptureErrors = new Set<string>()
+
+  /**
+   * The session id generator captures use. Protected so a test (or an embedder)
+   * can pin it; the default is process-monotonic and collision-resistant.
+   */
+  protected nextCaptureSessionId(): string {
+    return recorderSessionId()
+  }
+
+  /**
    * @param configSource - thunk returning the currently authoritative config.
    * @param cdpPool - optional pool over the CDP backend (tests inject fakes).
    * @param managedPool - optional pool over the managed persistent backend.
@@ -462,6 +478,22 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
   /** Cheap and side-effect free; backend problems surface per fetch instead. */
   available(): boolean {
     return true
+  }
+
+  /**
+   * Report a capture failure exactly once per distinct message. Recording must
+   * never fail a fetch, but it must not be silent either: `console.warn` (the
+   * only channel available to a provider that gets no logger) carries the
+   * error TEXT and nothing from the dump — no header, no body, no URL.
+   */
+  private reportCaptureError(message: string): void {
+    if (this.reportedCaptureErrors.has(message)) return
+    this.reportedCaptureErrors.add(message)
+    try {
+      console.warn(`dsh-web-fetch-playwright: network capture problem (the fetch is unaffected): ${message}`)
+    } catch {
+      // a console that refuses to warn must not break the fetch either
+    }
   }
 
   /**
@@ -545,7 +577,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
    * capture is swallowed — recording never fails a fetch.
    */
   private async withRecorder(config: ResolvedConfig, session: BrowserSession, fetchUrl: string): Promise<BrowserSession> {
-    const plan = captureOptionsFor(config, newCaptureSessionId())
+    const plan = captureOptionsFor(config)
     if (!plan.enabled) return session
     // Drop captures that already ended (their fetch released them): the set
     // then holds at most the ones live since the previous recorded fetch.
@@ -558,18 +590,27 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       const cdp = await openCdp(session.page)
       const recorder = await NetworkRecorder.create({
         session: cdp,
-        dir: plan.dir,
+        baseDir: plan.baseDir,
+        sessionId: () => this.nextCaptureSessionId(),
         url: fetchUrl,
         backend: config.backend ?? 'local',
         captureBodies: plan.captureBodies,
         maxBodyBytes: plan.maxBodyBytes,
         recordAllResources: plan.recordAllResources,
+        onError: (message) => { this.reportCaptureError(message) },
       })
-      if (recorder === undefined) return session
+      if (recorder === undefined) {
+        // Best-effort by contract: the fetch proceeds unrecorded — but not
+        // SILENTLY, or a broken dump path would go unnoticed forever.
+        this.reportCaptureError(`could not start a capture session under ${plan.baseDir}`)
+        return session
+      }
       this.activeRecorders.add(recorder)
       return { ...session, recorder }
-    } catch {
-      // Best-effort by contract: the fetch proceeds unrecorded.
+    } catch (error: unknown) {
+      // Best-effort by contract: the fetch proceeds unrecorded, and the
+      // failure is reported as text only (never a header, body, or URL).
+      this.reportCaptureError(`could not attach a capture session: ${messageOf(error)}`)
       return session
     }
   }

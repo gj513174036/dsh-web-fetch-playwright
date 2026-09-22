@@ -9,17 +9,20 @@
  * Filesystem cases run in throwaway temp directories; nothing here launches a
  * browser.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { buildHar, cookiesFromHeader, headersToHar, queryStringOf, type HarDocument } from '../src/har.ts'
+import { buildHar, cookiesFromHeader, headersToHar, queryStringOf, safeDecode, type HarDocument } from '../src/har.ts'
 import {
+  allocateCaptureDirectory,
   HAR_FILE,
   NETWORK_JSONL_FILE,
   NetworkRecorder,
   isStaticResource,
   newCaptureSessionId,
+  nextCaptureSessionId,
   sessionDirectory,
   truncateBody,
   type RecorderReport,
@@ -162,14 +165,20 @@ describe('NetworkRecorder', () => {
   })
   afterEach(() => { rmSync(root, { recursive: true, force: true }) })
 
-  /** Create a recorder over a fresh fake session (default: capture bodies). */
+  /**
+   * Create a recorder over a fresh fake session (default: capture bodies).
+   * `baseDir` + a FIXED `sessionId` keep the dump path predictable, which is
+   * what most cases assert against; the allocation cases below drive the
+   * default generator instead.
+   */
   async function recorderWith(
     session: FakeCdpSession,
-    over: Partial<Parameters<typeof NetworkRecorder.create>[0]> = {},
+    over: Partial<Omit<Parameters<typeof NetworkRecorder.create>[0], 'session'>> = {},
   ): Promise<NetworkRecorder> {
     const recorder = await NetworkRecorder.create({
       session,
-      dir,
+      baseDir: root,
+      sessionId: () => 'session-1',
       url: 'https://app.example.com/page',
       backend: 'local',
       captureBodies: true,
@@ -435,7 +444,7 @@ describe('NetworkRecorder', () => {
     writeFileSync(blocker, 'x')
     const recorder = await NetworkRecorder.create({
       session: new FakeCdpSession(),
-      dir: join(blocker, 'nested'),
+      baseDir: join(blocker, 'nested'),
       url: 'https://app.example.com/',
       captureBodies: true,
       maxBodyBytes: 128,
@@ -446,7 +455,7 @@ describe('NetworkRecorder', () => {
 
   it('keeps a session directory per capture, beside the base directory', async () => {
     expect(sessionDirectory('/tmp/base', 'abc')).toBe(join('/tmp/base', 'abc'))
-    const recorder = await recorderWith(new FakeCdpSession(), { dir: sessionDirectory(root, 'two') })
+    const recorder = await recorderWith(new FakeCdpSession(), { sessionId: () => 'two' })
     expect(recorder.dir).toBe(join(root, 'two'))
     expect(existsSync(recorder.jsonlPath)).toBe(true)
   })
@@ -556,3 +565,424 @@ const reportShape: RecorderReport = {
   httpCount: 0, webSocketCount: 0, frameCount: 0, errors: [],
 }
 void reportShape
+
+/** The P2 repair round: robustness, ExtraInfo merging, redirects, allocation. */
+describe('NetworkRecorder robustness (bad URLs, bad records)', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-hard-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  function readJsonl(dir: string): Array<Record<string, unknown>> {
+    return readFileSync(join(dir, NETWORK_JSONL_FILE), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+  }
+
+  it('keeps a malformed query pair verbatim instead of throwing', () => {
+    expect(queryStringOf('https://api.example.com/v1/x?q=%zz')).toEqual([{ name: 'q', value: '%zz' }])
+    expect(queryStringOf('https://api.example.com/v1/x?a=1&b=%&c=2')).toEqual([
+      { name: 'a', value: '1' },
+      { name: 'b', value: '%' },
+      { name: 'c', value: '2' },
+    ])
+    expect(queryStringOf('wss://stream.example.com/s?x=%zz')).toEqual([{ name: 'x', value: '%zz' }])
+    // Valid encoding still decodes, and the fragment is not part of the query.
+    expect(queryStringOf('https://x/?q=%E4%B8%AD#frag')).toEqual([{ name: 'q', value: '中' }])
+    expect(safeDecode('%E4%B8%AD')).toBe('中')
+    expect(safeDecode('%zz')).toBe('%zz')
+  })
+
+  it('degrades ONE unconvertible entry instead of losing the document', () => {
+    // A record whose shape the converter did not anticipate: enumerating its
+    // headers throws, which used to take the WHOLE export down with it.
+    const hostileHeaders = new Proxy<Record<string, string>>({}, {
+      ownKeys: () => { throw new Error('hostile header map') },
+    })
+    const har = buildHar({
+      http: [
+        { requestId: 'bad', startedAtMs: 1_500, method: 'GET', url: 'https://x/?q=%zz', requestHeaders: {}, responseHeaders: hostileHeaders },
+        { requestId: 'ok1', startedAtMs: 1_000, method: 'GET', url: 'https://x/one', requestHeaders: { cookie: 'a=1' } },
+        { requestId: 'ok2', startedAtMs: 2_000, method: 'POST', url: 'https://x/two', requestHeaders: {}, postData: '{}' },
+      ],
+      webSockets: [{ requestId: 's', url: 'wss://x/?x=%zz', startedAtMs: Number.NaN, frames: [] }],
+    })
+    expect(har.log.entries).toHaveLength(4)
+    const urls = har.log.entries.map(entry => entry.request.url)
+    expect(urls).toContain('https://x/one')
+    expect(urls).toContain('https://x/two')
+    const degraded = har.log.entries.find(entry => entry.request.url === 'https://x/?q=%zz')
+    expect(degraded?._error).toContain('entry conversion failed')
+    expect(degraded?.response.status).toBe(0)
+    // A NaN clock is handled in place (the entry keeps its data) rather than
+    // degrading, and a malformed WebSocket query is kept verbatim.
+    const socket = har.log.entries.find(entry => entry.request.url === 'wss://x/?x=%zz')
+    expect(socket?._resourceType).toBe('WebSocket')
+    expect(socket?.request.queryString).toEqual([{ name: 'x', value: '%zz' }])
+    expect(socket?._error).toBeUndefined()
+  })
+
+  it('keeps a NaN timestamp (an entry with an unusable clock is not lost)', () => {
+    const har = buildHar({
+      http: [{ requestId: 'weird', startedAtMs: Number.NaN, method: 'GET', url: 'https://x/one', requestHeaders: { cookie: 'a=1' } }],
+      webSockets: [],
+    })
+    expect(har.log.entries).toHaveLength(1)
+    expect(har.log.entries[0]?.request.url).toBe('https://x/one')
+    expect(har.log.entries[0]?.request.cookies).toEqual([{ name: 'a', value: '1' }])
+    expect(har.log.entries[0]?.startedDateTime).toBe(new Date(0).toISOString())
+    expect(har.log.entries[0]?._error).toBeUndefined()
+  })
+
+  it('still writes har.json when the capture mixes a bad URL with good ones', async () => {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{"a":1}' }, '2': { body: '{"b":2}' } } })
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'mixed', url: 'https://app.example.com/', captureBodies: true, maxBodyBytes: 1024, recordAllResources: false,
+    })
+    expect(recorder).toBeDefined()
+    session.emit('Network.requestWillBeSent', requestEvent({ requestId: '1', url: 'https://api.example.com/v1/broken?q=%zz' }))
+    session.emit('Network.responseReceived', responseEvent({ requestId: '1' }))
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    session.emit('Network.requestWillBeSent', requestEvent({ requestId: '2', url: 'https://api.example.com/v1/good' }))
+    session.emit('Network.responseReceived', responseEvent({ requestId: '2' }))
+    session.emit('Network.loadingFinished', { requestId: '2' })
+
+    const report = await recorder?.finish()
+    expect(report?.errors).toEqual([])
+    const har = JSON.parse(readFileSync(join(root, 'mixed', HAR_FILE), 'utf8')) as HarDocument
+    expect(har.log.entries.map(entry => entry.request.url).sort()).toEqual([
+      'https://api.example.com/v1/broken?q=%zz',
+      'https://api.example.com/v1/good',
+    ])
+    expect(har.log.entries.find(entry => entry.request.url.includes('%zz'))?.request.queryString).toEqual([{ name: 'q', value: '%zz' }])
+    // The JSONL has both exchanges too (nothing was dropped from the stream).
+    const kinds = readJsonl(join(root, 'mixed')).map(line => line['kind'])
+    expect(kinds.filter(kind => kind === 'finished')).toHaveLength(2)
+  })
+
+  it('reports a failed HAR write instead of swallowing it', async () => {
+    const reported: string[] = []
+    const session = new FakeCdpSession()
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'blocked', url: 'https://app.example.com/', captureBodies: true, maxBodyBytes: 64, recordAllResources: false,
+      onError: message => { reported.push(message) },
+    })
+    expect(recorder).toBeDefined()
+    const dir = join(root, 'blocked')
+    session.emit('Network.requestWillBeSent', requestEvent({ requestId: '1', headers: { cookie: 'session=abc123', authorization: 'Bearer tok-123' } }))
+    // Make the HAR path unwritable: a DIRECTORY where the file goes.
+    rmSync(join(dir, HAR_FILE), { force: true })
+    mkdirSync(join(dir, HAR_FILE))
+
+    const report = await recorder?.finish()
+    expect(report?.errors.join('\n')).toContain('writing har.json failed')
+    expect(reported.join('\n')).toContain('writing har.json failed')
+    // Only the error text is reported — never a header or a body from the dump.
+    expect(reported.join('\n')).not.toContain('abc123')
+    expect(reported.join('\n')).not.toContain('tok-123')
+    // The JSONL stream is unaffected, so the capture is still fully readable.
+    expect(readJsonl(dir).some(line => line['kind'] === 'request')).toBe(true)
+  })
+})
+
+/** ExtraInfo events are the authoritative header/cookie source. */
+describe('NetworkRecorder ExtraInfo merging', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-extra-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  function readJsonl(dir: string): Array<Record<string, unknown>> {
+    return readFileSync(join(dir, NETWORK_JSONL_FILE), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+  }
+
+  /** A recorder with a fixed session directory. */
+  async function recorder(session: FakeCdpSession): Promise<NetworkRecorder> {
+    const created = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'extra', url: 'https://app.example.com/', captureBodies: true, maxBodyBytes: 1024, recordAllResources: false,
+    })
+    expect(created).toBeDefined()
+    return created as NetworkRecorder
+  }
+
+  const REQUEST_EXTRA = {
+    requestId: '1',
+    headers: { ':authority': 'api.example.com', 'content-type': 'application/json' },
+    associatedCookies: [
+      { cookie: { name: 'session', value: 'abc123', domain: 'api.example.com', path: '/' }, blockedReasons: [] },
+      { cookie: { name: 'csrf', value: 'zz9', domain: 'api.example.com', path: '/' }, blockedReasons: [] },
+      { cookie: { name: 'blocked', value: 'nope' }, blockedReasons: ['SecureOnly'] },
+    ],
+  }
+
+  const RESPONSE_EXTRA = {
+    requestId: '1',
+    statusCode: 200,
+    headers: { 'content-type': 'application/json', 'set-cookie': 'sid=xyz; Path=/; HttpOnly' },
+  }
+
+  it('merges request ExtraInfo that arrives BEFORE the base event (cookies win)', async () => {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{}' } } })
+    const rec = await recorder(session)
+    session.emit('Network.requestWillBeSentExtraInfo', REQUEST_EXTRA)
+    session.emit('Network.requestWillBeSent', requestEvent({ headers: { 'content-type': 'application/json' } }))
+    session.emit('Network.responseReceived', responseEvent())
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    const report = await rec.finish()
+    expect(report.httpCount).toBe(1)
+
+    const lines = readJsonl(join(root, 'extra'))
+    const extraLine = lines.find(line => line['kind'] === 'requestExtra')
+    expect(extraLine).toBeDefined()
+    const extraHeaders = extraLine?.['headers'] as Record<string, string>
+    // The Cookie header is reconstructed from associatedCookies (blocked ones dropped).
+    expect(extraHeaders['cookie']).toBe('session=abc123; csrf=zz9')
+    expect(extraHeaders[':authority']).toBe('api.example.com')
+    expect(extraLine?.['cookieCount']).toBe(2)
+
+    const requestLine = lines.find(line => line['kind'] === 'request')
+    expect((requestLine?.['headers'] as Record<string, string>)['cookie']).toBe('session=abc123; csrf=zz9')
+
+    const har = JSON.parse(readFileSync(join(root, 'extra', HAR_FILE), 'utf8')) as HarDocument
+    expect(har.log.entries[0]?.request.cookies).toEqual([
+      { name: 'session', value: 'abc123', domain: 'api.example.com', path: '/' },
+      { name: 'csrf', value: 'zz9', domain: 'api.example.com', path: '/' },
+    ])
+  })
+
+  it('merges request ExtraInfo that arrives AFTER the base event', async () => {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{}' } } })
+    const rec = await recorder(session)
+    // The base event arrives first WITHOUT any cookie header.
+    session.emit('Network.requestWillBeSent', requestEvent({ headers: { 'content-type': 'application/json' } }))
+    session.emit('Network.requestWillBeSentExtraInfo', REQUEST_EXTRA)
+    session.emit('Network.responseReceived', responseEvent())
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    await rec.finish()
+
+    const lines = readJsonl(join(root, 'extra'))
+    expect(lines.some(line => line['kind'] === 'requestExtra')).toBe(true)
+    const har = JSON.parse(readFileSync(join(root, 'extra', HAR_FILE), 'utf8')) as HarDocument
+    // The HAR carries the late-arriving authoritative set, and the extra row
+    // lets the offline pipeline merge it even though the request row came first.
+    expect(har.log.entries[0]?.request.headers).toEqual(expect.arrayContaining([
+      { name: ':authority', value: 'api.example.com' },
+    ]))
+    expect(har.log.entries[0]?.request.cookies?.map(cookie => cookie.name)).toEqual(['session', 'csrf'])
+  })
+
+  it('merges response ExtraInfo (before and after) and exposes Set-Cookie', async () => {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{}' } } })
+    const rec = await recorder(session)
+    session.emit('Network.requestWillBeSent', requestEvent())
+    // Extra AFTER the base response event.
+    session.emit('Network.responseReceived', responseEvent({ headers: { 'content-type': 'application/json' } }))
+    session.emit('Network.responseReceivedExtraInfo', RESPONSE_EXTRA)
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    await rec.finish()
+
+    const lines = readJsonl(join(root, 'extra'))
+    const extraLine = lines.find(line => line['kind'] === 'responseExtra')
+    expect(extraLine).toMatchObject({ statusCode: 200, cookieCount: 1 })
+    expect((extraLine?.['headers'] as Record<string, string>)['set-cookie']).toBe('sid=xyz; Path=/; HttpOnly')
+
+    const har = JSON.parse(readFileSync(join(root, 'extra', HAR_FILE), 'utf8')) as HarDocument
+    expect(har.log.entries[0]?.response.headers).toEqual(expect.arrayContaining([
+      { name: 'set-cookie', value: 'sid=xyz; Path=/; HttpOnly' },
+    ]))
+    expect(har.log.entries[0]?.response.cookies).toEqual([{ name: 'sid', value: 'xyz' }])
+  })
+
+  it('ignores ExtraInfo for a request the static filter dropped', async () => {
+    const session = new FakeCdpSession()
+    const rec = await recorder(session)
+    session.emit('Network.requestWillBeSent', requestEvent({ requestId: 'img', type: 'Image' }))
+    session.emit('Network.requestWillBeSentExtraInfo', { ...REQUEST_EXTRA, requestId: 'img' })
+    session.emit('Network.responseReceivedExtraInfo', { ...RESPONSE_EXTRA, requestId: 'img' })
+    await rec.finish()
+    const kinds = readJsonl(join(root, 'extra')).map(line => line['kind'])
+    expect(kinds).toEqual(['session'])
+  })
+})
+
+/** Redirect hops become their own entries. */
+describe('NetworkRecorder redirect chains', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-redirect-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  it('turns a 301 → 200 chain into two HAR entries', async () => {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{"ok":true}' } } })
+    const rec = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'chain', url: 'https://app.example.com/', captureBodies: true, maxBodyBytes: 1024, recordAllResources: false,
+    })
+    expect(rec).toBeDefined()
+    // Hop 1: the initial request.
+    session.emit('Network.requestWillBeSent', requestEvent({ requestId: '1', url: 'http://app.example.com/old', method: 'GET' }))
+    // Hop 2: the SAME requestId, carrying hop 1's response.
+    session.emit('Network.requestWillBeSent', {
+      requestId: '1',
+      type: 'Document',
+      redirectResponse: {
+        url: 'http://app.example.com/old',
+        status: 301,
+        statusText: 'Moved Permanently',
+        mimeType: 'text/html',
+        headers: { location: 'https://app.example.com/new', 'content-length': '0' },
+      },
+      request: { url: 'https://app.example.com/new', method: 'GET', headers: { accept: 'text/html' } },
+    })
+    session.emit('Network.responseReceived', responseEvent({ requestId: '1', status: 200, mimeType: 'application/json' }))
+    session.emit('Network.loadingFinished', { requestId: '1' })
+
+    const report = await rec?.finish()
+    expect(report?.httpCount).toBe(2)
+
+    const lines = readFileSync(join(root, 'chain', NETWORK_JSONL_FILE), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+    const redirects = lines.filter(line => line['redirect'] === true)
+    expect(redirects.map(line => line['kind'])).toEqual(['response', 'finished'])
+    expect(redirects[0]).toMatchObject({ requestId: '1', status: 301, url: 'http://app.example.com/old' })
+    // The redirected request row carries redirectResponse, which is the shape
+    // the offline pipeline backfills a hop from.
+    const secondRequest = lines.filter(line => line['kind'] === 'request')[1]
+    expect(secondRequest?.['url']).toBe('https://app.example.com/new')
+    expect((secondRequest?.['redirectResponse'] as Record<string, unknown>)['status']).toBe(301)
+
+    const har = JSON.parse(readFileSync(join(root, 'chain', HAR_FILE), 'utf8')) as HarDocument
+    expect(har.log.entries).toHaveLength(2)
+    const [hop, final] = har.log.entries
+    expect(hop?.request.url).toBe('http://app.example.com/old')
+    expect(hop?.response.status).toBe(301)
+    expect(hop?.response.headers).toEqual(expect.arrayContaining([{ name: 'location', value: 'https://app.example.com/new' }]))
+    expect(final?.request.url).toBe('https://app.example.com/new')
+    expect(final?.response.status).toBe(200)
+    expect(final?.response.content.text).toBe('{"ok":true}')
+  })
+})
+
+/** Session directories are allocated, never shared. */
+describe('NetworkRecorder directory allocation', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-alloc-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  it('gives two same-clock, same-random allocations different directories', async () => {
+    const fixed = () => nextCaptureSessionId(1_700_000_000_000, () => 0.5)
+    const first = await allocateCaptureDirectory(root, fixed)
+    const second = await allocateCaptureDirectory(root, fixed)
+    expect(first).toBeDefined()
+    expect(second).toBeDefined()
+    expect(first).not.toBe(second)
+    expect(newCaptureSessionId(1_700_000_000_000, () => 0.5)).toBe(newCaptureSessionId(1_700_000_000_000, () => 0.5))
+    expect(nextCaptureSessionId(1_700_000_000_000, () => 0.5)).not.toBe(nextCaptureSessionId(1_700_000_000_000, () => 0.5))
+  })
+
+  it('retries past an existing session directory instead of merging into it', async () => {
+    const taken = join(root, 'taken')
+    mkdirSync(taken)
+    const ids = ['taken', 'taken', 'free']
+    let calls = 0
+    const allocated = await allocateCaptureDirectory(root, () => ids[calls++] ?? 'later')
+    expect(allocated).toBe(join(root, 'free'))
+    expect(calls).toBe(3)
+
+    // A generator that can never find a free slot gives up (never throws).
+    const stuck = await allocateCaptureDirectory(root, () => 'taken', 3)
+    expect(stuck).toBeUndefined()
+  })
+
+  it('keeps two recorders created in the same millisecond apart', async () => {
+    const first = await NetworkRecorder.create({ session: new FakeCdpSession(), baseDir: root, url: 'https://a/', captureBodies: false, maxBodyBytes: 64, recordAllResources: false })
+    const second = await NetworkRecorder.create({ session: new FakeCdpSession(), baseDir: root, url: 'https://b/', captureBodies: false, maxBodyBytes: 64, recordAllResources: false })
+    expect(first?.dir).toBeDefined()
+    expect(second?.dir).toBeDefined()
+    expect(first?.dir).not.toBe(second?.dir)
+    expect(existsSync(first?.jsonlPath ?? '')).toBe(true)
+    expect(existsSync(second?.jsonlPath ?? '')).toBe(true)
+    await first?.finish()
+    await second?.finish()
+  })
+})
+
+/** The maxBodyBytes = 0 semantics, pinned. */
+describe('NetworkRecorder body cap semantics', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-cap-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  it('maxBodyBytes 0 means NO cap: the whole body is stored', async () => {
+    const body = 'x'.repeat(5_000)
+    const session = new FakeCdpSession({ bodies: { '1': { body } } })
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'nocap', url: 'https://app.example.com/', captureBodies: true, maxBodyBytes: 0, recordAllResources: false,
+    })
+    session.emit('Network.requestWillBeSent', requestEvent())
+    session.emit('Network.responseReceived', responseEvent())
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    await recorder?.finish()
+
+    const lines = readFileSync(join(root, 'nocap', NETWORK_JSONL_FILE), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+    const bodyLine = lines.find(line => line['kind'] === 'responseBody')
+    expect(bodyLine?.['body']).toBe(body)
+    expect(bodyLine?.['bodyTruncated']).toBe(false)
+    expect(bodyLine?.['bodyBytes']).toBe(5_000)
+  })
+})
+
+/**
+ * The real-browser case: only runs where a launchable Chromium exists (it
+ * self-skips otherwise, like the repo's integration suite). It exists because
+ * "does a real browser's Cookie/Set-Cookie actually land in the dump?" can only
+ * be answered by a real browser; the fake-session cases above pin the merging
+ * logic itself.
+ */
+describe('NetworkRecorder real-browser capture (self-skipping)', () => {
+  it('records a real Cookie/Set-Cookie round trip', { timeout: 120_000 }, async () => {
+    const { chromium } = await import('playwright-core')
+    let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined
+    const server = createServer((request, response) => {
+      if (request.url === '/set') {
+        response.writeHead(200, { 'content-type': 'text/html', 'set-cookie': 'sid=real-cookie; Path=/' })
+        response.end('<!doctype html><html><body>set</body></html>')
+        return
+      }
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ cookie: request.headers.cookie ?? '' }))
+    })
+    const root = mkdtempSync(join(tmpdir(), 'dsh-recorder-real-'))
+    try {
+      await new Promise<void>(resolve => { server.listen(0, '127.0.0.1', () => { resolve() }) })
+      const address = server.address()
+      if (address === null || typeof address === 'string') return
+      const origin = `http://127.0.0.1:${String(address.port)}`
+      try {
+        browser = await chromium.launch({ headless: true, timeout: 60_000 })
+      } catch (error: unknown) {
+        console.warn(`skipping real-browser network capture: no launchable Chromium (${error instanceof Error ? error.message : String(error)})`)
+        return
+      }
+      const context = await browser.newContext()
+      const page = await context.newPage()
+      await page.goto(`${origin}/set`)
+      const cdp = await context.newCDPSession(page)
+      const recorder = await NetworkRecorder.create({
+        session: cdp, baseDir: root, sessionId: () => 'real', url: `${origin}/set`, captureBodies: true, maxBodyBytes: 4096, recordAllResources: true,
+      })
+      expect(recorder).toBeDefined()
+      // A same-origin XHR must carry the cookie the previous response set.
+      await page.evaluate(async (target: string) => {
+        await fetch(target, { credentials: 'include' })
+      }, `${origin}/api`)
+      await new Promise(resolve => { setTimeout(resolve, 300) })
+      await recorder?.finish()
+
+      const dir = join(root, 'real')
+      const lines = readFileSync(join(dir, NETWORK_JSONL_FILE), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>)
+      expect(lines.some(line => line['kind'] === 'requestExtra' || line['kind'] === 'responseExtra')).toBe(true)
+      const har = JSON.parse(readFileSync(join(dir, HAR_FILE), 'utf8')) as HarDocument
+      const cookies = har.log.entries.flatMap(entry => entry.request.cookies.map(cookie => cookie.name))
+      expect(cookies).toContain('sid')
+      expect(har.log.entries.flatMap(entry => entry.response.cookies.map(cookie => cookie.name))).toContain('sid')
+    } finally {
+      await browser?.close().catch(() => {})
+      await new Promise<void>(resolve => { server.close(() => { resolve() }) })
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})

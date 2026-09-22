@@ -27,6 +27,10 @@
  *   - `finished` — `requestId`, `url`, `status`, `mimeType`, `durationMs`
  *     (plus the body SIZES, never the body again);
  *   - `failed` — `requestId`, `url`, `errorText`, `canceled`;
+ *   - `requestExtra` / `responseExtra` — `requestId`, `url`, and the
+ *     AUTHORITATIVE `headers` set from CDP's ExtraInfo events (plus the
+ *     associated cookies); the base events' headers are only a fallback, and
+ *     the offline pipeline merges these rows by `requestId`;
  *   - `websocketCreated` / `websocketFrame` / `websocketClosed` — `requestId`,
  *     `url`, and for a frame `direction` (`sent`/`received`), `opcode`,
  *     `payloadData`;
@@ -34,6 +38,13 @@
  *   (epoch seconds, the spelling CDP itself uses);
  * - `har.json` — the HAR 1.2 export written when the fetch ends (normal,
  *   thrown, or aborted — all three go through {@link NetworkRecorder.finish}).
+ *   A single unconvertible record degrades to its own entry instead of costing
+ *   the document, and a failed write is reported (never silently dropped).
+ *
+ * The session directory is claimed with a non-recursive `mkdir` under the base
+ * directory ({@link allocateCaptureDirectory}), so two captures can never share
+ * a dump; `maxBodyBytes: 0` means NO CAP (the whole body is stored) — see
+ * {@link truncateBody}.
  *
  * Credentials are stored VERBATIM (`Cookie`, `Set-Cookie`, `Authorization`,
  * bodies). Protection is filesystem-level and explicit: the directory is mode
@@ -51,7 +62,7 @@
 import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { CdpSession } from './types.ts'
-import { buildHar, type RecordedHttpExchange, type RecordedWebSocket } from './har.ts'
+import { buildHar, cookiesFromHeader, type HarCookie, type RecordedHttpExchange, type RecordedWebSocket } from './har.ts'
 
 /** The dump file holding the live JSONL event stream. */
 export const NETWORK_JSONL_FILE = 'network.jsonl'
@@ -118,11 +129,20 @@ export interface RecorderOptions {
   /** The CDP session, already attached to the fetch's page. */
   session: CdpSession
   /**
-   * The session directory. {@link dumpDirectoryFor} composes the default
-   * (`<cwd>/net-dumps/<sessionId>`), whose basename is always the session id
-   * and whose parent is `net-dumps` unless the settings say otherwise.
+   * The BASE directory the capture allocates its own session directory under:
+   * `<baseDir>/<sessionId>`, where the id comes from {@link RecorderOptions.sessionId}.
+   * The default base is `<cwd>/net-dumps` (settings `recordDir` overrides it),
+   * so the basename of a default dump path is always `net-dumps`.
    */
-  dir: string
+  baseDir: string
+  /**
+   * Allocates the session id (the dump directory's basename). The default is
+   * {@link nextCaptureSessionId}, which is collision-resistant even when two
+   * allocations share a clock tick; {@link allocateCaptureDirectory} still
+   * retries on an existing directory, so a re-used id cannot silently merge
+   * two captures.
+   */
+  sessionId?: () => string
   /** The fetch URL this session belongs to (recorded in the header line). */
   url: string
   /** Backend label for the header line (`local`/`cdp`/`managed`). */
@@ -169,14 +189,30 @@ export type RecordedEvent = Record<string, unknown>
  */
 export class NetworkRecorder {
   private readonly errors: string[] = []
+  /** Exchanges still in flight, keyed by CDP `requestId`. */
   private readonly http = new Map<string, RecordedHttpExchange>()
+  /**
+   * Every exchange this capture recorded, in the order its request started.
+   * This is the HAR's entry list (a redirect hop lands here as its own record,
+   * and a still-in-flight exchange is exported too when the fetch is torn
+   * down), so the export order never depends on completion timing.
+   */
+  private readonly recorded: RecordedHttpExchange[] = []
   private readonly skipped = new Set<string>()
   private readonly sockets = new Map<string, RecordedWebSocket>()
+  /** ExtraInfo request headers/cookies that may arrive before OR after the base event. */
+  private readonly requestExtras = new Map<string, { headers: Record<string, string>; cookies: HarCookie[] }>()
+  /** ExtraInfo response headers/status, same both-orders handling. */
+  private readonly responseExtras = new Map<string, { headers: Record<string, string>; status?: number; cookies: HarCookie[] }>()
   private finished: Promise<RecorderReport> | undefined
   private writes: Promise<void> = Promise.resolve()
   private stopped = false
 
-  private constructor(private readonly options: RecorderOptions) {}
+  private constructor(
+    private readonly options: RecorderOptions,
+    /** The session directory this capture claimed (base + session id). */
+    readonly dir: string,
+  ) {}
 
   /**
    * Start a capture: create the session directory (0700), write the header
@@ -188,12 +224,18 @@ export class NetworkRecorder {
    * @returns the recorder, or undefined when recording cannot start at all.
    */
   static async create(options: RecorderOptions): Promise<NetworkRecorder | undefined> {
-    const recorder = new NetworkRecorder(options)
+    // The base directory is created recursively (it may be nested); the SESSION
+    // directory is then claimed with a non-recursive mkdir, so an existing one
+    // is an EEXIST we can see and retry instead of silently merging two
+    // captures into one dump.
     try {
-      await mkdir(options.dir, { recursive: true, mode: DUMP_DIR_MODE })
+      await mkdir(options.baseDir, { recursive: true, mode: DUMP_DIR_MODE })
     } catch (error: unknown) {
       return undefined
     }
+    const dir = await allocateCaptureDirectory(options.baseDir, options.sessionId ?? nextCaptureSessionId)
+    if (dir === undefined) return undefined
+    const recorder = new NetworkRecorder(options, dir)
     // The header goes FIRST (before subscribing, so no event can precede it):
     // a reader/parser of a capture in progress always knows what the stream is.
     recorder.append({
@@ -204,7 +246,7 @@ export class NetworkRecorder {
       // an exchange.
       fetchUrl: options.url,
       backend: options.backend,
-      dir: options.dir,
+      dir,
       captureBodies: options.captureBodies,
       maxBodyBytes: options.maxBodyBytes,
       recordAllResources: options.recordAllResources,
@@ -227,19 +269,14 @@ export class NetworkRecorder {
     return recorder
   }
 
-  /** The session directory the dumps live in. */
-  get dir(): string {
-    return this.options.dir
-  }
-
   /** Absolute path of the JSONL event stream. */
   get jsonlPath(): string {
-    return join(this.options.dir, NETWORK_JSONL_FILE)
+    return join(this.dir, NETWORK_JSONL_FILE)
   }
 
   /** Absolute path of the HAR export. */
   get harPath(): string {
-    return join(this.options.dir, HAR_FILE)
+    return join(this.dir, HAR_FILE)
   }
 
   /**
@@ -263,18 +300,20 @@ export class NetworkRecorder {
 
   private async complete(): Promise<RecorderReport> {
     this.stopped = true
-    await this.writes
+    await this.settleWrites()
     const report: RecorderReport = {
-      dir: this.options.dir,
+      dir: this.dir,
       jsonlPath: this.jsonlPath,
       harPath: this.harPath,
-      httpCount: this.http.size,
+      httpCount: this.recorded.length,
       webSocketCount: this.sockets.size,
       frameCount: [...this.sockets.values()].reduce((total, socket) => total + socket.frames.length, 0),
       errors: [...this.errors],
     }
     try {
-      const har = buildHar({ http: [...this.http.values()], webSockets: [...this.sockets.values()] })
+      // Every recorded exchange — completed, failed, a redirect hop, or still
+      // in flight when the fetch was torn down — in request order.
+      const har = buildHar({ http: [...this.recorded], webSockets: [...this.sockets.values()] })
       await writeFile(this.harPath, `${JSON.stringify(har, null, 2)}\n`, { mode: DUMP_FILE_MODE })
     } catch (error: unknown) {
       this.note(`writing ${HAR_FILE} failed: ${describe(error)}`)
@@ -306,7 +345,9 @@ export class NetworkRecorder {
       }
     }
     on('Network.requestWillBeSent', params => { this.onRequest(params) })
+    on('Network.requestWillBeSentExtraInfo', params => { this.onRequestExtra(params) })
     on('Network.responseReceived', params => { this.onResponse(params) })
+    on('Network.responseReceivedExtraInfo', params => { this.onResponseExtra(params) })
     on('Network.loadingFinished', params => { void this.onFinished(params) })
     on('Network.loadingFailed', params => { this.onFailed(params) })
     on('Network.webSocketCreated', params => { this.onSocketCreated(params) })
@@ -315,26 +356,45 @@ export class NetworkRecorder {
     on('Network.webSocketClosed', params => { this.onSocketClosed(params) })
   }
 
-  /** `Network.requestWillBeSent`: start an exchange (or drop it as static). */
+  /**
+   * `Network.requestWillBeSent`: start an exchange (or drop it as static).
+   *
+   * A redirect hop arrives as a new `requestWillBeSent` for the SAME
+   * `requestId` carrying `redirectResponse` (the hop that just happened). The
+   * in-flight exchange is finalized FIRST — with that hop's status/headers/mime
+   * — and emitted as its own `response`/`finished` pair, so a 301→200 chain
+   * yields TWO HAR entries instead of one entry that looks like it went
+   * straight to the destination. The new request line carries the
+   * `redirectResponse` too, which is exactly the shape the offline pipeline
+   * uses to backfill a hop.
+   */
   private onRequest(params: Record<string, unknown>): void {
     const requestId = text(params['requestId'])
     const request = record(params['request'])
     if (requestId === '' || request === undefined) return
     const resourceType = text(params['type']) || undefined
+    const redirectResponse = record(params['redirectResponse'])
     if (!this.options.recordAllResources && isStaticResource(resourceType)) {
       this.skipped.add(requestId)
       return
     }
+    if (redirectResponse !== undefined) this.finalizeRedirect(requestId, redirectResponse)
+    const extra = this.requestExtras.get(requestId)
+    const baseHeaders = headers(request['headers'])
     const exchange: RecordedHttpExchange = {
       requestId,
       startedAtMs: this.now(),
       ...(resourceType === undefined ? {} : { resourceType }),
       method: text(request['method']) || 'GET',
       url: text(request['url']),
-      requestHeaders: headers(request['headers']),
+      // ExtraInfo headers win when they are already known; the base event's
+      // headers are the fallback (and a late ExtraInfo merges into the record).
+      requestHeaders: extra === undefined ? baseHeaders : { ...baseHeaders, ...extra.headers },
+      ...(extra === undefined ? {} : { requestCookies: extra.cookies }),
       ...(typeof request['postData'] === 'string' ? { postData: request['postData'] } : {}),
     }
     this.http.set(requestId, exchange)
+    this.recorded.push(exchange)
     this.append({
       kind: 'request',
       ...this.stamps(exchange.startedAtMs),
@@ -344,6 +404,101 @@ export class NetworkRecorder {
       resourceType: exchange.resourceType,
       headers: exchange.requestHeaders,
       postData: exchange.postData,
+      ...(redirectResponse === undefined ? {} : { redirectResponse: redirectShape(redirectResponse) }),
+    })
+  }
+
+  /**
+   * Close a redirect hop as its own entry: the hop's response becomes a
+   * complete `RecordedHttpExchange` (status/headers/mimeType + the moment it
+   * finished) and both the in-flight map and a `response`/`finished` line pair
+   * are settled before the redirected request starts.
+   */
+  private finalizeRedirect(requestId: string, redirectResponse: Record<string, unknown>): void {
+    const hop = this.http.get(requestId)
+    if (hop === undefined) return
+    const shape = redirectShape(redirectResponse)
+    if (shape.status !== undefined) hop.status = shape.status
+    if (shape.statusText !== undefined) hop.statusText = shape.statusText
+    if (shape.mimeType !== undefined) hop.mimeType = shape.mimeType
+    hop.responseHeaders = shape.headers
+    hop.finishedAtMs = this.now()
+    this.append({
+      kind: 'response',
+      ...this.stamps(hop.finishedAtMs),
+      requestId,
+      url: hop.url,
+      status: hop.status,
+      statusText: hop.statusText,
+      mimeType: hop.mimeType,
+      headers: hop.responseHeaders,
+      redirect: true,
+    })
+    this.append({
+      kind: 'finished',
+      ...this.stamps(hop.finishedAtMs),
+      requestId,
+      url: hop.url,
+      status: hop.status,
+      mimeType: hop.mimeType,
+      durationMs: hop.finishedAtMs - hop.startedAtMs,
+      redirect: true,
+    })
+    this.http.delete(requestId)
+  }
+
+  /** `Network.requestWillBeSentExtraInfo`: the authoritative request headers/cookies. */
+  private onRequestExtra(params: Record<string, unknown>): void {
+    const requestId = text(params['requestId'])
+    if (requestId === '') return
+    if (this.skipped.has(requestId)) return
+    const extraHeaders = headers(params['headers'])
+    const cookies = associatedCookies(params['associatedCookies'])
+    if (Object.keys(extraHeaders).length === 0 && cookies.length === 0) return
+    // CDP's extra-info headers are the complete set the browser sent, including
+    // the cookies it attached; the base event is frequently missing them.
+    const cookieHeader = cookieHeaderFor(extraHeaders, cookies)
+    const headersWithCookies = cookieHeader === undefined ? extraHeaders : { ...extraHeaders, cookie: cookieHeader }
+    this.requestExtras.set(requestId, { headers: headersWithCookies, cookies })
+    const exchange = this.http.get(requestId)
+    if (exchange !== undefined) {
+      exchange.requestHeaders = { ...exchange.requestHeaders, ...headersWithCookies }
+      exchange.requestCookies = cookies
+    }
+    this.append({
+      kind: 'requestExtra',
+      ...this.stamps(this.now()),
+      requestId,
+      ...(exchange === undefined ? {} : { url: exchange.url }),
+      headers: headersWithCookies,
+      cookieCount: cookies.length,
+    })
+  }
+
+  /** `Network.responseReceivedExtraInfo`: authoritative response headers/status. */
+  private onResponseExtra(params: Record<string, unknown>): void {
+    const requestId = text(params['requestId'])
+    if (requestId === '') return
+    if (this.skipped.has(requestId)) return
+    const extraHeaders = headers(params['headers'])
+    const statusCode = typeof params['statusCode'] === 'number' ? params['statusCode'] : undefined
+    if (Object.keys(extraHeaders).length === 0 && statusCode === undefined) return
+    const cookies = cookieHeaders(extraHeaders, ['set-cookie', 'Set-Cookie'])
+    this.responseExtras.set(requestId, { headers: extraHeaders, ...(statusCode === undefined ? {} : { status: statusCode }), cookies })
+    const exchange = this.http.get(requestId)
+    if (exchange !== undefined) {
+      exchange.responseHeaders = { ...exchange.responseHeaders, ...extraHeaders }
+      if (cookies.length > 0) exchange.responseCookies = cookies
+      if (exchange.status === undefined && statusCode !== undefined) exchange.status = statusCode
+    }
+    this.append({
+      kind: 'responseExtra',
+      ...this.stamps(this.now()),
+      requestId,
+      ...(exchange === undefined ? {} : { url: exchange.url }),
+      statusCode,
+      headers: extraHeaders,
+      cookieCount: cookies.length,
     })
   }
 
@@ -357,8 +512,13 @@ export class NetworkRecorder {
     if (status !== undefined) exchange.status = status
     if (typeof response['statusText'] === 'string') exchange.statusText = response['statusText']
     if (typeof response['mimeType'] === 'string') exchange.mimeType = response['mimeType']
-    const responseHeaders = headers(response['headers'])
+    // ExtraInfo headers (which carry the true `Set-Cookie` set) win; the base
+    // event's are the fallback, and a missing responseExtra never loses them.
+    const extra = this.responseExtras.get(exchange.requestId)
+    const responseHeaders = { ...headers(response['headers']), ...(extra?.headers ?? {}) }
     if (Object.keys(responseHeaders).length > 0) exchange.responseHeaders = responseHeaders
+    if (extra !== undefined && extra.cookies.length > 0) exchange.responseCookies = extra.cookies
+    if (exchange.status === undefined && extra?.status !== undefined) exchange.status = extra.status
     this.append({
       kind: 'response',
       ...this.stamps(this.now()),
@@ -394,6 +554,7 @@ export class NetworkRecorder {
       }
     }
     exchange.finishedAtMs = this.now()
+    this.http.delete(exchange.requestId)
     if (exchange.body !== undefined) {
       // The body is its own line, in the shape CDP's own getResponseBody
       // response has (`body` + `base64Encoded`), which is what the offline
@@ -430,6 +591,7 @@ export class NetworkRecorder {
     if (exchange === undefined) return
     exchange.errorText = text(params['errorText']) || 'network error'
     exchange.finishedAtMs = this.now()
+    this.http.delete(exchange.requestId)
     this.append({
       kind: 'failed',
       ...this.stamps(exchange.finishedAtMs),
@@ -495,9 +657,24 @@ export class NetworkRecorder {
     return this.http.get(requestId)
   }
 
+  /**
+   * Wait for every pending append — including the ones an ALREADY IN-FLIGHT
+   * handler queues while we wait (a `loadingFinished` body read that started
+   * before the fetch ended still contributes its `responseBody`/`finished`
+   * lines). Looping until the chain stops growing is what makes the JSONL
+   * complete before the HAR is built and before `finish()` resolves.
+   */
+  private async settleWrites(): Promise<void> {
+    for (let round = 0; round < 8; round++) {
+      const pending = this.writes
+      await pending
+      if (pending === this.writes) return
+    }
+  }
+
   /** Append one JSONL line, serialized behind every earlier append. */
   private append(event: RecordedEvent): void {
-    const line = `${JSON.stringify({ ...event, session: this.options.dir })}\n`
+    const line = `${JSON.stringify({ ...event, session: this.dir })}\n`
     this.writes = this.writes
       .then(async () => { await appendFile(this.jsonlPath, line, { mode: DUMP_FILE_MODE }) })
       .catch((error: unknown) => { this.note(`appending to ${NETWORK_JSONL_FILE} failed: ${describe(error)}`) })
@@ -534,6 +711,57 @@ export function sessionDirectory(baseDir: string, sessionId: string): string {
 }
 
 /**
+ * Process-monotonic counter appended by {@link nextCaptureSessionId}: two
+ * allocations that share a clock tick (and even the same `Math.random` value)
+ * still get different ids, and therefore different directories.
+ */
+let allocationCounter = 0
+
+/**
+ * The session id the recorder allocates by default: {@link newCaptureSessionId}
+ * plus a process-monotonic 3-hex suffix, so a collision needs an actual
+ * filesystem clash rather than a coincident millisecond.
+ *
+ * @param now - epoch milliseconds (injectable for tests).
+ * @param random - a `Math.random` substitute (injectable for tests).
+ * @returns a filesystem-safe, sortable, collision-resistant session id.
+ */
+export function nextCaptureSessionId(now: number = Date.now(), random: () => number = Math.random): string {
+  allocationCounter = (allocationCounter + 1) % 0x1000
+  return `${newCaptureSessionId(now, random)}-${allocationCounter.toString(16).padStart(3, '0')}`
+}
+
+/**
+ * Claim a session directory under `baseDir` with a NON-recursive `mkdir`, so an
+ * existing directory surfaces as EEXIST and the allocator retries with a fresh
+ * id instead of silently merging two captures into one dump (or appending to a
+ * previous run's JSONL).
+ *
+ * @param baseDir - the base directory (expected to exist; created by the caller).
+ * @param sessionId - the id generator, called once per attempt.
+ * @param attempts - how many candidate ids to try before giving up.
+ * @returns the claimed directory, or undefined when none could be claimed.
+ */
+export async function allocateCaptureDirectory(
+  baseDir: string,
+  sessionId: () => string,
+  attempts = 64,
+): Promise<string | undefined> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const candidate = join(baseDir, sessionId())
+    try {
+      // Non-recursive on purpose: the base exists, so EEXIST here means THIS
+      // session directory is taken.
+      await mkdir(candidate, { mode: DUMP_DIR_MODE })
+      return candidate
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== 'EEXIST') return undefined
+    }
+  }
+  return undefined
+}
+
+/**
  * A filesystem-safe, sortable per-capture id: compact UTC timestamp plus four
  * random hex characters. No colons (Windows), no path separators.
  *
@@ -545,6 +773,73 @@ export function newCaptureSessionId(now: number = Date.now(), random: () => numb
   const stamp = new Date(now).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
   const suffix = Math.floor(random() * 0xffff).toString(16).padStart(4, '0')
   return `${stamp}-${suffix}`
+}
+
+/** The `redirectResponse` fields the recorder and the JSONL line carry. */
+interface RedirectShape {
+  headers: Record<string, string>
+  status?: number
+  statusText?: string
+  mimeType?: string
+  url?: string
+}
+
+/** Narrow CDP's `redirectResponse` to the fields a hop entry needs. */
+function redirectShape(response: Record<string, unknown>): RedirectShape {
+  const shape: RedirectShape = { headers: headers(response['headers']) }
+  if (typeof response['status'] === 'number') shape.status = response['status']
+  if (typeof response['statusText'] === 'string') shape.statusText = response['statusText']
+  if (typeof response['mimeType'] === 'string') shape.mimeType = response['mimeType']
+  if (typeof response['url'] === 'string') shape.url = response['url']
+  return shape
+}
+
+/**
+ * The cookies CDP reports as ATTACHED to a request
+ * (`requestWillBeSentExtraInfo.associatedCookies`). Cookies the browser
+ * blocked are skipped — they were not sent — and the rest keep their values
+ * verbatim.
+ */
+function associatedCookies(value: unknown): HarCookie[] {
+  if (!Array.isArray(value)) return []
+  const cookies: HarCookie[] = []
+  for (const entry of value) {
+    const associated = record(entry)
+    if (associated === undefined) continue
+    const blocked = associated['blockedReasons']
+    if (Array.isArray(blocked) && blocked.length > 0) continue
+    const cookie = record(associated['cookie'])
+    if (cookie === undefined) continue
+    const name = text(cookie['name'])
+    if (name === '') continue
+    const parsed: HarCookie = { name, value: text(cookie['value']) }
+    if (typeof cookie['domain'] === 'string') parsed.domain = cookie['domain']
+    if (typeof cookie['path'] === 'string') parsed.path = cookie['path']
+    cookies.push(parsed)
+  }
+  return cookies
+}
+
+/**
+ * The `Cookie` header to record alongside the extra-info headers: CDP's own
+ * header set when it carries one, else one reconstructed from the associated
+ * cookies (the offline pipeline reads headers, so without this a capture whose
+ * base event lacks the header would lose the session).
+ */
+function cookieHeaderFor(extraHeaders: Record<string, string>, cookies: readonly HarCookie[]): string | undefined {
+  for (const [name, value] of Object.entries(extraHeaders)) {
+    if (name.toLowerCase() === 'cookie') return value
+  }
+  if (cookies.length === 0) return undefined
+  return cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
+}
+
+/** Cookies carried by a header map's `Set-Cookie`, in HAR shape. */
+function cookieHeaders(headerMap: Record<string, string>, names: readonly string[]): HarCookie[] {
+  for (const [name, value] of Object.entries(headerMap)) {
+    if (names.includes(name)) return cookiesFromHeader(value)
+  }
+  return []
 }
 
 /** A thrown value's one-line description. */

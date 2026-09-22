@@ -199,7 +199,13 @@ export interface Config {
    * {@link Config.maxBodyBytes}). Off = metadata only.
    */
   captureBodies?: boolean
-  /** Byte cap for a stored response body / WebSocket frame payload. */
+  /**
+   * Byte cap for a stored response body / WebSocket frame payload.
+   * **`0` means NO CAP** (the whole body is stored) — the recorder treats a
+   * non-positive cap as "no limit"; negative/absent fall back to the default
+   * ({@link DEFAULT_MAX_BODY_BYTES}). A body that IS cut is flagged
+   * `bodyTruncated` with its original `bodyBytes`.
+   */
   maxBodyBytes?: number
   /**
    * Keep image/font/media/stylesheet records too. Off (the default) drops
@@ -240,6 +246,8 @@ export const Config: z<Config> = z.object({
   recordNetwork: z.boolean().default(false),
   recordDir: z.string().default(''),
   captureBodies: z.boolean().default(true),
+  // 0 = no cap (the recorder stores whole bodies); the ceiling keeps a dump
+  // from growing without bound when bodies are captured.
   maxBodyBytes: z.number().step(1024).min(0).max(MAX_BODY_BYTES_CEILING).default(DEFAULT_MAX_BODY_BYTES),
   recordAllResources: z.boolean().default(false),
 })
@@ -435,14 +443,33 @@ export function managedLaunchKey(launch: ManagedLaunch): string {
 }
 
 /**
- * The directory one capture session writes into: the configured `recordDir`
- * as the BASE (resolved against the working directory when relative), else
- * `<working directory>/{@link DEFAULT_RECORD_DIRECTORY}` — then the session id
- * as the last segment, so concurrent fetches never share a directory and the
- * default always ends in `net-dumps/<sessionId>`.
+ * The BASE directory the capture dumps live under: the configured `recordDir`
+ * (resolved against the working directory when relative), else
+ * `<working directory>/{@link DEFAULT_RECORD_DIRECTORY}` — so a default path
+ * always ends in `net-dumps`. The recorder appends and claims the per-session
+ * segment itself ({@link effectiveRecordDir} composes the full path for tests
+ * and callers that just want the shape).
  *
  * @param config - the resolved settings section (or any partial of it).
- * @param sessionId - this capture's id (see `newCaptureSessionId`).
+ * @param cwd - the working directory the default and relative paths resolve against.
+ * @returns the absolute base dump directory.
+ */
+export function effectiveRecordBase(
+  config: Pick<Config, 'recordDir'>,
+  cwd: string = process.cwd(),
+): string {
+  const configured = (config.recordDir ?? '').trim()
+  if (configured === '') return join(cwd, DEFAULT_RECORD_DIRECTORY)
+  return isAbsolute(configured) ? configured : resolve(cwd, configured)
+}
+
+/**
+ * The full session directory path for a given id: `<base>/<sessionId>`. Useful
+ * for tests and diagnostics; the RECORDER allocates the real directory (and may
+ * pick a different id) so a collision can never merge two captures.
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @param sessionId - the capture's id (see `newCaptureSessionId`).
  * @param cwd - the working directory the default and relative paths resolve against.
  * @returns the absolute session dump directory.
  */
@@ -451,17 +478,17 @@ export function effectiveRecordDir(
   sessionId: string,
   cwd: string = process.cwd(),
 ): string {
-  const configured = (config.recordDir ?? '').trim()
-  const base = configured !== ''
-    ? (isAbsolute(configured) ? configured : resolve(cwd, configured))
-    : join(cwd, DEFAULT_RECORD_DIRECTORY)
-  return join(base, sessionId)
+  return join(effectiveRecordBase(config, cwd), sessionId)
 }
 
 /** Everything one capture session needs, resolved from the settings section. */
 export interface CapturePlan {
-  /** The session's own directory (0700, files 0600). */
-  dir: string
+  /**
+   * The BASE directory the capture allocates its session directory under
+   * (`<baseDir>/<sessionId>`, 0700, files 0600). The recorder claims the
+   * session directory itself, so two captures can never share one dump.
+   */
+  baseDir: string
   /** Fetch response bodies through `Network.getResponseBody`. */
   captureBodies: boolean
   /** Byte cap for a stored body / frame payload. */
@@ -484,12 +511,11 @@ export interface CapturePlan {
  */
 export function captureOptionsFor(
   config: CaptureSettings,
-  sessionId: string,
   cwd: string = process.cwd(),
 ): CapturePlan {
   return {
     enabled: config.recordNetwork === true,
-    dir: effectiveRecordDir(config, sessionId, cwd),
+    baseDir: effectiveRecordBase(config, cwd),
     captureBodies: config.captureBodies !== false,
     maxBodyBytes: typeof config.maxBodyBytes === 'number' && Number.isFinite(config.maxBodyBytes)
       ? config.maxBodyBytes

@@ -185,12 +185,12 @@ google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.config/chrome
 
 | 文件 | 内容 |
 | --- | --- |
-| `network.jsonl` | 每行一个 JSON 对象，**抓取进行中持续追加**——先是 `session` 头行，然后每个请求依次 `request` / `response` / `responseBody` / `finished`（失败则 `failed`），以及 `websocketCreated` / `websocketFrame` / `websocketClosed`。可边跑边读、中断也不丢，也是离线流水线的输入格式。 |
+| `network.jsonl` | 每行一个 JSON 对象，**抓取进行中持续追加**——先是 `session` 头行，然后每个请求依次 `request` / `response` / `responseBody` / `finished`（失败则 `failed`）、承载权威 header+cookie 集的 `requestExtra` / `responseExtra` 行（重定向跳会单独定稿为一对 `response`/`finished`，因此 301→200 产出两条记录），以及 `websocketCreated` / `websocketFrame` / `websocketClosed`。可边跑边读、中断也不丢，也是离线流水线的输入格式。单个坏 URL 或坏记录只会降级为那一条：导出绝不会丢掉整份文档。 |
 | `har.json` | 抓取结束时导出的 HAR 1.2——正常结束、抛错、被 abort 三条路径都会写（插件卸载也会 flush）。WebSocket 流量按 Chrome 的 `_webSocketMessages` 扩展挂在 entry 上。 |
 
 > **抓包产物含明文凭据。** `Cookie`、`Set-Cookie`、`Authorization`、token 与请求/响应正文都按原样保存——这是刻意设计，因为「复现已登录会话」正是它的用途——所以请把 dump 目录当作密码文件对待。默认值做了防护：目录 `0700`、文件 `0600`，且 `net-dumps/` 已在本仓库 `.gitignore` 中。但一旦你把目录复制出去或提交，这些防护就失效了：切勿外发、发布或作为附件分享。
 
-配置项：`recordNetwork`（默认关闭——因为抓包会把凭据写到磁盘，所以是显式开关）、`recordDir`（基目录；每次抓包在其下新建 `<sessionId>` 子目录）、`captureBodies`（通过 `getResponseBody` 读取响应正文）、`maxBodyBytes`（单条正文/帧上限，0–16 MiB；被截断的会标记 `bodyTruncated` 并保留原始 `bodyBytes`）、`recordAllResources`（同时记录 image/font/media/stylesheet，默认丢弃：对提取业务 API 是噪音且量最大）。设置卡片就在开关旁给出明文凭据警告。
+配置项：`recordNetwork`（默认关闭——因为抓包会把凭据写到磁盘，所以是显式开关）、`recordDir`（基目录；每次抓包用**非递归 mkdir** 在其下独占一个 `<sessionId>` 子目录，两次抓包绝不可能共用一份 dump）、`captureBodies`（通过 `getResponseBody` 读取响应正文）、`maxBodyBytes`（单条正文/帧上限，0–16 MiB，**0 = 不限制（no cap）**；被截断的会标记 `bodyTruncated` 并保留原始 `bodyBytes`）、`recordAllResources`（同时记录 image/font/media/stylesheet，默认丢弃：对提取业务 API 是噪音且量最大；注意抓取自身的资源过滤会**提前 abort** image/font/media 子请求，打开该开关只能看到它们的 URL 与取消事件，而 stylesheet 不会被拦截、可完整记录）。设置卡片就在开关旁给出明文凭据警告。
 
 录制全程 **best-effort**：CDP 抖动、正文已被回收、目录不可写、事件格式异常——一律吞掉（记录在 recorder report 里），**绝不会让 `web_fetch` 失败**，也不会让页面内容被吞。
 
