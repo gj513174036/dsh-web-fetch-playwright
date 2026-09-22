@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildHar, cookiesFromHeader, headersToHar, queryStringOf, safeDecode, type HarDocument } from '../src/har.ts'
 import {
   allocateCaptureDirectory,
+  extraMatchesHop,
   HAR_FILE,
   NETWORK_JSONL_FILE,
   NetworkRecorder,
@@ -1161,5 +1162,143 @@ describe('NetworkRecorder ExtraInfo vs the static filter (t15/R2)', () => {
     const extra = lines.find(line => line['kind'] === 'requestExtra')
     expect(extra).toMatchObject({ requestId: 'ghost', unclaimed: true, cookieCount: 1 })
     expect(extra).not.toHaveProperty('url') // no hop to name
+  })
+})
+
+/**
+ * t17/F1 (blocking): CDP does NOT fire an ExtraInfo event for every hop —
+ * protocol.d.ts:12415 says so explicitly — and a cached redirect hop typically
+ * has none. Pairing by ARRIVAL INDEX therefore hands the next hop's credentials
+ * to the hop that has no ExtraInfo of its own, which is exactly the bug the
+ * review reproduced (hop1 a cached 301 → hop2's Cookie/Authorization recorded
+ * against `/v1/start`, while the real endpoint `/v1/final` came back bare).
+ * Pairing must be by hop IDENTITY (`:path` + `:authority`), with the index rule
+ * only as a documented fallback.
+ */
+describe('NetworkRecorder hop identity pairing (t17/F1)', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'dsh-recorder-ident-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  /** A chain whose FIRST hop has no ExtraInfo at all (a cached 301). */
+  const BASE_START = requestEvent({ requestId: '1', url: 'https://api.example.com/v1/start', method: 'GET', headers: {} })
+  const BASE_FINAL = {
+    requestId: '1',
+    type: 'Fetch',
+    redirectResponse: {
+      url: 'https://api.example.com/v1/start',
+      status: 301,
+      statusText: 'Moved Permanently',
+      mimeType: 'text/html',
+      headers: { location: 'https://api.example.com/v1/final' },
+    },
+    request: { url: 'https://api.example.com/v1/final', method: 'GET', headers: {} },
+  }
+  const FINAL_REQUEST_EXTRA = {
+    requestId: '1',
+    headers: {
+      ':authority': 'api.example.com',
+      ':path': '/v1/final',
+      ':method': 'GET',
+      cookie: 'hop2=two',
+      authorization: 'Bearer hop2-token',
+      'x-hop': 'two',
+    },
+    associatedCookies: [{ cookie: { name: 'hop2', value: 'two', domain: 'api.example.com', path: '/' }, blockedReasons: [] }],
+  }
+  const FINAL_RESPONSE_EXTRA = {
+    requestId: '1',
+    statusCode: 200,
+    headers: { 'content-type': 'application/json', 'set-cookie': 'hop2resp=yes; Path=/' },
+  }
+
+  /** Run the cached-301 chain and return both artifacts. */
+  async function cachedRedirectCapture(name: string): Promise<{ har: HarDocument; lines: Array<Record<string, unknown>> }> {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{"ok":true}' } } })
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => name, url: 'https://api.example.com/v1/start',
+      captureBodies: true, maxBodyBytes: 1024, recordAllResources: false,
+    })
+    expect(recorder).toBeDefined()
+    session.emit('Network.requestWillBeSent', BASE_START)
+    // NO ExtraInfo for hop 1 (cache hit) …
+    session.emit('Network.requestWillBeSent', BASE_FINAL)
+    // … and the only request/response ExtraInfo belongs to hop 2.
+    session.emit('Network.requestWillBeSentExtraInfo', FINAL_REQUEST_EXTRA)
+    session.emit('Network.responseReceived', responseEvent({ requestId: '1', status: 200, mimeType: 'application/json' }))
+    session.emit('Network.responseReceivedExtraInfo', FINAL_RESPONSE_EXTRA)
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    await recorder?.finish()
+    const dir = join(root, name)
+    return {
+      har: JSON.parse(readFileSync(join(dir, HAR_FILE), 'utf8')) as HarDocument,
+      lines: readFileSync(join(dir, NETWORK_JSONL_FILE), 'utf8').split('\n').filter(line => line !== '').map(line => JSON.parse(line) as Record<string, unknown>),
+    }
+  }
+
+  it('keeps the credentials of the ONLY hop that has ExtraInfo (hop1 has none)', async () => {
+    const { har, lines } = await cachedRedirectCapture('cached301')
+    expect(har.log.entries).toHaveLength(2)
+    const [hop1, hop2] = har.log.entries
+
+    // hop1 = the cached 301 on /v1/start: it must be COMPLETELY bare.
+    expect(hop1?.response.status).toBe(301)
+    expect(hop1?.request.url).toBe('https://api.example.com/v1/start')
+    expect(hop1?.request.cookies).toEqual([])
+    expect(hop1?.request.headers.map(header => header.name.toLowerCase())).not.toContain('authorization')
+    expect(hop1?.request.headers.map(header => header.name.toLowerCase())).not.toContain('x-hop')
+    expect(hop1?.request.headers.map(header => header.name.toLowerCase())).not.toContain('cookie')
+    expect(hop1?.response.cookies).toEqual([])
+
+    // hop2 = the real endpoint: it holds its own credentials.
+    expect(hop2?.response.status).toBe(200)
+    expect(hop2?.request.url).toBe('https://api.example.com/v1/final')
+    expect(hop2?.request.cookies?.map(cookie => cookie.name)).toEqual(['hop2'])
+    expect(hop2?.request.headers).toEqual(expect.arrayContaining([
+      { name: 'authorization', value: 'Bearer hop2-token' },
+      { name: 'x-hop', value: 'two' },
+    ]))
+    expect(hop2?.response.cookies?.map(cookie => cookie.name)).toEqual(['hop2resp'])
+
+    // The JSONL agrees with the HAR: the extra row names hop 2 and its URL.
+    const extraLines = lines.filter(line => line['kind'] === 'requestExtra' || line['kind'] === 'responseExtra')
+    expect(extraLines).toHaveLength(2)
+    for (const line of extraLines) {
+      expect(line['hop']).toBe(1)
+      expect(line['url']).toBe('https://api.example.com/v1/final')
+    }
+  })
+
+  it('matches by :path + :authority even when the ExtraInfo arrives before its hop', async () => {
+    const session = new FakeCdpSession({ bodies: { '1': { body: '{}' } } })
+    const recorder = await NetworkRecorder.create({
+      session, baseDir: root, sessionId: () => 'earlyident', url: 'https://api.example.com/v1/start',
+      captureBodies: true, maxBodyBytes: 1024, recordAllResources: false,
+    })
+    session.emit('Network.requestWillBeSent', BASE_START)
+    // hop2's ExtraInfo BEFORE hop2's base event, and hop1 still has none.
+    session.emit('Network.requestWillBeSentExtraInfo', FINAL_REQUEST_EXTRA)
+    session.emit('Network.requestWillBeSent', BASE_FINAL)
+    session.emit('Network.responseReceived', responseEvent({ requestId: '1', status: 200, mimeType: 'application/json' }))
+    session.emit('Network.loadingFinished', { requestId: '1' })
+    await recorder?.finish()
+
+    const har = JSON.parse(readFileSync(join(root, 'earlyident', HAR_FILE), 'utf8')) as HarDocument
+    expect(har.log.entries[0]?.request.cookies).toEqual([])
+    expect(har.log.entries[0]?.request.headers.some(header => header.name.toLowerCase() === 'x-hop')).toBe(false)
+    expect(har.log.entries[1]?.request.cookies?.map(cookie => cookie.name)).toEqual(['hop2'])
+  })
+
+  it('identifies a hop by :path + :authority (unit)', () => {
+    const hop = { url: 'https://api.example.com/v1/final?page=2', method: 'GET' }
+    expect(extraMatchesHop({ headers: { ':path': '/v1/final?page=2', ':authority': 'api.example.com' } }, hop)).toBe(true)
+    expect(extraMatchesHop({ headers: { ':path': '/v1/final', ':authority': 'api.example.com' } }, hop)).toBe(true)
+    expect(extraMatchesHop({ headers: { ':path': '/v1/start', ':authority': 'api.example.com' } }, hop)).toBe(false)
+    expect(extraMatchesHop({ headers: { ':path': '/v1/final', ':authority': 'other.example.com' } }, hop)).toBe(false)
+    expect(extraMatchesHop({ headers: { ':path': '/v1/final?page=2', ':authority': 'api.example.com', ':method': 'POST' } }, hop)).toBe(false)
+    // Pseudo-headers missing (or only one of them): no identity to match on.
+    expect(extraMatchesHop({ headers: { cookie: 'a=1' } }, hop)).toBe(false)
+    expect(extraMatchesHop({ headers: { ':path': '/v1/final?page=2' } }, hop)).toBe(false)
+    expect(extraMatchesHop({ headers: { ':authority': 'api.example.com' } }, hop)).toBe(false)
   })
 })

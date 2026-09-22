@@ -229,22 +229,109 @@ interface ExtraSlot {
   authority?: string
   /** True once a hop took it (or the hold window flushed it). */
   claimed?: boolean
+  /** The hop index it was claimed for (absent while unclaimed). */
+  hop?: number
+}
+
+/**
+ * Whether an ExtraInfo slot IDENTIFIES a hop: its `:path` and `:authority`
+ * pseudo-headers (which Chrome sends on `requestWillBeSentExtraInfo`) name the
+ * same target as the hop's base-event URL, and its `:method` agrees when the
+ * extra carries one.
+ *
+ * Both pseudo-headers are REQUIRED: with only one of them a redirect chain
+ * inside a single host is ambiguous, and an ambiguous identity must fall back
+ * to the index rule rather than guess.
+ *
+ * @param extra - the ExtraInfo slot's header set.
+ * @param hop - the base-event exchange to test against.
+ * @returns true when the extra is unambiguously about that hop's request.
+ */
+export function extraMatchesHop(
+  extra: { headers: Record<string, string> },
+  hop: { url: string; method: string },
+): boolean {
+  const path = extra.headers[':path']
+  const authority = extra.headers[':authority']
+  if (path === undefined || authority === undefined) return false
+  let parsed: URL
+  try {
+    parsed = new URL(hop.url)
+  } catch {
+    return false
+  }
+  if (authority.toLowerCase() !== parsed.host.toLowerCase()) return false
+  // Chrome's `:path` is the request target: path plus query.
+  const target = `${parsed.pathname}${parsed.search}`
+  if (path !== target && path !== parsed.pathname) return false
+  const method = extra.headers[':method']
+  if (method !== undefined && method.toLowerCase() !== hop.method.toLowerCase()) return false
+  return true
+}
+
+/**
+ * The response-side identity: a `responseReceivedExtraInfo` reports the status
+ * of the response it belongs to (the `statusCode` param, or Chrome's `:status`
+ * pseudo-header), so it identifies the hop whose own response has that status.
+ * Response headers carry no path, which is why the status is the only identity
+ * available on that side.
+ *
+ * @param extra - the response ExtraInfo slot.
+ * @param hop - the base-event exchange (status known once `responseReceived`
+ *   arrived, or immediately for a redirect hop).
+ * @returns true when the extra is unambiguously about that hop's response.
+ */
+export function responseExtraMatchesHop(
+  extra: { status?: number; headers: Record<string, string> },
+  hop: RecordedHttpExchange,
+): boolean {
+  const status = extra.status ?? statusFromHeaders(extra.headers)
+  return status !== undefined && hop.status === status
+}
+
+/** The `:status` pseudo-header of a response ExtraInfo header set, if any. */
+function statusFromHeaders(headers: Record<string, string>): number | undefined {
+  const raw = headers[':status']
+  if (raw === undefined) return undefined
+  const parsed = Number.parseInt(raw, 10)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 /**
  * One requestId's hop slots: base-event hops plus the ExtraInfo they claim.
  *
- * PAIRING RULE: the Nth extra of a requestId belongs to its Nth hop — the rule
- * Playwright's own tracker uses (coreBundle.js `ResponseExtraInfoTracker` keeps
- * three parallel arrays per requestId and patches them by index). That is
- * correct for every arrival order in which a hop's own ExtraInfo does not
- * arrive AFTER a LATER hop's ExtraInfo: the racy "next hop's extra first"
- * order, and the "this hop's extra after the redirect" order, both land on the
- * right hop. The remaining inversion (extra of hop 1 arriving after the extra
- * of hop 2) is locally indistinguishable — nothing in the event names its hop *
- * — and matches what Playwright does as well; each slot therefore also keeps
- * the `:path`/`:authority` pseudo-headers Chrome sends, so a future refinement
- * can use them if a real capture ever exhibits that order.
+ * PAIRING RULE (identity first): an ExtraInfo slot is placed on the hop whose
+ * own request/response it NAMES — `:path` + `:authority` (plus `:method` when
+ * present) for a request slot, the reported status for a response slot. That is
+ * what makes pairing survive the case CDP explicitly allows
+ * (`protocol.d.ts`: "Not every requestWillBeSent event will have an additional
+ * requestWillBeSentExtraInfo fired for it"): a cached redirect hop with no
+ * ExtraInfo of its own no longer steals the next hop's credentials.
+ *
+ * COVERED, verified against synthetic CDP event streams (the suite drives the
+ * canonical, "next hop's extra first", and "this hop's extra after the
+ * redirect" orders, plus a hop that has no extra at all):
+ *  - every hop has its own extra, in any arrival order relative to its base event;
+ *  - a hop has NO extra (a cached 301), and the next hop's extra still lands on
+ *    the next hop;
+ *  - a response extra that arrives before its hop's `responseReceived` is held
+ *    and placed once that hop's status is known.
+ *
+ * FALLBACK (and its limits): when a slot carries no usable identity (no
+ * `:path`/`:authority`, or no status — a minimal CDP implementation or a
+ * synthetic event) or several hops match it equally, the arrival index decides
+ * ("the Nth extra of a requestId belongs to its Nth hop", Playwright's own
+ * rule). That is correct only while every earlier hop of that requestId
+ * produced its own extra of the same kind; with an omission it can be off by
+ * the number of omissions.
+ *
+ * NOT COVERED (explicit exceptions): a hop's extra arriving AFTER a LATER hop's
+ * extra while both carry no usable identity — nothing in the event names its
+ * hop, so the two are locally indistinguishable (Playwright has the same
+ * limitation); and a response extra whose status never matches any hop stays
+ * unclaimed and is flushed as `unclaimed` after the hold window. Neither order
+ * could be reproduced against a real browser in this environment (no launchable
+ * Chromium), so these are documented limits, not verified behavior.
  */
 interface HopSlots {
   /** The base-event exchanges of this requestId, in hop order. */
@@ -481,8 +568,7 @@ export class NetworkRecorder {
     slots.hops.push(exchange)
     // A hop that starts NOW may already have its ExtraInfo on hold (CDP does
     // not promise which of the two arrives first) — claim it for this hop.
-    const held = this.claimHeldExtra(requestId, hopIndex)
-    if (held !== undefined) this.applyRequestExtra(exchange, held)
+    this.claimHeldExtra(requestId, hopIndex, 'request')
     this.http.set(requestId, exchange)
     this.recorded.push(exchange)
     this.append({
@@ -515,6 +601,16 @@ export class NetworkRecorder {
     if (shape.mimeType !== undefined) hop.mimeType = shape.mimeType
     hop.responseHeaders = shape.headers
     hop.finishedAtMs = this.now()
+    // This hop's status is known NOW, so a response ExtraInfo that arrived
+    // early (held, because no hop had that status yet) can finally be placed
+    // on this hop by identity.
+    const slots = this.slots.get(requestId)
+    const hopIndex = slots?.hops.indexOf(hop) ?? -1
+    if (slots !== undefined && hopIndex !== -1 && !this.hopHasExtra(slots, 'response', hopIndex)) {
+      const queued = slots.responseExtras[hopIndex]
+      if (queued !== undefined && queued.claimed !== true) this.claimExtra(requestId, queued, hop, hopIndex)
+      else this.claimHeldExtra(requestId, hopIndex, 'response')
+    }
     this.append({
       kind: 'response',
       ...this.stamps(hop.finishedAtMs),
@@ -574,15 +670,15 @@ export class NetworkRecorder {
     const authority = merged[':authority']
     if (authority !== undefined) slot.authority = authority
     slots.requestExtras.push(slot)
-    const hop = slots.hops[slot.index]
-    if (hop === undefined) {
-      // Its hop has not started yet (the next redirect hop, or a hop whose base
+    const target = this.hopForExtra(slots, slot)
+    if (target === undefined) {
+      // Its hop is not known yet (the next redirect hop, or a hop whose base
       // event never comes): hold it, and start the flush window.
       this.heldExtras.push(slot)
       this.armHoldTimer()
       return
     }
-    this.claimExtra(requestId, slot, hop)
+    this.claimExtra(requestId, slot, slots.hops[target] as RecordedHttpExchange, target)
   }
 
   /** `Network.responseReceivedExtraInfo`: authoritative response headers/status. */
@@ -604,30 +700,109 @@ export class NetworkRecorder {
       ...(statusCode === undefined ? {} : { status: statusCode }),
     }
     slots.responseExtras.push(slot)
-    const hop = slots.hops[slot.index]
-    if (hop === undefined) {
+    const target = this.hopForExtra(slots, slot)
+    if (target === undefined) {
       this.heldExtras.push(slot)
       this.armHoldTimer()
       return
     }
-    this.claimExtra(requestId, slot, hop)
+    this.claimExtra(requestId, slot, slots.hops[target] as RecordedHttpExchange, target)
   }
 
-  /** Claim a held slot for the hop that has just appeared. */
-  private claimHeldExtra(requestId: string, hopIndex: number): ExtraSlot | undefined {
-    const position = this.heldExtras.findIndex(slot => slot.index === hopIndex && !slot.claimed && this.slots.get(requestId)?.requestExtras.includes(slot) === true)
-    if (position === -1) return undefined
-    const slot = this.heldExtras.splice(position, 1)[0]
-    if (slot === undefined) return undefined
-    const hop = this.slots.get(requestId)?.hops[hopIndex]
-    if (hop === undefined) return undefined
-    this.claimExtra(requestId, slot, hop)
-    return slot
+  /**
+   * Which hop an ExtraInfo slot belongs to, in priority order:
+   *
+   *  1. IDENTITY — `:path` + `:authority` naming exactly one hop whose own
+   *     request/response has not claimed an extra yet (response slots use the
+   *     status instead). This is the only rule that survives a hop WITHOUT an
+   *     ExtraInfo event of its own, which CDP explicitly allows
+   *     (`protocol.d.ts`: "Not every requestWillBeSent event will have an
+   *     additional requestWillBeSentExtraInfo fired for it") — a cached
+   *     redirect hop typically has none.
+   *  2. INDEX — the slot's arrival index, used only when identity is
+   *     unavailable: the extra carries no usable pseudo-header (a minimal
+   *     CDP implementation or a synthetic event), or several hops match it
+   *     equally. The index rule is correct exactly while every earlier hop of
+   *     that requestId produced its own extra of the same kind; if one was
+   *     omitted, the index rule can be off by the number of omissions — which
+   *     is why it is the fallback and not the primary rule.
+   *
+   * @param slots - the requestId's hop slots.
+   * @param slot - the ExtraInfo slot to place.
+   * @returns the hop index, or undefined when the slot must be held.
+   */
+  private hopForExtra(slots: HopSlots, slot: ExtraSlot): number | undefined {
+    const candidates = this.hopIndexesByIdentity(slots, slot)
+    if (candidates.length === 1) return candidates[0]
+    if (candidates.length === 0 && this.hasUsableIdentity(slot)) {
+      // The extra NAMES a target no hop has yet — it belongs to a hop that has
+      // not started (the next redirect hop). Hold it: the index fallback would
+      // hand it to the hop currently at that index, which is the very
+      // misattribution this pairing exists to prevent.
+      return undefined
+    }
+    // Fallback (see above): the arrival index, when that hop exists and has
+    // not claimed an extra of this kind yet. Reached only when the identity is
+    // unusable (no pseudo-headers at all) or ambiguous (several hops match).
+    const indexed = slots.hops[slot.index]
+    if (indexed !== undefined && !this.hopHasExtra(slots, slot.kind, slot.index)) return slot.index
+    return undefined
+  }
+
+  /** Whether a slot carries enough to identify a hop at all. */
+  private hasUsableIdentity(slot: ExtraSlot): boolean {
+    if (slot.kind === 'request') return slot.headers[':path'] !== undefined && slot.headers[':authority'] !== undefined
+    return (slot.status ?? statusFromHeaders(slot.headers)) !== undefined
+  }
+
+  /** Every still-unclaimed hop an ExtraInfo slot identifies, in hop order. */
+  private hopIndexesByIdentity(slots: HopSlots, slot: ExtraSlot): number[] {
+    const candidates: number[] = []
+    for (let index = 0; index < slots.hops.length; index++) {
+      const hop = slots.hops[index]
+      if (hop === undefined || this.hopHasExtra(slots, slot.kind, index)) continue
+      const matches = slot.kind === 'request' ? extraMatchesHop(slot, hop) : responseExtraMatchesHop(slot, hop)
+      if (matches) candidates.push(index)
+    }
+    return candidates
+  }
+
+  /** Whether a hop already holds an ExtraInfo slot of this kind. */
+  private hopHasExtra(slots: HopSlots, kind: 'request' | 'response', hopIndex: number): boolean {
+    const list = kind === 'request' ? slots.requestExtras : slots.responseExtras
+    return list.some(candidate => candidate.hop === hopIndex)
+  }
+
+  /**
+   * Claim a held slot for the hop that has just appeared, identity first: a
+   * held extra whose `:path`/`:authority` names THIS hop is its own, even when
+   * an earlier hop produced no extra at all. Only when no held slot identifies
+   * it does the arrival index decide (see {@link hopForExtra} for the fallback's
+   * exact applicability).
+   */
+  private claimHeldExtra(requestId: string, hopIndex: number, kind: 'request' | 'response'): ExtraSlot | undefined {
+    const slots = this.slots.get(requestId)
+    const hop = slots?.hops[hopIndex]
+    if (slots === undefined || hop === undefined) return undefined
+    const owned = this.heldExtras.filter(slot => !slot.claimed && slot.kind === kind && this.ownerOf(slot) === requestId)
+    const byIdentity = owned.filter(slot => kind === 'request' ? extraMatchesHop(slot, hop) : responseExtraMatchesHop(slot, hop))
+    // The index fallback is confined to slots that carry NO usable identity:
+    // a slot that names a target (and does not name this hop) belongs to
+    // another hop, and must not be handed over just because its arrival index
+    // matches — that is the misattribution this pairing exists to prevent.
+    const fallback = byIdentity.length === 0
+      ? owned.find(slot => slot.index === hopIndex && !this.hasUsableIdentity(slot) && !this.hopHasExtra(slots, kind, hopIndex))
+      : undefined
+    const chosen = byIdentity.length === 1 ? byIdentity[0] : fallback
+    if (chosen === undefined) return undefined
+    this.claimExtra(requestId, chosen, hop, hopIndex)
+    return chosen
   }
 
   /** Apply a slot to its hop (authoritative) and write its JSONL line. */
-  private claimExtra(requestId: string, slot: ExtraSlot, hop: RecordedHttpExchange): void {
+  private claimExtra(requestId: string, slot: ExtraSlot, hop: RecordedHttpExchange, hopIndex: number): void {
     slot.claimed = true
+    slot.hop = hopIndex
     const held = this.heldExtras.indexOf(slot)
     if (held !== -1) this.heldExtras.splice(held, 1)
     if (slot.kind === 'request') {
@@ -639,7 +814,7 @@ export class NetworkRecorder {
         url: hop.url,
         headers: slot.headers,
         cookieCount: slot.cookies.length,
-        hop: slot.index,
+        hop: hopIndex,
       })
       return
     }
@@ -652,7 +827,7 @@ export class NetworkRecorder {
       statusCode: slot.status,
       headers: slot.headers,
       cookieCount: slot.cookies.length,
-      hop: slot.index,
+      hop: hopIndex,
     })
   }
 
@@ -732,14 +907,15 @@ export class NetworkRecorder {
     if (Object.keys(responseHeaders).length > 0) exchange.responseHeaders = responseHeaders
     const slots = this.slots.get(exchange.requestId)
     const hopIndex = slots?.hops.indexOf(exchange) ?? -1
-    if (slots !== undefined && hopIndex !== -1) {
+    if (slots !== undefined && hopIndex !== -1 && !this.hopHasExtra(slots, 'response', hopIndex)) {
+      // This hop's response status is known NOW, so a response ExtraInfo that
+      // arrived early (or is queued at the index fallback) can be placed:
+      // identity first (its status names this hop), then the held/index slot.
       const slot = slots.responseExtras[hopIndex]
-      if (slot === undefined) {
-        // A held response slot for this hop, if one arrived early.
-        const held = this.claimHeldExtra(exchange.requestId, hopIndex)
-        void held
-      } else if (slot.claimed !== true) {
-        this.claimExtra(exchange.requestId, slot, exchange)
+      if (slot !== undefined && slot.claimed !== true && !this.hasUsableIdentity(slot)) {
+        this.claimExtra(exchange.requestId, slot, exchange, hopIndex)
+      } else {
+        this.claimHeldExtra(exchange.requestId, hopIndex, 'response')
       }
     }
     this.append({
