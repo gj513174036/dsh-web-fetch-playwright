@@ -162,8 +162,12 @@ async function conditionHolds(
   }
   // A read that did not happen is *not* evidence that the text is gone: an
   // `absent` condition that treated "no answer" as "not there" would report a
-  // stalled page as the thing it was waiting for.
-  if (answer === TIMED_OUT) return { held: false, why: 'the page did not answer' }
+  // stalled page as the thing it was waiting for. It is also not worth a sentence
+  // of its own: the last poll of a long wait runs with no budget left and would
+  // tell the reader "the page did not answer" about a page that answered forty
+  // times — the honest message is that the text was not there for as long as the
+  // step waited.
+  if (answer === TIMED_OUT) return { held: false, why: '' }
   const found = answer === true
   return { held: condition.absent === true ? !found : found, why: '' }
 }

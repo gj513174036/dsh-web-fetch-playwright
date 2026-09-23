@@ -399,6 +399,15 @@ would be reported `clicked (unverified)`, and a submit that silently failed woul
 **unfiltered** register as if it were the search. That is the silent-wrong-answer class this whole model
 exists to remove, so the wait names the count the query produces.
 
+Demonstrated, on the live page, by running the same recipe with a count of a *different* query
+(`888 result(s) found`): the step fails naming itself and where it stood, rather than returning the register —
+
+```
+{"ok":false,"failure":{"index":3,"verb":"waitFor",
+ "detail":"text \"888 result(s) found\" (not met within 6000ms)",
+ "url":"https://www.tga.gov.au/resources/artg?keywords=vitamin+d"}}
+```
+
 The cost is real and accepted: **when the register changes, this step fails loudly and the number is updated**.
 That is the trade this repository prefers (fail with the step that did not hold) over a step that cannot tell
 a search from a browse. A different keyword needs a different count, and therefore a different target — the
