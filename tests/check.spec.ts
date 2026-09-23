@@ -173,6 +173,23 @@ describe('checkScript', () => {
     expect(answer.tried?.[0]).toContain('none reachable (covered)')
   })
 
+  it('reads the control the page is showing now when it replaced the one it ticked', async () => {
+    // The read-back re-resolves without the "holds a state" filter and lands on
+    // the <label> that merely carries the same words, reporting a lost control
+    // while a perfectly good checked box is on the page.
+    const answer = await runScript(GATE, [{ kind: 'text', text: '全选' }], 'checked', (dom) => {
+      const label = dom.window.document.getElementById('all')
+      label?.addEventListener('click', () => {
+        const fresh = dom.window.document.createElement('input')
+        fresh.type = 'checkbox'
+        fresh.id = 'cb'
+        fresh.checked = true
+        dom.window.document.getElementById('cb')?.replaceWith(fresh)
+      })
+    })
+    expect(answer).toEqual({ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', acted: true })
+  })
+
   it('reports an act whose read-back never happened instead of claiming the state', async () => {
     // The control disappears on the click (a page that re-renders it away): the
     // act went out, so this is not "no candidate", and it is not a state either.
