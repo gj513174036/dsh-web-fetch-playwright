@@ -291,11 +291,11 @@ export interface BrowserSession {
    */
   recorder?: NetworkRecorder
   /**
-   * Pages this fetch adopted because a target step opened them (`opensPage`).
-   * They are ordinary tabs of the same context; in profile mode nothing else
-   * would close them, so {@link closeSession} does.
+   * Pages this fetch's tabs opened — the ones a target adopted, and any stray a
+   * popup guard caught. They are ordinary tabs of the same context; in profile
+   * mode nothing else would close them, so {@link closeSession} does.
    */
-  adoptedPages?: PlaywrightPage[]
+  openedPages?: PlaywrightPage[]
 }
 
 /**
@@ -918,20 +918,19 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // response, so either of them needs it too.
     const tracksResponses = challengeWaitMs > 0 || config.dismissConsent === true || targetsFile !== ''
     const tracker = tracksResponses ? trackMainFrameResponses(page) : undefined
-    // Pages an act opens: the guard leaves the one a target adopts alone (and
-    // closes every other), the adopted page's own responses are tracked so the
-    // result can describe it, and teardown closes it with the fetch.
-    const adopted: PlaywrightPage[] = []
-    const adoptedSet = new Set<PlaywrightPage>()
-    const openedTrackers = new Map<PlaywrightPage, MainFrameTracker | undefined>()
+    // Everything the fetch knows about the pages its tabs open, in one place:
+    // `openedPages` is what teardown closes, `adoptedTrackers` says which of them
+    // a target adopted (the guard asks) and carries each adopted page's own
+    // main-frame responses, so the result can describe the document it read.
+    const openedPages: PlaywrightPage[] = []
+    const adoptedTrackers = new Map<PlaywrightPage, MainFrameTracker | undefined>()
+    const isClaimed = (popup: PlaywrightPage): boolean => adoptedTrackers.has(popup)
     const claimPage = (popup: PlaywrightPage): void => {
-      if (adoptedSet.has(popup)) return
-      adoptedSet.add(popup)
-      adopted.push(popup)
-      openedTrackers.set(popup, tracksResponses ? trackMainFrameResponses(popup) : undefined)
+      if (isClaimed(popup)) return
+      adoptedTrackers.set(popup, tracksResponses ? trackMainFrameResponses(popup) : undefined)
     }
-    guardPopups(page, popup => adoptedSet.has(popup))
-    session.adoptedPages = adopted
+    guardPopups(page, isClaimed, openedPages)
+    session.openedPages = openedPages
     let response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
     tracker?.seed(response)
 
@@ -1017,7 +1016,14 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
      * and status are the honest ones to report.
      */
     const settledDocument = (): { url: string; statusCode: number } => {
-      const settled = (openedTrackers.get(documentPage) ?? tracker)?.last() ?? null
+      // An adopted page has its own response to report. When it never reported
+      // one, the honest answer is the same convention the fetch uses when there
+      // is no response at all (200) — never the status of the page it left.
+      if (documentPage !== page) {
+        const adopted = adoptedTrackers.get(documentPage)?.last() ?? null
+        return { url: documentPage.url(), statusCode: adopted === null ? 200 : adopted.status() }
+      }
+      const settled = tracker?.last() ?? null
       return settled !== null && settled !== finalResponse
         ? { url: documentPage.url(), statusCode: settled.status() }
         : { url: documentPage.url(), statusCode }
@@ -1288,9 +1294,9 @@ async function closeSession(session: BrowserSession | undefined): Promise<void> 
   // that is mid-flight. `finish()` is idempotent, so the abort listener and
   // the fetch's own finally may both call it safely.
   if (session.recorder !== undefined) await session.recorder.finish()
-  // The pages a target adopted are this fetch's tabs: in profile mode nothing
-  // else would close them.
-  for (const adopted of session.adoptedPages ?? []) await closeWithGrace(adopted)
+  // The pages this fetch's tabs opened are its tabs too: in profile mode
+  // nothing else would close them.
+  for (const opened of session.openedPages ?? []) await closeWithGrace(opened)
   await closeWithGrace(session.page)
   if (session.persistent !== true) await closeWithGrace(session.context)
   if (session.sharedBrowser !== true) await closeWithGrace(session.browser)
@@ -1381,13 +1387,15 @@ async function installResourceFilter(owner: {
  * profile mode a stray tab would stay in the user's remote browser.
  * Best-effort: a page that refuses listeners just loses the guard.
  */
-function guardPopups(page: PlaywrightPage, isClaimed?: (popup: PlaywrightPage) => boolean): void {
+function guardPopups(page: PlaywrightPage, isClaimed: (popup: PlaywrightPage) => boolean, opened: PlaywrightPage[]): void {
   try {
     page.on?.('popup', popup => {
-      if (isClaimed === undefined) {
-        void popup.close().catch(() => {})
-        return
-      }
+      // Noted first, so teardown closes it even if the deferred close below
+      // never gets its turn (a fetch that ends in the same tick).
+      if (!opened.includes(popup)) opened.push(popup)
+      // A page this fetch opened is watched in turn: a tab it spawns is either
+      // adopted by a later step or closed, one level down.
+      guardPopups(popup, isClaimed, opened)
       // A target may adopt this page: the step's waiter is a listener on the
       // same event, registered after this one, so the close waits a tick for
       // that claim. A page nobody claims is still closed, exactly as before.

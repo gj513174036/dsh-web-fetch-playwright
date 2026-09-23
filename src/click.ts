@@ -33,6 +33,12 @@ import { labelledCandidates, type Candidate, type WaitCondition } from './target
 /** How long the page gets to answer the click probe. */
 export const CLICK_TIMEOUT_MS = 5_000
 
+/**
+ * A fragment every click script contains, so a test double can tell a click
+ * probe from the other probes without copying a piece of the script's text.
+ */
+export const CLICK_SCRIPT_MARKER = 'const watch = '
+
 /** What one click attempt came to. */
 export type ClickOutcome =
   /**
@@ -75,7 +81,7 @@ export function clickScript(candidates: readonly Candidate[], watch?: WaitCondit
   const watched = watch !== undefined && watch.kind === 'text' ? JSON.stringify({ text: watch.text, absent: watch.absent === true }) : 'null'
   return `(() => {
   const candidates = ${JSON.stringify(labelledCandidates(candidates))};
-  const watch = ${watched};
+  ${CLICK_SCRIPT_MARKER}${watched};
   ${spliceFragments(PAGE_FRAGMENTS)}
   const before = watch === null ? null : (visibleTextOf().indexOf(watch.text) >= 0) !== watch.absent;
   const found = resolveCandidates(candidates);

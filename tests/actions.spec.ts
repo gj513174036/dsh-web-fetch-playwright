@@ -7,6 +7,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { describeCondition, renderActionSummary, runTargetActions, textProbeScript } from '../src/actions.ts'
+import { CLICK_SCRIPT_MARKER } from '../src/click.ts'
 import type { ActionFailure, ActionRun } from '../src/actions.ts'
 import type { ActionStep, Candidate, CheckStep, ClickStep, Target, TypeStep, WaitStep } from '../src/targets.ts'
 import type { PlaywrightPage } from '../src/types.ts'
@@ -39,7 +40,7 @@ function clickPage(answer: unknown | (() => unknown)): PlaywrightPage {
   return pageWith({
     evaluate: async (script) => {
       // Only the click script carries a watch.
-      if (!script.includes('const watch = ')) return true
+      if (!script.includes(CLICK_SCRIPT_MARKER)) return true
       return typeof answer === 'function' ? (answer as () => unknown)() : answer
     },
   })
@@ -322,7 +323,7 @@ describe('runTargetActions, the state condition', () => {
       evaluate: async (script) => {
         if (script.includes('const accept = ')) return holds
         if (script.includes('const want = ')) return holds
-        if (script.includes('const watch = ')) return { ok: true, candidate: 'selector "#a" -> button' }
+        if (script.includes(CLICK_SCRIPT_MARKER)) return { ok: true, candidate: 'selector "#a" -> button' }
         return true
       },
     })
@@ -376,7 +377,7 @@ describe('runTargetActions, a step that opens a page', () => {
   function openerPage(opened: PlaywrightPage | null): PlaywrightPage {
     return {
       url: () => 'https://a.example/search',
-      evaluate: async (script: string) => (script.includes('const watch = ') ? { ok: true, candidate: 'selector "#go" -> link' } : true),
+      evaluate: async (script: string) => (script.includes(CLICK_SCRIPT_MARKER) ? { ok: true, candidate: 'selector "#go" -> link' } : true),
       on: (event: string, listener: (page: PlaywrightPage) => void) => {
         if (event === 'popup' && opened !== null) queueMicrotask(() => listener(opened))
       },
