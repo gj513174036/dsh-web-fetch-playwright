@@ -36,7 +36,7 @@ describe('page fragments', () => {
   it('ships bundles that are self-contained', () => {
     // The failure this catches is the one that bit the extraction: a consumer
     // picked the fragments it thought it needed and named one it had left out.
-    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function"', '')).toBe(true)
+    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof reachabilityOf === "function"', '')).toBe(true)
     expect(withFragments<boolean>(DISMISS_FRAGMENTS, 'typeof isConsentDocument === "function" && typeof accessibleNameOf === "function"', '')).toBe(true)
   })
 
@@ -73,6 +73,48 @@ describe('page fragments', () => {
         dom.window.document.elementFromPoint = ((x: number, y: number) => dom.window.document.elementFromPoint === undefined ? null : dom.window.document.querySelector('button')) as unknown as Document['elementFromPoint']
       })
       expect(clear).toBe('')
+    })
+  })
+
+  describe('roleOf', () => {
+    it('reads the role a control has, not only the one it declares', () => {
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("button"))', '<button>go</button>')).toBe('button')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("a"))', '<a href="/x">go</a>')).toBe('link')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("input"))', '<input type="submit" value="go">')).toBe('button')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("input"))', '<input type="search">')).toBe('searchbox')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("input"))', '<input type="text">')).toBe('textbox')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("select"))', '<select></select>')).toBe('combobox')
+    })
+
+    it('lets a declared role win, and answers nothing for what it does not map', () => {
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("div"))', '<div role="tab">go</div>')).toBe('tab')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("a"))', '<a>no href</a>')).toBe('')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'roleOf(document.querySelector("div"))', '<div>plain</div>')).toBe('')
+    })
+  })
+
+  describe('reachabilityOf', () => {
+    it('says nothing for a control a person can hit', () => {
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<button>go</button>')).toBe('')
+    })
+
+    it('counts a hidden input as reachable through its label, and not otherwise', () => {
+      // The gate's checkboxes: the input has no box, the label a person clicks does.
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("input"))', '<label><input type="checkbox"> 全选</label>')).toBe('')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("input"))', '<div><input type="checkbox"></div>')).toBe('not laid out')
+    })
+
+    it('refuses a disabled control, however it says so', () => {
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<button disabled>go</button>')).toBe('disabled')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("div"))', '<div role="button" aria-disabled="true">go</div>')).toBe('disabled')
+    })
+
+    it('refuses a control something else is sitting on', () => {
+      const covered = withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<div id="overlay"></div><button>go</button>', (dom) => {
+        const overlay = dom.window.document.getElementById('overlay')
+        dom.window.document.elementFromPoint = (() => overlay) as unknown as Document['elementFromPoint']
+      })
+      expect(covered).toBe('covered')
     })
   })
 

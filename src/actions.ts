@@ -1,24 +1,27 @@
 /**
  * Running a target's actions.
  *
- * The runner is deliberately dull: for each step it evaluates the step's
- * condition until it holds or the step's ceiling runs out, and a step that never
- * holds either fails the whole fetch (loudly, naming the step) or, if it was
- * declared `optional`, is skipped and recorded. Nothing here guesses and nothing
- * degrades quietly — the failure modes this project keeps paying for are "it
- * looked like it worked" and "it quietly did less".
+ * The runner is deliberately dull: for each step it either evaluates the step's
+ * condition until it holds, or clicks the first reachable candidate; a step that
+ * does not get there either fails the whole fetch (loudly, naming the step) or,
+ * if it was declared `optional`, is skipped and recorded. Nothing here guesses
+ * and nothing degrades quietly — the failure modes this project keeps paying for
+ * are "it looked like it worked" and "it quietly did less".
  *
  * The condition is the post-condition. That is why `waitFor` is the verb that
  * carries the honesty of everything after it: a `click` cannot assert its own
  * effect (what a click does differs per page), so the *wait* that follows is what
- * turns "a click was dispatched" into "the page did what the target claims".
+ * turns "a click was dispatched" into "the page did what the target claims". A
+ * click with no such wait after it is reported as **unverified** — the gap is
+ * shown rather than hidden, which is the whole point of the summary.
  *
  * @module dsh-web-fetch-playwright/actions
  */
 
 import type { PlaywrightPage } from './types.ts'
+import { clickCandidate } from './click.ts'
 import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
-import { urlIsUnder, type Target, type WaitCondition } from './targets.ts'
+import { describeCandidate, urlIsUnder, type ActionStep, type ClickStep, type Target, type WaitCondition, type WaitStep } from './targets.ts'
 
 /** Longest one step may take, before the fetch's own remaining budget caps it. */
 export const STEP_CEILING_MS = 10_000
@@ -26,13 +29,24 @@ export const STEP_CEILING_MS = 10_000
 /** How often a condition is re-checked while it is not yet true. */
 export const POLL_MS = 250
 
+/** How one step ended, as the summary reports it. */
+export type StepOutcome =
+  /** A condition held. */
+  | 'met'
+  /** An `optional` step did not, and the run carried on without it. */
+  | 'skipped'
+  /** A click was dispatched, and a later step confirmed the page changed. */
+  | 'clicked'
+  /** A click was dispatched, and no later `waitFor` confirmed anything. */
+  | 'unverified'
+
 /** One step's outcome, as the summary reports it. */
 export interface StepReport {
   readonly index: number
   readonly verb: string
-  /** What the step was waiting for, in words. */
+  /** What the step did or waited for, in words. */
   readonly detail: string
-  readonly outcome: 'met' | 'skipped'
+  readonly outcome: StepOutcome
 }
 
 /** What a completed run leaves behind. */
@@ -122,6 +136,27 @@ async function conditionHolds(
   return condition.absent === true ? !found : found
 }
 
+/** What a click step's candidates look like before anything is tried. */
+function describeCandidates(step: ClickStep): string {
+  return step.candidates.map(describeCandidate).join(', ')
+}
+
+/**
+ * Does a step after this one confirm that a click's effect happened?
+ *
+ * A `waitFor` confirms when it reported `met` and its condition is about the
+ * page — text or URL. A fixed wait asserts nothing (the clock passed whether or
+ * not the page moved), and an `optional` wait that was skipped confirms nothing
+ * either, which is why this reads the reports rather than the recipe alone.
+ */
+function clickConfirmed(actions: readonly ActionStep[], reports: readonly StepReport[], index: number): boolean {
+  return reports.some((report) => {
+    if (report.index <= index || report.outcome !== 'met') return false
+    const step = actions[report.index]
+    return step !== undefined && step.verb === 'waitFor' && step.condition.kind !== 'time'
+  })
+}
+
 /**
  * Run a target's actions against the page the fetch has open.
  *
@@ -141,9 +176,51 @@ export async function runTargetActions(
   const reports: StepReport[] = []
 
   for (const [index, step] of target.actions.entries()) {
+    const budget = Math.max(0, Math.min(ceiling, options.remainingMs()))
+    const failure = (detail: string): ActionOutcome => ({
+      ok: false,
+      failure: { index, verb: step.verb, detail, url: page.url() },
+    })
+
+    if (step.verb === 'click') {
+      const detail = `candidates: ${describeCandidates(step)}`
+      if (budget === 0) {
+        if (step.optional === true) {
+          reports.push({ index, verb: step.verb, detail: `${detail} (no budget left)`, outcome: 'skipped' })
+          continue
+        }
+        return failure(`${detail} (only 0ms of the step budget is left)`)
+      }
+      const outcome = await clickCandidate(page, step.candidates, budget)
+      if (outcome.kind === 'clicked') {
+        reports.push({ index, verb: step.verb, detail: outcome.candidate, outcome: 'clicked' })
+        continue
+      }
+      if (outcome.kind === 'clicked-unreported') {
+        // The click went out and the page navigated before the script could say
+        // which candidate landed. The following wait, if any, is what judges it.
+        reports.push({ index, verb: step.verb, detail: 'a candidate (the page navigated before it could say which)', outcome: 'clicked' })
+        continue
+      }
+      if (outcome.kind === 'unreadable') {
+        const why = `${detail} (the page could not be read: ${outcome.problem})`
+        if (step.optional === true) {
+          reports.push({ index, verb: step.verb, detail: why, outcome: 'skipped' })
+          continue
+        }
+        return failure(why)
+      }
+      // Every candidate was passed over: the page says so, with one reason each.
+      const why = `no candidate could be clicked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
+      if (step.optional === true) {
+        reports.push({ index, verb: step.verb, detail: why, outcome: 'skipped' })
+        continue
+      }
+      return failure(why)
+    }
+
     const detail = describeCondition(step.condition)
     const startedAt = Date.now()
-    const budget = Math.max(0, Math.min(ceiling, options.remainingMs()))
     let held = false
     let unanswerable = false
 
@@ -180,22 +257,24 @@ export async function runTargetActions(
       reports.push({ index, verb: step.verb, detail, outcome: 'skipped' })
       continue
     }
-    return {
-      ok: false,
-      failure: {
-        index,
-        verb: step.verb,
-        detail: unanswerable
-          ? `${detail} (the page could not be read)`
-          : exceedsBudget
-            ? `${detail} (only ${String(budget)}ms of the step budget is left)`
-            : `${detail} (not met within ${String(budget)}ms)`,
-        url: page.url(),
-      },
-    }
+    return failure(
+      unanswerable
+        ? `${detail} (the page could not be read)`
+        : exceedsBudget
+          ? `${detail} (only ${String(budget)}ms of the step budget is left)`
+          : `${detail} (not met within ${String(budget)}ms)`,
+    )
   }
 
-  return { ok: true, run: { steps: reports, finalUrl: page.url() } }
+  // The gap a click cannot close by itself: with no later `waitFor` that held,
+  // the summary must not imply the page changed. Marking it here, once, keeps
+  // the verdict out of the verb's own code.
+  const marked = reports.map((report) =>
+    report.outcome === 'clicked' && !clickConfirmed(target.actions, reports, report.index)
+      ? { ...report, outcome: 'unverified' as const }
+      : report,
+  )
+  return { ok: true, run: { steps: marked, finalUrl: page.url() } }
 }
 
 /**
@@ -212,9 +291,14 @@ export async function runTargetActions(
  * @returns one line.
  */
 export function renderActionSummary(run: ActionRun, statusCode: number): string {
-  const parts = run.steps.map((step) => {
-    const mark = step.outcome === 'skipped' ? 'skipped' : 'met'
-    return `${String(step.index + 1)}. ${step.verb} ${step.detail} — ${mark}`
-  })
+  const parts = run.steps.map((step) => `${String(step.index + 1)}. ${step.verb} ${step.detail} — ${markOf(step.outcome)}`)
   return `actions: ${parts.join(' · ')} → final document ${run.finalUrl} (HTTP ${String(statusCode)})`
+}
+
+/** How one outcome reads in the summary line. */
+function markOf(outcome: StepOutcome): string {
+  if (outcome === 'skipped') return 'skipped'
+  if (outcome === 'unverified') return 'clicked (unverified)'
+  if (outcome === 'clicked') return 'clicked'
+  return 'met'
 }

@@ -1,17 +1,17 @@
 /**
  * Running a target's actions.
  *
- * The page is faked to the two members the runner actually uses (its URL and its
+ * The page is faked to the member the runner actually uses (its URL and its
  * scripting seam), so each case states a condition and observes the outcome: met,
- * skipped, or the failure that names the step.
+ * skipped, clicked, unverified, or the failure that names the step.
  */
 import { describe, expect, it } from 'vitest'
 import { describeCondition, renderActionSummary, runTargetActions, textProbeScript } from '../src/actions.ts'
 import type { ActionFailure, ActionRun } from '../src/actions.ts'
-import type { Target, WaitStep } from '../src/targets.ts'
+import type { ActionStep, Candidate, ClickStep, Target, WaitStep } from '../src/targets.ts'
 import type { PlaywrightPage } from '../src/types.ts'
 
-const target = (...steps: readonly WaitStep[]): Target => ({
+const target = (...steps: readonly ActionStep[]): Target => ({
   name: 't',
   match: { kind: 'prefix', url: 'https://a.example/search' },
   actions: steps,
@@ -20,9 +20,24 @@ const target = (...steps: readonly WaitStep[]): Target => ({
 const text = (value: string, absent?: boolean): WaitStep =>
   absent === true ? { verb: 'waitFor', condition: { kind: 'text', text: value, absent: true } } : { verb: 'waitFor', condition: { kind: 'text', text: value } }
 
+const click = (...candidates: readonly Candidate[]): ClickStep => ({ verb: 'click', candidates })
+
 function pageWith(options: { url?: string; evaluate?: (script: string) => Promise<unknown> }): PlaywrightPage {
   const base = { url: () => options.url ?? 'https://a.example/search' }
   return (options.evaluate === undefined ? base : { ...base, evaluate: options.evaluate }) as unknown as PlaywrightPage
+}
+
+/**
+ * A page that answers the click probe and the text probes separately, so one
+ * fake can stand behind a recipe that both clicks and waits.
+ */
+function clickPage(answer: unknown | (() => unknown)): PlaywrightPage {
+  return pageWith({
+    evaluate: async (script) => {
+      if (!script.includes('const candidates = ')) return true
+      return typeof answer === 'function' ? (answer as () => unknown)() : answer
+    },
+  })
 }
 
 const options = { remainingMs: () => 5_000, stepCeilingMs: 20, pollMs: 1 }
@@ -126,6 +141,93 @@ describe('runTargetActions', () => {
   })
 })
 
+describe('runTargetActions, the click verb', () => {
+  const landed = { ok: true, candidate: 'text "查询" -> button' }
+
+  it('clicks, and counts the click as confirmed by the wait that follows', async () => {
+    const outcome = await runTargetActions(clickPage(landed), target(click({ kind: 'text', text: '查询' }), text('结果')), options)
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps).toEqual([
+      { index: 0, verb: 'click', detail: 'text "查询" -> button', outcome: 'clicked' },
+      { index: 1, verb: 'waitFor', detail: 'text "结果"', outcome: 'met' },
+    ])
+  })
+
+  it('marks a click that nothing after it confirmed as unverified', async () => {
+    // A recipe may end on a click; the summary then has to show the gap rather
+    // than let "clicked" read as "it worked".
+    const last = await runTargetActions(clickPage(landed), target(click({ kind: 'text', text: '查询' })), options)
+    expect(last.ok && last.run.steps.map((step) => step.outcome)).toEqual(['unverified'])
+
+    // A fixed wait asserts nothing about the page, so it confirms nothing.
+    const timed = await runTargetActions(clickPage(landed), target(click({ kind: 'text', text: '查询' }), { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }), options)
+    expect(timed.ok && timed.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
+
+    // An optional wait that was skipped confirms nothing either.
+    const skipped = await runTargetActions(
+      pageWith({
+        evaluate: async (script) => (script.includes('const candidates = ') ? landed : false),
+      }),
+      target(click({ kind: 'text', text: '查询' }), { ...text('也许出现'), optional: true }),
+      options,
+    )
+    expect(skipped.ok && skipped.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'skipped'])
+  })
+
+  it('counts a click whose page navigated out from under it, and lets the wait judge it', async () => {
+    const navigated = await runTargetActions(
+      clickPage(() => { throw new Error('Execution context was destroyed, most likely because of a navigation') }),
+      target(click({ kind: 'text', text: '商品标题' }), text('结果')),
+      options,
+    )
+    expect(navigated.ok).toBe(true)
+    if (!navigated.ok) return
+    expect(navigated.run.steps[0]?.outcome).toBe('clicked')
+    expect(navigated.run.steps[0]?.detail).toContain('the page navigated')
+  })
+
+  it('fails loudly when every candidate was passed over, and says why for each', async () => {
+    const missed = { ok: false, tried: ['selector "#off": matched 1, none reachable (disabled)', 'text "查询": no match'] }
+    const outcome = await runTargetActions(clickPage(missed), target(click({ kind: 'text', text: '查询' })), options)
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.index).toBe(0)
+    expect(failure.verb).toBe('click')
+    expect(failure.url).toBe('https://a.example/search')
+    expect(failure.detail).toContain('no candidate could be clicked, out of text "查询"')
+    expect(failure.detail).toContain('selector "#off": matched 1, none reachable (disabled)')
+    expect(failure.detail).toContain('text "查询": no match')
+  })
+
+  it('fails when the page cannot be read at all, since that is not a click', async () => {
+    const outcome = await runTargetActions(clickPage(false), target(click({ kind: 'text', text: '查询' })), options)
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('the page could not be read')
+  })
+
+  it('skips an optional click that cannot land, and runs the rest', async () => {
+    const outcome = await runTargetActions(
+      clickPage({ ok: false, tried: ['text "关闭广告": no match'] }),
+      target({ ...click({ kind: 'text', text: '关闭广告' }), optional: true }, { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }),
+      options,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['skipped', 'met'])
+    expect(outcome.run.steps[0]?.detail).toContain('text "关闭广告": no match')
+  })
+
+  it('does not send a click to a page it has no budget left for', async () => {
+    let asked = 0
+    const page = pageWith({ evaluate: async () => { asked += 1; return landed } })
+    const outcome = await runTargetActions(page, target(click({ kind: 'text', text: '查询' })), { remainingMs: () => 0, stepCeilingMs: 20, pollMs: 1 })
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('only 0ms of the step budget is left')
+    expect(asked).toBe(0)
+  })
+})
+
 describe('textProbeScript', () => {
   it('carries the needle safely, whatever it contains', () => {
     const script = textProbeScript('He said "hi"\n结果 \\ end')
@@ -139,6 +241,8 @@ describe('renderActionSummary', () => {
     steps: [
       { index: 0, verb: 'waitFor', detail: 'text "结果"', outcome: 'met' },
       { index: 1, verb: 'waitFor', detail: 'text "弹窗" to disappear', outcome: 'skipped' },
+      { index: 2, verb: 'click', detail: 'text "查询" -> button', outcome: 'unverified' },
+      { index: 3, verb: 'click', detail: 'selector "#next" -> link', outcome: 'clicked' },
     ],
     finalUrl: 'https://a.example/results',
   }
@@ -150,6 +254,8 @@ describe('renderActionSummary', () => {
     expect(summary).not.toContain('\n')
     expect(summary).toContain('1. waitFor text "结果" — met')
     expect(summary).toContain('2. waitFor text "弹窗" to disappear — skipped')
+    expect(summary).toContain('3. click text "查询" -> button — clicked (unverified)')
+    expect(summary).toContain('4. click selector "#next" -> link — clicked')
     expect(summary).toContain('final document https://a.example/results (HTTP 200)')
   })
 })

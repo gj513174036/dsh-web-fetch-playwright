@@ -60,7 +60,7 @@ function fakePersistentContext(spec: FakePageSpec = {}): { handle: PlaywrightPer
   const handle: PlaywrightPersistentContext = {
     newPage: async () => {
       state.pagesOpened++
-      const pageState: FakePageState = { pageClosed: false, gotos: 0 }
+      const pageState: FakePageState = { pageClosed: false, gotos: 0, waits: 0 }
       const page = makeFakePage(spec, pageState)
       const close = page.close.bind(page)
       return {
@@ -170,7 +170,7 @@ function installFakeLocalBackend(behavior: { failLaunch?: Error; failPersistentL
     launch: async (options) => {
       record.launches.push(options)
       if (behavior.failLaunch !== undefined) throw behavior.failLaunch
-      const pageState: FakePageState = { pageClosed: false, gotos: 0 }
+      const pageState: FakePageState = { pageClosed: false, gotos: 0, waits: 0 }
       const page = makeFakePage(behavior.page ?? {}, pageState)
       const context: PlaywrightContext = {
         newPage: async () => page,
@@ -279,6 +279,8 @@ interface FakePageState {
   pageClosed: boolean
   /** How many `goto` calls the page served. */
   gotos: number
+  /** How many `waitForLoadState` calls the page served. */
+  waits: number
 }
 
 function fakeResponse(spec: FakePageSpec, entry?: NonNullable<FakePageSpec['gotoScript']>[number]): PlaywrightResponse | null {
@@ -352,6 +354,7 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
       return Promise.resolve(fakeResponse(spec, entry))
     },
     waitForLoadState: async () => {
+      state.waits++
       if (spec.networkIdleError === true) throw new Error('networkidle timeout')
     },
     url: () => spec.finalUrl ?? 'https://final.example.com/docs',
@@ -384,7 +387,7 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
 }
 
 function fakeSession(spec: FakePageSpec): BrowserSession {
-  const pageState: FakePageState = { pageClosed: false, gotos: 0 }
+  const pageState: FakePageState = { pageClosed: false, gotos: 0, waits: 0 }
   const closed = { context: false, browser: false }
   const page = makeFakePage(spec, pageState)
   const context: PlaywrightContext = {
@@ -403,6 +406,7 @@ function fakeSession(spec: FakePageSpec): BrowserSession {
     closed: {
       get pageClosed() { return pageState.pageClosed },
       get gotos() { return pageState.gotos },
+      get waits() { return pageState.waits },
       get context() { return closed.context },
       get browser() { return closed.browser },
     },
@@ -503,7 +507,7 @@ function fakeCdpConnection(spec: FakePageSpec = {}, capture: FakeCaptureScript =
   }
   const makePage = (): PlaywrightPage => {
     state.pagesOpened++
-    const pageState = { pageClosed: false, gotos: 0 }
+    const pageState = { pageClosed: false, gotos: 0, waits: 0 }
     const page = makeFakePage(spec, pageState, state.popupListeners)
     const base = page.close.bind(page)
     return {
@@ -558,6 +562,16 @@ async function codeOf(promise: Promise<unknown>): Promise<string> {
     const webError = error as WebError
     if (webError instanceof WebError) return webError.code
     throw error
+  }
+  throw new Error('expected the fetch to reject')
+}
+
+/** The message of the error a fetch rejects with — the words the caller sees. */
+async function messageOf(promise: Promise<unknown>): Promise<string> {
+  try {
+    await promise
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
   }
   throw new Error('expected the fetch to reject')
 }
@@ -782,6 +796,72 @@ describe('PlaywrightFetchProvider', () => {
       new FakeProvider({ targetsFile }, { contentType: 'application/json', textBody: '{"ok":true}' }).fetch({ url: 'https://example.com/api' }),
     )
     expect(code).toBe('WEB_FETCH_TARGET')
+  })
+
+  const clickText = (text: string, optional = false): string =>
+    `{ "verb": "click", "candidates": [ { "text": "${text}" } ]${optional ? ', "optional": true' : ''} }`
+
+  it('clicks a candidate, and counts the click as confirmed by the wait that follows', async () => {
+    const targetsFile = targetFor('https://example.com/docs', `${clickText('查询')}, ${waitText('World')}`)
+    const result = await new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, candidate: 'text "查询" -> button' }, true],
+    }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('> actions: 1. click text "查询" -> button — clicked')).toBe(true)
+    expect(content).toContain('2. waitFor text "World" — met → final document https://final.example.com/docs (HTTP 200)')
+  })
+
+  it('shows a click that nothing after it confirmed as unverified', async () => {
+    // A recipe may end on a click. The summary then has to carry the doubt, so
+    // "clicked" never reads as "the page changed".
+    const targetsFile = targetFor('https://example.com/docs', clickText('查询'))
+    const result = await new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, candidate: 'text "查询" -> button' }],
+    }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content).toContain('1. click text "查询" -> button — clicked (unverified)')
+  })
+
+  it('fails the fetch when no click candidate can land, naming the step, the candidates and the URL', async () => {
+    const targetsFile = targetFor('https://example.com/docs', `${clickText('查询')}, ${waitText('World')}`)
+    const message = await messageOf(new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: false, tried: ['selector "#off": matched 1, none reachable (disabled)', 'text "查询": no match'] }],
+    }).fetch({ url: 'https://example.com/docs' }))
+    expect(message).toContain('target "docs" step 1 (click) did not hold')
+    expect(message).toContain('no candidate could be clicked, out of text "查询"')
+    expect(message).toContain('selector "#off": matched 1, none reachable (disabled)')
+    expect(message).toContain('text "查询": no match')
+    expect(message).toContain('at https://final.example.com/docs')
+  })
+
+  it('records an optional step that was skipped, and still reads the page', async () => {
+    const targetsFile = targetFor('https://example.com/docs', `${clickText('关闭广告', true)}, ${waitText('World')}`)
+    const result = await new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: false, tried: ['text "关闭广告": no match'] }, true],
+    }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content).toContain('— skipped')
+    expect(content).toContain('text "关闭广告": no match')
+    expect(content).toContain('2. waitFor text "World" — met')
+  })
+
+  it('lets a click’s navigation land before it re-describes the result', async () => {
+    // The click can navigate; the URL and status in the summary must describe the
+    // document it landed on, so one more bounded settle runs. A recipe of waits
+    // alone does not pay for it.
+    const clicked = targetFor('https://example.com/docs', `${clickText('查询')}, ${waitText('World')}`)
+    const clickedProvider = new FakeProvider({ targetsFile: clicked }, {
+      evaluateQueue: [{ ok: true, candidate: 'text "查询" -> button' }, true],
+    })
+    await clickedProvider.fetch({ url: 'https://example.com/docs' })
+
+    const waited = targetFor('https://example.com/docs', waitText('World'))
+    const waitedProvider = new FakeProvider({ targetsFile: waited }, { evaluateResult: true })
+    await waitedProvider.fetch({ url: 'https://example.com/docs' })
+
+    const waitsOf = (provider: FakeProvider): number =>
+      (provider.lastSession as unknown as { closed: { waits: number } }).closed.waits
+    expect(waitsOf(clickedProvider)).toBeGreaterThan(waitsOf(waitedProvider))
   })
 
   it('wraps the summary as a blockquote element when the body is raw HTML', async () => {
@@ -1122,7 +1202,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     await provider.fetch({ url: 'https://example.com/popup-spawner' })
     expect(state.popupListeners.length).toBeGreaterThan(0) // the guard attached
 
-    const popupState = { pageClosed: false, gotos: 0 }
+    const popupState = { pageClosed: false, gotos: 0, waits: 0 }
     const popup = makeFakePage({}, popupState)
     for (const listener of state.popupListeners) listener(popup) // page spawned a popup
     expect(popupState.pageClosed).toBe(true)

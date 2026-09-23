@@ -1,11 +1,11 @@
 /**
  * The page fragments every in-page script shares.
  *
- * Three scripts now read the same page and would otherwise each answer the same
- * four questions in their own words: does this element occupy layout, which
- * `<label>` controls it, what is its accessible name, and is something else
- * sitting on top of it. Two of those answers are non-obvious and both were
- * learned the hard way on a real consent gate:
+ * Four scripts now read the same page and would otherwise each answer the same
+ * questions in their own words: does this element occupy layout, which
+ * `<label>` controls it, what is its accessible name, what is its role, and is
+ * something else sitting on top of it. Two of those answers are non-obvious and
+ * both were learned the hard way on a real consent gate:
  *
  * - A hidden checkbox has no text of its own, so its name lives in the label
  *   around it — and its `value` is the literal string `on`, which must never be
@@ -106,6 +106,63 @@ export const FRAGMENT_HOST = `const hostOf = (el) => {
 export const CONSENT_CONTEXT = /cookie|consent|privacy|gdpr|同意|隐私/i
 
 /**
+ * The element's role, as far as a target needs one.
+ *
+ * A small mapping rather than the ARIA specification: the roles a target
+ * actually names (button, link, checkbox, radio, tab, textbox, searchbox,
+ * combobox), with the explicit `role` attribute first because it overrides the
+ * tag. An element outside the mapping answers `''` — it stays reachable by
+ * selector or by text, so the gap costs one candidate kind, never a control.
+ *
+ * Roles come from a fixed table instead of the accessibility tree because the
+ * scripts run in whatever backend the fetch has, and the tree is not part of the
+ * seam this plugin owns.
+ */
+export const FRAGMENT_ROLE = `const roleOf = (el) => {
+    const explicit = (el.getAttribute('role') || '').trim().toLowerCase();
+    if (explicit !== '') return explicit;
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'button') return 'button';
+    if (tag === 'a' || tag === 'area') return el.hasAttribute('href') ? 'link' : '';
+    if (tag === 'input') {
+      if (type === 'submit' || type === 'button' || type === 'reset' || type === 'image') return 'button';
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'search') return 'searchbox';
+      if (type === 'range') return 'slider';
+      if (type === 'number') return 'spinbutton';
+      if (type === 'hidden') return '';
+      return 'textbox';
+    }
+    if (tag === 'select') return el.hasAttribute('multiple') ? 'listbox' : 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'summary') return 'button';
+    if (tag === 'option') return 'option';
+    return '';
+  };`
+
+/**
+ * Why this control cannot be acted on, or `''` when it can be.
+ *
+ * The single answer to "is this reachable", asked *before* anything is clicked:
+ * a disabled control does nothing, a control with no box cannot be hit, and a
+ * laid-out control can still be covered by the element that would really receive
+ * the click. The last one is measured on whatever a person would hit — the
+ * element itself, or the `<label>` that forwards a click to it — because that is
+ * the difference between "the click was dispatched" and "the page did what the
+ * target claims".
+ */
+export const FRAGMENT_REACHABILITY = `const reachabilityOf = (el) => {
+    if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') return 'disabled';
+    const host = hostOf(el);
+    if (host === 'hidden') return 'not laid out';
+    const visible = host === 'label' ? labelHostOf(el) : el;
+    if (visible !== null && coverageOf(visible) !== '') return 'covered';
+    return '';
+  };`
+
+/**
  * The page's visible text.
  *
  * `innerText` is what a person sees; it does not exist everywhere (jsdom, where
@@ -145,7 +202,9 @@ export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_LABEL_HOST,
   FRAGMENT_HOST,
   FRAGMENT_ACCESSIBLE_NAME,
+  FRAGMENT_ROLE,
   FRAGMENT_COVERAGE,
+  FRAGMENT_REACHABILITY,
 ]
 
 /** The consent fragments, in the order they must be declared. */

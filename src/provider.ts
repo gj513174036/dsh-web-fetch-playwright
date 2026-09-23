@@ -1061,6 +1061,14 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           WEB_FETCH_ACTION_CODE,
         )
       }
+      // A dispatched click can navigate — the recipe's own wait may have been
+      // satisfied by the URL alone — so let the navigation land before
+      // re-describing the result. Bounded, and only when a click actually went
+      // out: a recipe of waits alone must behave exactly as it did before.
+      const clicked = outcome.run.steps.some((step) => step.verb === 'click' && step.outcome !== 'skipped')
+      if (clicked) {
+        await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
+      }
       const settled = settledDocument()
       finalUrl = settled.url
       statusCode = settled.statusCode

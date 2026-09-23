@@ -5,7 +5,7 @@
  * than on a browser: what a bad file says, and which target a URL gets.
  */
 import { describe, expect, it } from 'vitest'
-import { matchesTarget, normalizedUrl, parseTargets, selectTarget } from '../src/targets.ts'
+import { describeCandidate, matchesTarget, normalizedUrl, parseTargets, selectTarget } from '../src/targets.ts'
 import type { Target } from '../src/targets.ts'
 
 /** One target's file, with `actions` being the comma-separated steps. */
@@ -106,9 +106,13 @@ describe('parseTargets', () => {
       { "verb": "waitFor", "condition": { "kind": "url", "url": "https://a.example/gate", "absent": true } },
       { "verb": "waitFor", "condition": { "kind": "time", "ms": 250 }, "optional": true }`
     const step = targetsOf(file(actions))[0]?.actions
-    expect(step?.[1]?.condition).toEqual({ kind: 'text', text: '加载中', absent: true })
-    expect(step?.[2]?.condition).toEqual({ kind: 'url', url: 'https://a.example/results' })
-    expect(step?.[3]?.condition).toEqual({ kind: 'url', url: 'https://a.example/gate', absent: true })
+    const conditionOf = (index: number): unknown => {
+      const entry = step?.[index]
+      return entry?.verb === 'waitFor' ? entry.condition : undefined
+    }
+    expect(conditionOf(1)).toEqual({ kind: 'text', text: '加载中', absent: true })
+    expect(conditionOf(2)).toEqual({ kind: 'url', url: 'https://a.example/results' })
+    expect(conditionOf(3)).toEqual({ kind: 'url', url: 'https://a.example/gate', absent: true })
     expect(step?.[4]).toEqual({ verb: 'waitFor', condition: { kind: 'time', ms: 250 }, optional: true })
   })
 
@@ -120,11 +124,55 @@ describe('parseTargets', () => {
     expect(errorOf(file(waitText, '{ "kind": "regex", "url": "https://a.example/x" }'))).toContain('targets[0].match.kind')
     expect(errorOf(file(waitText, '{ "kind": "prefix", "url": "not a url" }'))).toContain('targets[0].match.url')
     expect(errorOf(file(''))).toContain('targets[0].actions')
-    expect(errorOf(file('{ "verb": "click" }'))).toContain('targets[0].actions[0].verb')
+    expect(errorOf(file('{ "verb": "press", "key": "Enter" }'))).toContain('targets[0].actions[0].verb')
+    expect(errorOf(file('{ "verb": "click" }'))).toContain('targets[0].actions[0].candidates')
+    expect(errorOf(file('{ "verb": "click", "candidates": [] }'))).toContain('can never match')
     expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "text", "text": "" } }'))).toContain('.condition.text')
     expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "time", "ms": -1 } }'))).toContain('.condition.ms')
     expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "text", "text": "x" }, "condtion": 1 }'))).toContain('unknown key "condtion"')
     expect(errorOf(file(waitText, undefined, ''))).toContain('targets[0].name')
+  })
+
+  it('reads a click step and every candidate kind, in the order written', () => {
+    const click = `{ "verb": "click", "candidates": [
+      { "selector": "#search-btn" },
+      { "text": "查询" },
+      { "role": "button", "name": "Search" } ] }`
+    expect(targetsOf(file(click))[0]?.actions[0]).toEqual({
+      verb: 'click',
+      candidates: [
+        { kind: 'selector', selector: '#search-btn' },
+        { kind: 'text', text: '查询' },
+        { kind: 'role', role: 'button', name: 'Search' },
+      ],
+    })
+  })
+
+  it('keeps `optional` available on a click, since a popup may or may not be there', () => {
+    const click = `{ "verb": "click", "candidates": [ { "text": "关闭" } ], "optional": true }`
+    expect(targetsOf(file(click))[0]?.actions[0]).toEqual({ verb: 'click', candidates: [{ kind: 'text', text: '关闭' }], optional: true })
+  })
+
+  it('refuses a candidate that is malformed, ambiguous or unnamed', () => {
+    const click = (candidates: string): string => file(`{ "verb": "click", "candidates": [${candidates}] }`)
+    // One kind per candidate: mixing them would smuggle in an order the recipe
+    // should state itself.
+    expect(errorOf(click('{ "selector": "#a", "text": "b" }'))).toContain('unknown key "text"')
+    expect(errorOf(click('{ "selector": "" }'))).toContain('.candidates[0].selector')
+    expect(errorOf(click('{ "text": "   " }'))).toContain('.candidates[0].text')
+    expect(errorOf(click('{ "role": "button" }'))).toContain('.candidates[0].name')
+    expect(errorOf(click('{ "name": "查询" }'))).toContain('beside a "role"')
+    expect(errorOf(click('{ "id": "a" }'))).toContain('.candidates[0]: expected one of')
+    expect(errorOf(click('"#a"'))).toContain('.candidates[0]: expected an object')
+    expect(errorOf(click('{ "role": "", "name": "x" }'))).toContain('.candidates[0].role')
+    expect(errorOf(file('{ "verb": "click", "candidates": [ { "text": "x" } ], "condtion": 1 }'))).toContain('unknown key "condtion"')
+    expect(errorOf(file('{ "verb": "waitFor", "candidates": [ { "text": "x" } ] }'))).toContain('unknown key "candidates"')
+  })
+
+  it('describes a candidate the same way everywhere it is named', () => {
+    expect(describeCandidate({ kind: 'selector', selector: '#a' })).toBe('selector "#a"')
+    expect(describeCandidate({ kind: 'text', text: '查询' })).toBe('text "查询"')
+    expect(describeCandidate({ kind: 'role', role: 'button', name: 'Search' })).toBe('role button "Search"')
   })
 
   it('allows two targets to share a name, since names never select', () => {

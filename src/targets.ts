@@ -42,6 +42,18 @@ export type WaitCondition =
   | { readonly kind: 'url'; readonly url: string; readonly absent?: boolean }
   | { readonly kind: 'time'; readonly ms: number }
 
+/**
+ * One way to name a control: an intent's ordered candidates, tried until one is
+ * reachable (ADR-0002). Three kinds, because each covers what the others cannot
+ * — a selector is exact but breaks with the markup, a text is what a person
+ * reads, and a role with an accessible name is what an assistive technology
+ * sees, which is also what survives a re-styled control.
+ */
+export type Candidate =
+  | { readonly kind: 'selector'; readonly selector: string }
+  | { readonly kind: 'text'; readonly text: string }
+  | { readonly kind: 'role'; readonly role: string; readonly name: string }
+
 /** A step that waits for a condition before the fetch reads the document. */
 export interface WaitStep {
   readonly verb: 'waitFor'
@@ -50,11 +62,30 @@ export interface WaitStep {
   readonly optional?: boolean
 }
 
+/**
+ * A step that clicks the first reachable candidate.
+ *
+ * The click does not assert its own effect — what a click does differs per page,
+ * so a universal post-condition could only be a guess. The `waitFor` after it is
+ * what turns "a click was dispatched" into "the page did what the target
+ * claims"; with no such wait, the summary says the step is unverified.
+ */
+export interface ClickStep {
+  readonly verb: 'click'
+  /** Tried in order; the first reachable one is clicked, and the rest are not. */
+  readonly candidates: readonly Candidate[]
+  /** When true, failing this step is skipped and recorded instead of fatal. */
+  readonly optional?: boolean
+}
+
+/** One step of a recipe. */
+export type ActionStep = WaitStep | ClickStep
+
 /** A named recipe for one page. */
 export interface Target {
   readonly name: string
   readonly match: TargetMatch
-  readonly actions: readonly WaitStep[]
+  readonly actions: readonly ActionStep[]
 }
 
 /** The parsed file, or the reason it is unusable. */
@@ -170,6 +201,21 @@ function at(path: string): string {
   return path === '' ? 'targets file' : path
 }
 
+/**
+ * How a candidate reads in a summary or a failure message.
+ *
+ * One wording for every place that names a candidate, so a failure message and
+ * the summary line above it describe the same attempt the same way.
+ *
+ * @param candidate - the candidate.
+ * @returns e.g. `selector "#search"`, `text "查询"`, `role button "Search"`.
+ */
+export function describeCandidate(candidate: Candidate): string {
+  if (candidate.kind === 'selector') return `selector ${JSON.stringify(candidate.selector)}`
+  if (candidate.kind === 'text') return `text ${JSON.stringify(candidate.text)}`
+  return `role ${candidate.role} ${JSON.stringify(candidate.name)}`
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -232,19 +278,86 @@ function parseCondition(value: unknown, path: string): { condition: WaitConditio
   return { error: `${at(path)}.kind: expected "text", "url" or "time"` }
 }
 
-function parseStep(value: unknown, path: string): { step: WaitStep } | { error: string } {
+/**
+ * Parse one candidate.
+ *
+ * A candidate is exactly one kind — `{ selector }`, `{ text }` or
+ * `{ role, name }` — and a mixed one is refused rather than read as a priority
+ * order, because the order between candidates is the recipe's business and
+ * inside one there is none.
+ */
+function parseCandidate(value: unknown, path: string): { candidate: Candidate } | { error: string } {
   if (!isRecord(value)) return { error: `${at(path)}: expected an object` }
-  const unknown = unknownKeys(value, ['verb', 'condition', 'optional'], path)
-  if (unknown !== null) return { error: unknown }
-  const verb = value['verb']
-  if (verb !== 'waitFor') {
-    return { error: `${at(path)}.verb: expected "waitFor" (the other verbs are not implemented yet)` }
+  if ('selector' in value) {
+    const unknown = unknownKeys(value, ['selector'], path)
+    if (unknown !== null) return { error: unknown }
+    const selector = value['selector']
+    if (typeof selector !== 'string' || selector.trim() === '') {
+      return { error: `${at(path)}.selector: expected a non-empty CSS selector` }
+    }
+    return { candidate: { kind: 'selector', selector: selector.trim() } }
   }
-  const parsed = parseCondition(value['condition'], `${path}.condition`)
-  if ('error' in parsed) return { error: parsed.error }
-  const optional = value['optional']
-  if (optional !== undefined && typeof optional !== 'boolean') return { error: `${at(path)}.optional: expected a boolean` }
-  return { step: optional === true ? { verb, condition: parsed.condition, optional: true } : { verb, condition: parsed.condition } }
+  if ('text' in value) {
+    const unknown = unknownKeys(value, ['text'], path)
+    if (unknown !== null) return { error: unknown }
+    const text = value['text']
+    if (typeof text !== 'string' || text.trim() === '') {
+      return { error: `${at(path)}.text: expected the visible text of the control, e.g. "查询"` }
+    }
+    return { candidate: { kind: 'text', text: text.trim() } }
+  }
+  if ('role' in value) {
+    const unknown = unknownKeys(value, ['role', 'name'], path)
+    if (unknown !== null) return { error: unknown }
+    const role = value['role']
+    const name = value['name']
+    if (typeof role !== 'string' || role.trim() === '') {
+      return { error: `${at(path)}.role: expected an accessible role, e.g. "button" or "link"` }
+    }
+    if (typeof name !== 'string' || name.trim() === '') {
+      return { error: `${at(path)}.name: expected the accessible name the control must have, e.g. "查询"` }
+    }
+    return { candidate: { kind: 'role', role: role.trim().toLowerCase(), name: name.trim() } }
+  }
+  if ('name' in value) return { error: `${at(path)}.name: only means something beside a "role"` }
+  return {
+    error: `${at(path)}: expected one of { "selector": ... }, { "text": ... } or { "role": ..., "name": ... }`,
+  }
+}
+
+function parseStep(value: unknown, path: string): { step: ActionStep } | { error: string } {
+  if (!isRecord(value)) return { error: `${at(path)}: expected an object` }
+  const verb = value['verb']
+  if (verb === 'waitFor') {
+    const unknown = unknownKeys(value, ['verb', 'condition', 'optional'], path)
+    if (unknown !== null) return { error: unknown }
+    const parsed = parseCondition(value['condition'], `${path}.condition`)
+    if ('error' in parsed) return { error: parsed.error }
+    const optional = value['optional']
+    if (optional !== undefined && typeof optional !== 'boolean') return { error: `${at(path)}.optional: expected a boolean` }
+    return { step: optional === true ? { verb, condition: parsed.condition, optional: true } : { verb, condition: parsed.condition } }
+  }
+  if (verb === 'click') {
+    const unknown = unknownKeys(value, ['verb', 'candidates', 'optional'], path)
+    if (unknown !== null) return { error: unknown }
+    const candidates = value['candidates']
+    if (!Array.isArray(candidates)) {
+      return { error: `${at(path)}.candidates: expected an array of candidates, most precise first` }
+    }
+    if (candidates.length === 0) {
+      return { error: `${at(path)}.candidates: a click with no candidates can never match anything; give it one or remove the step` }
+    }
+    const parsed: Candidate[] = []
+    for (const [index, raw] of candidates.entries()) {
+      const candidate = parseCandidate(raw, `${path}.candidates[${String(index)}]`)
+      if ('error' in candidate) return { error: candidate.error }
+      parsed.push(candidate.candidate)
+    }
+    const optional = value['optional']
+    if (optional !== undefined && typeof optional !== 'boolean') return { error: `${at(path)}.optional: expected a boolean` }
+    return { step: optional === true ? { verb, candidates: parsed, optional: true } : { verb, candidates: parsed } }
+  }
+  return { error: `${at(path)}.verb: expected "waitFor" or "click" (the other verbs are not implemented yet)` }
 }
 
 function parseTarget(value: unknown, path: string): { target: Target } | { error: string } {
@@ -258,7 +371,7 @@ function parseTarget(value: unknown, path: string): { target: Target } | { error
   const actions = value['actions']
   if (!Array.isArray(actions)) return { error: `${at(path)}.actions: expected an array` }
   if (actions.length === 0) return { error: `${at(path)}.actions: a target with no actions does nothing; remove it or give it one` }
-  const steps: WaitStep[] = []
+  const steps: ActionStep[] = []
   for (const [index, raw] of actions.entries()) {
     const step = parseStep(raw, `${path}.actions[${String(index)}]`)
     if ('error' in step) return { error: step.error }

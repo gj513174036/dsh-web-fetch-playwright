@@ -1,0 +1,197 @@
+/**
+ * The `click` verb's in-page half: walk an ordered candidate list, and click the
+ * first candidate that is *reachable*.
+ *
+ * Reachability is checked before the click, never inferred from it: the control
+ * must exist, occupy layout (itself or through the `<label>` that forwards a
+ * click to it), be free of anything sitting on top of it, and not be disabled.
+ * All four questions already have one answer each in `page-fragments`, so this
+ * module asks them rather than answering them again.
+ *
+ * Two honesty rules shape the code:
+ *
+ * - **The click does not assert its own effect.** What a click does differs per
+ *   page, so a universal post-condition could only be a guess. This verb reports
+ *   which candidate landed, and nothing more; the `waitFor` after it is the
+ *   assertion, and the summary marks a click that no later `waitFor` confirmed
+ *   (see `actions.ts`). "A click was dispatched, so it must have worked" is the
+ *   failure mode this whole feature exists to remove.
+ * - **A click that navigates is not a failure.** The navigation can destroy the
+ *   execution context before the script returns its answer, so that one error is
+ *   recognised and reported as "clicked, and the page moved before the script
+ *   could say which candidate landed". Reporting it as unreachable would fail
+ *   every recipe whose click is a link.
+ *
+ * @module dsh-web-fetch-playwright/click
+ */
+
+import type { PlaywrightPage } from './types.ts'
+import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
+import { describeCandidate, type Candidate } from './targets.ts'
+
+/** How long the page gets to answer the click probe. */
+export const CLICK_TIMEOUT_MS = 5_000
+
+/**
+ * The controls a `text` or `role` candidate is allowed to consider.
+ *
+ * Deliberately the same neighbourhood for both kinds: a text candidate names a
+ * control by the words a person reads (its label, its value, its placeholder),
+ * and a role candidate names one by what it is — a search box a `type` step will
+ * write into is found by text or by `role: "searchbox"` just as a button is.
+ * Order within the page decides between matches, which is why the winner is
+ * named in the summary rather than left implicit.
+ */
+export const CANDIDATE_CONTROLS = 'button, a[href], input, select, textarea, label, summary, [role], [contenteditable="true"]'
+
+/** What one click attempt came to. */
+export type ClickOutcome =
+  /** A candidate was reachable and its click was dispatched. */
+  | { readonly kind: 'clicked'; readonly candidate: string }
+  /**
+   * The click went out and the page navigated before the script could report
+   * which candidate landed. Not a failure — the following `waitFor` is what says
+   * whether the page did what the target claims.
+   */
+  | { readonly kind: 'clicked-unreported' }
+  /** No candidate could be clicked; `reasons` holds one entry per candidate tried. */
+  | { readonly kind: 'not-clicked'; readonly reasons: readonly string[] }
+  /** The page could not be asked at all, which is never a click. */
+  | { readonly kind: 'unreadable'; readonly problem: string }
+
+/**
+ * The in-page resolver and click.
+ *
+ * Each candidate's description is computed here, by
+ * {@link describeCandidate}, and travels into the script as a `label` — one
+ * wording for the summary, the failure message and the recipe, instead of a
+ * second copy of the phrasing that can drift.
+ *
+ * @param candidates - the recipe's ordered candidates.
+ * @returns a script returning a `ClickOutcome`-shaped object.
+ */
+export function clickScript(candidates: readonly Candidate[]): string {
+  const encoded = candidates.map((candidate) => ({ ...candidate, label: describeCandidate(candidate) }))
+  return `(() => {
+  const candidates = ${JSON.stringify(encoded)};
+  const CONTROLS = ${JSON.stringify(CANDIDATE_CONTROLS)};
+  ${spliceFragments(PAGE_FRAGMENTS)}
+  const collapsed = (value) => String(value || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+  const matchesOf = (candidate) => {
+    if (candidate.kind === 'selector') {
+      try { return Array.prototype.slice.call(document.querySelectorAll(candidate.selector)) }
+      catch (error) { return null }
+    }
+    let found = [];
+    try { found = Array.prototype.slice.call(document.querySelectorAll(CONTROLS)) } catch (error) { return [] }
+    const wantedName = collapsed(candidate.kind === 'text' ? candidate.text : candidate.name);
+    const wantedRole = candidate.kind === 'role' ? candidate.role : null;
+    return found.filter((el) => {
+      if (wantedRole !== null && roleOf(el) !== wantedRole) return false;
+      return collapsed(accessibleNameOf(el)) === wantedName;
+    });
+  };
+  const tried = [];
+  for (const candidate of candidates) {
+    const matches = matchesOf(candidate);
+    if (matches === null) { tried.push(candidate.label + ': not a usable selector'); continue }
+    if (matches.length === 0) { tried.push(candidate.label + ': no match'); continue }
+    let winner = null;
+    const reasons = [];
+    for (const el of matches) {
+      const reason = reachabilityOf(el);
+      if (reason === '') { winner = el; break }
+      if (reasons.indexOf(reason) < 0) reasons.push(reason);
+    }
+    if (winner === null) {
+      tried.push(candidate.label + ': matched ' + matches.length + ', none reachable (' + reasons.join(', ') + ')');
+      continue;
+    }
+    const host = laidOut(winner) ? 'self' : 'label';
+    const hit = host === 'label' ? labelHostOf(winner) : winner;
+    if (hit === null) { tried.push(candidate.label + ': no label to click'); continue }
+    const landed = candidate.label + ' -> ' + (roleOf(hit) || hit.tagName.toLowerCase());
+    // A reachable candidate ends the walk whether or not its click worked: the
+    // order is the recipe's, so a later candidate must not be tried behind the
+    // author's back. A throw is reported rather than silently moved past.
+    try { hit.click() } catch (error) { return { ok: false, tried: tried.concat(landed + ': the click threw (' + String(error) + ')') } }
+    return { ok: true, candidate: landed };
+  }
+  return { ok: false, tried: tried };
+})()`
+}
+
+/** Sentinel for {@link raceTimeout}, distinct from any page answer. */
+const TIMED_OUT = Symbol('click-timeout')
+
+/**
+ * Settle `work`, or give up after `ms` — a stalled probe must not spend the
+ * fetch's budget.
+ *
+ * @param work - the promise to bound.
+ * @param ms - the budget in milliseconds.
+ * @returns the value, or {@link TIMED_OUT}.
+ */
+function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { resolve(TIMED_OUT) }, ms)
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
+}
+
+/**
+ * Does this failure describe the page moving out from under the script?
+ *
+ * The click is what caused it, so it cannot be read as "the control was not
+ * there" — and a phrase list is the only signal the seam gives. Kept narrow and
+ * in one place: anything else stays an honest "the page could not be read".
+ *
+ * @param error - what the scripting seam rejected with.
+ * @returns true when the page most likely navigated.
+ */
+export function looksLikeNavigation(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /execution context was destroyed|navigat|target closed|context or browser has been closed|frame was detached|has been closed/i.test(message)
+}
+
+/**
+ * Resolve and click, from the outside.
+ *
+ * @param page - the page the fetch has open.
+ * @param candidates - the recipe's ordered candidates.
+ * @param timeoutMs - budget for the attempt; must stay inside the step's ceiling.
+ * @returns what happened, in the four shapes {@link ClickOutcome} allows.
+ */
+export async function clickCandidate(
+  page: PlaywrightPage,
+  candidates: readonly Candidate[],
+  timeoutMs: number = CLICK_TIMEOUT_MS,
+): Promise<ClickOutcome> {
+  const evaluate = page.evaluate?.bind(page)
+  if (evaluate === undefined) {
+    return { kind: 'unreadable', problem: 'the page offers no scripting, so no candidate could be tried' }
+  }
+  let answer: unknown
+  try {
+    answer = await raceTimeout(evaluate(clickScript(candidates)), Math.max(0, timeoutMs))
+  } catch (error: unknown) {
+    if (looksLikeNavigation(error)) return { kind: 'clicked-unreported' }
+    return { kind: 'unreadable', problem: error instanceof Error ? error.message : String(error) }
+  }
+  if (answer === TIMED_OUT) return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
+  if (typeof answer !== 'object' || answer === null) {
+    return { kind: 'unreadable', problem: 'the page answered with something other than a click result' }
+  }
+  const shape = answer as { ok?: unknown; candidate?: unknown; tried?: unknown }
+  if (shape.ok === true) {
+    return { kind: 'clicked', candidate: typeof shape.candidate === 'string' ? shape.candidate : 'a candidate' }
+  }
+  const reasons = Array.isArray(shape.tried) ? shape.tried.filter((entry): entry is string => typeof entry === 'string') : []
+  return { kind: 'not-clicked', reasons }
+}
