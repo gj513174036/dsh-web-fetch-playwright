@@ -195,11 +195,48 @@
 **已确认要长期跑的站点**：`cn.iherb.com`（商品页）。它的路径已验证——`catalog.app.iherb.com/search/v2/{kw}`
 给出商品、价格、评分与图片地址，服务器直连可用，**不需要动作模型**。
 
-| # | 站点 | 类型 | 结论 | 意味着 |
-| --- | --- | --- | --- | --- |
-| 1 | `examine.com/supplements/vitamin-d/` | Next.js 内容站（补剂证据库） | **既没有内容接口，也不需要动作**：`api.examine.com/v1/*` 只有 `products` / `settings` / `subscription` 三个账号类接口，正文（RDA 表、UL 表、条件-结局-评级表）**全在服务端渲染的文档里**，`web_fetch` 已经拿到 | 这一类站点不需要动作模型，也不需要爬虫去调接口——ADR-0001 的"接口优先"在这里表现为"连接口都不必找" |
-| 2 | cn.iherb.com 商品页（早前） | 电商 PDP | 有干净接口：`catalog.app.iherb.com/search/v2/{kw}`，商品/价格/评分/图片地址全能推出 | 不需要动作模型 |
+### 已探站点
 
-**两条探针的共同含义**：动作模型的适用面比直觉窄——它真正的地盘是
-**登录后才有数据的门户**、**必须交互才出数据的页面**、以及**接口不可重放（签名/不透明）**的站点，
-而不是普通的"内容页"。因此 §11 第 2 步只实现"真实站点逼出来的动词"这条纪律更值得坚持。
+| 站点 | 类别 | 判词 | 关键数字 | 拿到它的数据需要什么 |
+| --- | --- | --- | --- | --- |
+| `cn.iherb.com/search` | 电商搜索 | `ok-no-actions` | 正文 6.2k · 33 个 JSON | **接口**：`catalog.app.iherb.com/search/v2/{kw}`（服务器直连；已长期确认为目标） |
+| `examine.com/supplements/vitamin-d/` | 内容 / 证据库 | `ok-no-actions` | 正文 27.4k · 5 个 JSON（皆账号类） | **什么都不用**：正文就在文档里 |
+| `clinicaltrials.gov/search` | 权威数据库 | `ok-no-actions` | 正文 3.6k | **官方 API**：`/api/v2/studies?query.intr=…`（实测 200） |
+| `swansonvitamins.com` | 电商（Shopify） | `ok-no-actions`（正文多为外壳） | 正文 4.2k · 接口带签名 | **官方接口**：`/products.json?limit=250&page=N`（实测 250 条/页，含变体与图片） |
+| `search.jd.com` | 中文电商 | `login-gated` | 正文 195 · 跳 `passport.jd.com` | **登录态**（不是动作） |
+| `zhihu.com` | 中文 UGC | `login-gated` | 正文 468 · 跳 `/signin` | **登录态** |
+| `github.com/settings/profile` | 登录后门户 | `login-gated` | 正文 282 · 跳 `/login?return_to=…` | **登录态**（该 profile 未登录 GitHub） |
+| `booking.com` | 旅游 / 反爬 | `unclear` → 实为**同意插页** | 正文 510 · 跳 `pipl_consent.zh-cn.html` | **先过同意插页**，再谈接口 |
+| `nmpa.gov.cn` | 中国监管门户 | **`needs-action`** | 正文 1.8k · **0 个 JSON** | **动作**：表单查询 + 点击 |
+| `accessdata.fda.gov/scripts/cder/daf/` | 权威数据库 | `api-replayable`（实为 WAF 噪音） | 正文 1.6k · 2 个随机路径 JSON | **动作**：表单查询；那两个 JSON 是防护信标，不是数据 |
+| 一个 PDF 链接 | 二进制内容 | `unclear` | 正文 0 · 0 个 JSON | **二进制路径**（Chrome PDF 阅读器；内容不进 DOM） |
+
+### 这次铺开逼出来的动词
+
+| 动词 | 来自哪个站点 | 为什么 |
+| --- | --- | --- |
+| `waitFor` | NMPA、Booking 同意插页 | 结果/跳转是异步出现的，必须先等条件成立 |
+| `click` | NMPA、Booking 同意插页 | 表单提交、接受按钮 |
+| `type` | NMPA（查询框要填关键字） | 视其表单实现而定 |
+| `press` / `scroll` / `response` 条件 | **本次无人逼出** | 按 §11 先不做，等真实站点逼出来 |
+
+**结论：§11 第 2 步只需实现 `waitFor` + `click`，`type` 视 NMPA 表单而定。** 这就是"只实现被逼出来的
+动词"的具体答案——而不是先把五个动词都写出来。
+
+### 不是动作模型能解决的三类
+
+| 类别 | 例子 | 真正的解法 |
+| --- | --- | --- |
+| 登录后才有数据 | JD、知乎、GitHub 设置页 | **会话**：共享真实 profile（前提是那个 profile 确实登录了该站），或单独的登录步骤；动作模型在这里帮不上忙 |
+| 同意**插页**（整页跳转，不是横幅） | Booking.com | 现有能力只处理**横幅**；整页插页是个缺口，值得单列（后续：识别插页 → 点击 → 回到目标页） |
+| 内容在二进制里 | PDF | 二进制/下载路径；当前 `web_fetch` 拒绝非 HTML |
+
+### 探针工具自身的两个局限（照实记）
+
+1. **`contentChars ≥ 2000` 会把"外壳很厚的首页"误判成"已拿到内容"**：Swanson 正文 4195 字，多数是导航与
+   页脚，商品其实没在里面。判词不能替代人看一眼。
+2. **分不清"数据接口"与"防护信标"**：FDA 那两个随机路径 JSON 被计成接口，实际是 WAF 噪音。
+
+这两条都指向同一件事：**判词只作分流线索**；真正的结论来自"要长期跑的站点走 `web_fetch` + `netdump`
+的正式路径，并且像 Swanson 那样——探针说'接口带签名、只能驱动 DOM'，而 ADR-0001 的纪律让我们多花
+一次 `curl` 就找到了 `/products.json`。"
