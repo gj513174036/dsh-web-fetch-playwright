@@ -8,6 +8,10 @@
  */
 import { JSDOM } from 'jsdom'
 import { describe, expect, it } from 'vitest'
+import { checkScript } from '../src/check.ts'
+import { clickScript } from '../src/click.ts'
+import { CONSENT_GATE_PROBE, DISMISS_SCRIPT } from '../src/consent.ts'
+import { OBSERVE_SCRIPT } from '../src/observe.ts'
 import { DISMISS_FRAGMENTS, PAGE_FRAGMENTS, spliceFragments } from '../src/page-fragments.ts'
 
 const LAID_OUT = { width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10, x: 0, y: 0, toJSON: () => ({}) }
@@ -36,8 +40,23 @@ describe('page fragments', () => {
   it('ships bundles that are self-contained', () => {
     // The failure this catches is the one that bit the extraction: a consumer
     // picked the fragments it thought it needed and named one it had left out.
-    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof reachabilityOf === "function" && typeof matchesOf === "function" && typeof resolveCandidates === "function" && typeof checkedStateOf === "function"', '')).toBe(true)
+    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof matchesOf === "function" && typeof resolveCandidates === "function" && typeof checkedStateOf === "function"', '')).toBe(true)
     expect(withFragments<boolean>(DISMISS_FRAGMENTS, 'typeof isConsentDocument === "function" && typeof accessibleNameOf === "function"', '')).toBe(true)
+  })
+
+  it('ships no script a stray backtick would cut in half', () => {
+    // These scripts are template literals; one backtick inside a comment ends the
+    // string early and the failure surfaces as a syntax error at typecheck time —
+    // or, worse, in the browser. This has now happened three times, so it is
+    // checked once for every script instead of once per module.
+    const scripts = [
+      OBSERVE_SCRIPT,
+      DISMISS_SCRIPT,
+      CONSENT_GATE_PROBE,
+      clickScript([{ kind: 'text', text: 'x' }]),
+      checkScript([{ kind: 'text', text: 'x' }], 'checked'),
+    ]
+    for (const script of scripts) expect(script).not.toContain('`')
   })
 
   describe('accessibleNameOf', () => {
@@ -117,28 +136,28 @@ describe('page fragments', () => {
     })
   })
 
-  describe('reachabilityOf', () => {
+  describe('hitTargetOf, the reasons a control cannot be acted on', () => {
     it('says nothing for a control a person can hit', () => {
-      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<button>go</button>')).toBe('')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'hitTargetOf(document.querySelector("button")).reason', '<button>go</button>')).toBe('')
     })
 
     it('counts a hidden input as reachable through its label, and not otherwise', () => {
       // The gate's checkboxes: the input has no box, the label a person clicks does.
-      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("input"))', '<label><input type="checkbox"> 全选</label>')).toBe('')
-      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("input"))', '<div><input type="checkbox"></div>')).toBe('not laid out')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'hitTargetOf(document.querySelector("input")).reason', '<label><input type="checkbox"> 全选</label>')).toBe('')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'hitTargetOf(document.querySelector("input")).reason', '<div><input type="checkbox"></div>')).toBe('not laid out')
     })
 
     it('refuses a disabled control, however it says so', () => {
-      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<button disabled>go</button>')).toBe('disabled')
-      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("div"))', '<div role="button" aria-disabled="true">go</div>')).toBe('disabled')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'hitTargetOf(document.querySelector("button")).reason', '<button disabled>go</button>')).toBe('disabled')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'hitTargetOf(document.querySelector("div")).reason', '<div role="button" aria-disabled="true">go</div>')).toBe('disabled')
       // A control inside a disabled fieldset has no `disabled` of its own, yet
       // activating it does nothing — which is the "clicked, so it worked"
       // failure this check exists to pre-empt.
-      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<fieldset disabled><button>go</button></fieldset>')).toBe('disabled')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'hitTargetOf(document.querySelector("button")).reason', '<fieldset disabled><button>go</button></fieldset>')).toBe('disabled')
     })
 
     it('refuses a control something else is sitting on', () => {
-      const covered = withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<div id="overlay"></div><button>go</button>', (dom) => {
+      const covered = withFragments<string>(PAGE_FRAGMENTS, 'hitTargetOf(document.querySelector("button")).reason', '<div id="overlay"></div><button>go</button>', (dom) => {
         const overlay = dom.window.document.getElementById('overlay')
         dom.window.document.elementFromPoint = (() => overlay) as unknown as Document['elementFromPoint']
       })

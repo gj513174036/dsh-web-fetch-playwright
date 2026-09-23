@@ -205,15 +205,26 @@ export async function runTargetActions(
       ok: false,
       failure: { index, verb: step.verb, detail, url: page.url() },
     })
+    /**
+     * A step that did not get there. An `optional` one is recorded as skipped and
+     * the run carries on (`null`); anything else ends the fetch naming the step.
+     * One home for the escape hatch, so no verb can forget it or word it
+     * differently.
+     */
+    const endStep = (detail: string): ActionOutcome | null => {
+      if (step.optional === true) {
+        reports.push({ index, verb: step.verb, detail, outcome: 'skipped' })
+        return null
+      }
+      return failure(detail)
+    }
 
     if (step.verb === 'click') {
       const detail = `candidates: ${describeCandidates(step)}`
       if (budget === 0) {
-        if (step.optional === true) {
-          reports.push({ index, verb: step.verb, detail: `${detail} (no budget left)`, outcome: 'skipped' })
-          continue
-        }
-        return failure(`${detail} (only 0ms of the step budget is left)`)
+        const stopped = endStep(`${detail} (only 0ms of the step budget is left)`)
+        if (stopped !== null) return stopped
+        continue
       }
       const confirming = confirmingWaitAfter(target.actions, index)
       const urlBefore = page.url()
@@ -241,53 +252,44 @@ export async function runTargetActions(
         continue
       }
       if (outcome.kind === 'unreadable') {
-        const why = `${detail} (the page could not be read: ${outcome.problem})`
-        if (step.optional === true) {
-          reports.push({ index, verb: step.verb, detail: why, outcome: 'skipped' })
-          continue
-        }
-        return failure(why)
+        const stopped = endStep(`${detail} (the page could not be read: ${outcome.problem})`)
+        if (stopped !== null) return stopped
+        continue
       }
       // Every candidate was passed over: the page says so, with one reason each.
       const why = `no candidate could be clicked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
-      if (step.optional === true) {
-        reports.push({ index, verb: step.verb, detail: why, outcome: 'skipped' })
-        continue
-      }
-      return failure(why)
+      const stopped = endStep(why)
+      if (stopped !== null) return stopped
+      continue
     }
 
     if (step.verb === 'check') {
       const detail = `candidates: ${describeCandidates(step)}, state ${step.state}`
       if (budget === 0) {
-        if (step.optional === true) {
-          reports.push({ index, verb: step.verb, detail: `${detail} (no budget left)`, outcome: 'skipped' })
-          continue
-        }
-        return failure(`${detail} (only 0ms of the step budget is left)`)
+        const stopped = endStep(`${detail} (only 0ms of the step budget is left)`)
+        if (stopped !== null) return stopped
+        continue
       }
       const outcome = await checkControl(page, step.candidates, step.state, budget)
       if (outcome.kind === 'checked') {
-        // The verdict is the read-back, not the click: `changed` separates the
-        // step that had to act from the idempotent one, and both report the
-        // state the page actually shows.
-        const how = outcome.changed ? `was ${outcome.was}, now ${outcome.state}` : `already ${outcome.state}`
+        // The verdict is the read-back, not the click: `acted` separates the
+        // step that had to do something from the idempotent one, and both report
+        // the state the page actually shows.
+        const how = outcome.acted ? `was ${outcome.was}, now ${outcome.state}` : `already ${outcome.state}`
         reports.push({ index, verb: step.verb, detail: `${outcome.candidate} (${how})`, outcome: 'met' })
         continue
       }
       const why =
-        outcome.kind === 'reverted'
-          ? `${outcome.candidate}: it was ${outcome.was}, the click went out, and it reports ${outcome.now} — the page did not keep the change`
+        outcome.kind === 'unchanged'
+          ? `${outcome.candidate}: it was ${outcome.was}, the click went out, and it reports ${outcome.now} — the page does not show the change`
           : outcome.kind === 'unverified'
             ? `${detail} (${outcome.problem})`
             : outcome.kind === 'unreadable'
               ? `${detail} (the page could not be read: ${outcome.problem})`
               : `no candidate could be checked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
-      if (step.optional === true) {
-        reports.push({ index, verb: step.verb, detail: why, outcome: 'skipped' })
-        continue
-      }
-      return failure(why)
+      const stopped = endStep(why)
+      if (stopped !== null) return stopped
+      continue
     }
 
     const detail = describeCondition(step.condition)
@@ -324,17 +326,14 @@ export async function runTargetActions(
       reports.push({ index, verb: step.verb, detail, outcome: 'met' })
       continue
     }
-    if (step.optional === true) {
-      reports.push({ index, verb: step.verb, detail, outcome: 'skipped' })
-      continue
-    }
-    return failure(
+    const stopped = endStep(
       unanswerable
         ? `${detail} (the page could not be read)`
         : exceedsBudget
           ? `${detail} (only ${String(budget)}ms of the step budget is left)`
           : `${detail} (not met within ${String(budget)}ms)`,
     )
+    if (stopped !== null) return stopped
   }
 
   // The gap a click cannot close by itself: the wait that follows has to have

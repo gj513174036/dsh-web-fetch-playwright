@@ -20,8 +20,10 @@ interface CheckAnswer {
   candidate?: string
   was?: string
   state?: string
-  changed?: boolean
-  acted?: string | null
+  /** On success: had to click for it (the idempotent case answers false). */
+  acted?: boolean
+  /** On failure: the candidate whose click went out before the read-back died. */
+  attempted?: string | null
   why?: string | null
   tried?: string[]
 }
@@ -66,7 +68,7 @@ describe('checkScript', () => {
       seen.dom = dom
       track(dom, '#all', clicked)
     })
-    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'checked', changed: true })
+    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'checked', acted: true })
     // The label is what was clicked (jsdom then bounces the forwarded click off
     // the input back up to it, which is why the count is not the point) and the
     // control it forwards to is the one that ended up ticked.
@@ -81,7 +83,7 @@ describe('checkScript', () => {
       show(dom, '#cb')
       track(dom, '#cb', clicked)
     })
-    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> checkbox', was: 'checked', state: 'checked', changed: false })
+    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> checkbox', was: 'checked', state: 'checked', acted: false })
     expect(clicked).toEqual([])
   })
 
@@ -89,7 +91,7 @@ describe('checkScript', () => {
     const answer = await runScript('<input id="cb" type="checkbox" checked>', [{ kind: 'selector', selector: '#cb' }], 'unchecked', (dom) => {
       show(dom, '#cb')
     })
-    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> checkbox', was: 'checked', state: 'unchecked', changed: true })
+    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> checkbox', was: 'checked', state: 'unchecked', acted: true })
   })
 
   it('reports the state the page kept, not the one the click caused', async () => {
@@ -99,7 +101,7 @@ describe('checkScript', () => {
       const input = dom.window.document.getElementById('cb') as HTMLInputElement
       input.addEventListener('click', () => { setTimeout(() => { input.checked = false }, 0) })
     })
-    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'unchecked', changed: true })
+    expect(answer).toEqual({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'unchecked', acted: true })
   })
 
   it('finds a custom control by its announced state, and sets it', async () => {
@@ -112,7 +114,7 @@ describe('checkScript', () => {
         control?.addEventListener('click', () => control.setAttribute('aria-checked', 'true'))
       },
     )
-    expect(answer).toEqual({ ok: true, candidate: 'text "全选" -> checkbox', was: 'unchecked', state: 'checked', changed: true })
+    expect(answer).toEqual({ ok: true, candidate: 'text "全选" -> checkbox', was: 'unchecked', state: 'checked', acted: true })
   })
 
   it('treats a toggle button’s aria-pressed as its state', async () => {
@@ -137,7 +139,7 @@ describe('checkScript', () => {
     )
     expect(answer).toEqual({
       ok: false,
-      acted: null,
+      attempted: null,
       why: null,
       tried: [
         'selector "#missing": no match',
@@ -179,7 +181,7 @@ describe('checkScript', () => {
       input?.addEventListener('click', () => { input.remove() })
     })
     expect(answer.ok).toBe(false)
-    expect(answer.acted).toBe('selector "#cb" -> label')
+    expect(answer.attempted).toBe('selector "#cb" -> label')
     expect(answer.why).toContain('could not be read back')
   })
 
@@ -197,32 +199,32 @@ describe('checkControl', () => {
 
   it('reads a verified state, and whether the attempt had to act', async () => {
     const acted = await checkControl(
-      pageWith(async () => ({ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', changed: true })),
+      pageWith(async () => ({ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', acted: true })),
       [{ kind: 'text', text: '全选' }],
       'checked',
     )
-    expect(acted).toEqual({ kind: 'checked', candidate: 'text "全选" -> label', state: 'checked', was: 'unchecked', changed: true })
+    expect(acted).toEqual({ kind: 'checked', candidate: 'text "全选" -> label', state: 'checked', was: 'unchecked', acted: true })
 
     const already = await checkControl(
-      pageWith(async () => ({ ok: true, candidate: 'text "全选" -> label', was: 'checked', state: 'checked', changed: false })),
+      pageWith(async () => ({ ok: true, candidate: 'text "全选" -> label', was: 'checked', state: 'checked', acted: false })),
       [{ kind: 'text', text: '全选' }],
       'checked',
     )
-    expect(already).toEqual({ kind: 'checked', candidate: 'text "全选" -> label', state: 'checked', was: 'checked', changed: false })
+    expect(already).toEqual({ kind: 'checked', candidate: 'text "全选" -> label', state: 'checked', was: 'checked', acted: false })
   })
 
   it('calls a control that did not end in the wanted state a revert', async () => {
     const outcome = await checkControl(
-      pageWith(async () => ({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'unchecked', changed: true })),
+      pageWith(async () => ({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'unchecked', acted: true })),
       [{ kind: 'selector', selector: '#cb' }],
       'checked',
     )
-    expect(outcome).toEqual({ kind: 'reverted', candidate: 'selector "#cb" -> label', was: 'unchecked', now: 'unchecked' })
+    expect(outcome).toEqual({ kind: 'unchanged', candidate: 'selector "#cb" -> label', was: 'unchecked', now: 'unchecked' })
   })
 
   it('never accepts an act whose read-back did not happen', async () => {
     const gone = await checkControl(
-      pageWith(async () => ({ ok: false, acted: 'selector "#cb" -> label', why: 'the control could not be read back after ticking it', tried: [] })),
+      pageWith(async () => ({ ok: false, attempted: 'selector "#cb" -> label', why: 'the control could not be read back after ticking it', tried: [] })),
       [{ kind: 'selector', selector: '#cb' }],
       'checked',
     )
@@ -240,7 +242,7 @@ describe('checkControl', () => {
 
   it('reports the candidates it passed over', async () => {
     const outcome = await checkControl(
-      pageWith(async () => ({ ok: false, acted: null, tried: ['text "全选": no match', 42] })),
+      pageWith(async () => ({ ok: false, attempted: null, tried: ['text "全选": no match', 42] })),
       [{ kind: 'text', text: '全选' }],
       'checked',
     )

@@ -174,14 +174,6 @@ export const FRAGMENT_HIT_TARGET = `const hitTargetOf = (el) => {
   };`
 
 /**
- * Why this control cannot be acted on, or `''` when it can be.
- *
- * The same answer as {@link FRAGMENT_HIT_TARGET}, in the shape a caller wants
- * when it only needs to report: one walk, two conveniences.
- */
-export const FRAGMENT_REACHABILITY = `const reachabilityOf = (el) => hitTargetOf(el).reason;`
-
-/**
  * The controls a `text` or `role` candidate is allowed to consider.
  *
  * Deliberately one neighbourhood for both kinds: a text candidate names a
@@ -236,9 +228,8 @@ export const FRAGMENT_CANDIDATE_MATCH = `const CONTROLS = ${JSON.stringify(CANDI
  * A usable candidate ends the walk — later ones are not tried behind the
  * author's back, whether or not the act that follows works out.
  *
- * @returns `control`/`hit` (`null` when nothing was usable), the winning
- *   candidate's description, where it was found, and one reason per candidate
- *   that was passed over.
+ * @returns `control`/`hit` (`null` when nothing was usable), how the winner reads
+ *   in a summary (`landed`), and one reason per candidate that was passed over.
  */
 export const FRAGMENT_RESOLVE = `const resolveCandidates = (candidates, accept) => {
     const tried = [];
@@ -264,9 +255,17 @@ export const FRAGMENT_RESOLVE = `const resolveCandidates = (candidates, accept) 
         tried.push(candidate.label + ': matched ' + matches.length + ', ' + parts.join(', '));
         continue;
       }
-      return { candidate: candidate.label, control: chosen.control, host: chosen.host, hit: chosen.hit, tried: tried };
+      // The one wording for what a step landed on, so a summary, a failure
+      // message and a test cannot describe the same act three ways.
+      const landed = candidate.label + ' -> ' + (roleOf(chosen.hit) || chosen.hit.tagName.toLowerCase());
+      return { candidate: candidate.label, landed: landed, control: chosen.control, hit: chosen.hit, tried: tried };
     }
-    return { candidate: null, control: null, host: null, hit: null, tried: tried };
+    return { candidate: null, landed: null, control: null, hit: null, tried: tried };
+  };
+
+  /** Click the resolved element, answering the throw as a message instead of raising it. */
+  const clickFailureOf = (hit) => {
+    try { hit.click(); return '' } catch (error) { return String(error) }
   };`
 
 /**
@@ -334,7 +333,6 @@ export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_ROLE,
   FRAGMENT_COVERAGE,
   FRAGMENT_HIT_TARGET,
-  FRAGMENT_REACHABILITY,
   FRAGMENT_CANDIDATE_MATCH,
   FRAGMENT_RESOLVE,
   FRAGMENT_CHECKED_STATE,

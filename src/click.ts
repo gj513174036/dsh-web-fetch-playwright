@@ -81,12 +81,12 @@ export function clickScript(candidates: readonly Candidate[], watch?: WaitCondit
   const before = watch === null ? null : (visibleTextOf().indexOf(watch.text) >= 0) !== watch.absent;
   const found = resolveCandidates(candidates);
   if (found.control === null) return { ok: false, tried: found.tried };
-  const landed = found.candidate + ' -> ' + (roleOf(found.hit) || found.hit.tagName.toLowerCase());
-  // A reachable candidate ends the walk whether or not its click worked: the
-  // order is the recipe's, so a later candidate must not be tried behind the
-  // author's back. A throw is reported rather than silently moved past.
-  try { found.hit.click() } catch (error) { return { ok: false, tried: found.tried.concat(landed + ': the click threw (' + String(error) + ')') } }
-  return { ok: true, candidate: landed, before: before };
+  // A usable candidate ends the walk whether or not its click worked: the order is
+  // the recipe's, so a later candidate must not be tried behind the author's back.
+  // A throw is reported rather than silently moved past.
+  const threw = clickFailureOf(found.hit);
+  if (threw !== '') return { ok: false, tried: found.tried.concat(found.landed + ': the click threw (' + threw + ')') };
+  return { ok: true, candidate: found.landed, before: before };
 })()`
 }
 

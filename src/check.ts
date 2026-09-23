@@ -40,17 +40,17 @@ export type ControlState = 'checked' | 'unchecked'
 /** What one `check` attempt came to. */
 export type CheckOutcome =
   /**
-   * The control reports the wanted state. `changed` says whether this attempt
-   * had to act for it: `false` is the idempotent case, where the state already
-   * held and the control was deliberately left alone.
+   * The control reports the wanted state. `acted` says whether this attempt had
+   * to do anything for it: `false` is the idempotent case, where the state
+   * already held and the control was deliberately left alone.
    */
-  | { readonly kind: 'checked'; readonly candidate: string; readonly state: ControlState; readonly was: ControlState; readonly changed: boolean }
+  | { readonly kind: 'checked'; readonly candidate: string; readonly state: ControlState; readonly was: ControlState; readonly acted: boolean }
   /**
    * The act went out and the control still does not report the wanted state —
-   * a page that reverted it, or a control that never reacted. The step fails:
-   * the precondition does not hold.
+   * a page that reverted it, or a control that never reacted to the click at
+   * all. The step fails either way: the precondition does not hold.
    */
-  | { readonly kind: 'reverted'; readonly candidate: string; readonly was: ControlState; readonly now: ControlState }
+  | { readonly kind: 'unchanged'; readonly candidate: string; readonly was: ControlState; readonly now: ControlState }
   /** The act went out and the state could not be read back (the page moved, or the control is gone). */
   | { readonly kind: 'unverified'; readonly problem: string }
   /** No candidate could be checked; `reasons` holds one entry per candidate tried. */
@@ -62,8 +62,9 @@ export type CheckOutcome =
  * The in-page half: resolve, look before acting, act, then read back.
  *
  * The answer's shape is what the wrapper judges: `ok` plus a state means the
- * control was read; `acted` without `ok` means the act went out but the read-back
- * did not happen; neither means nothing was tried.
+ * control was read (with `acted` saying whether anything had to be clicked);
+ * `attempted` without `ok` means the click went out but the read-back did not
+ * happen; neither means nothing was tried.
  *
  * @param candidates - the recipe's ordered candidates.
  * @param state - the state the control has to end in.
@@ -77,13 +78,14 @@ export function checkScript(candidates: readonly Candidate[], state: ControlStat
   ${spliceFragments(PAGE_FRAGMENTS)}
   // Only a control that holds a state can be checked — which is also what keeps
   // a text candidate from stopping on the <label> that merely carries the words.
-  const found = resolveCandidates(candidates, (el) => checkedStateOf(el) === '' ? 'it is not a control that holds a checked state' : '');
-  if (found.control === null) return { ok: false, acted: null, why: null, tried: found.tried };
+  const accept = (el) => checkedStateOf(el) === '' ? 'it is not a control that holds a checked state' : '';
+  const found = resolveCandidates(candidates, accept);
+  if (found.control === null) return { ok: false, attempted: null, why: null, tried: found.tried };
   const control = found.control;
-  const landed = found.candidate + ' -> ' + (roleOf(found.hit) || found.hit.tagName.toLowerCase());
   const before = checkedStateOf(control);
-  if (before === want) return { ok: true, candidate: landed, was: before, state: before, changed: false };
-  try { found.hit.click() } catch (error) { return { ok: false, acted: null, why: null, tried: found.tried.concat(landed + ': the click threw (' + String(error) + ')') } }
+  if (before === want) return { ok: true, candidate: found.landed, was: before, state: before, acted: false };
+  const threw = clickFailureOf(found.hit);
+  if (threw !== '') return { ok: false, attempted: null, why: null, tried: found.tried.concat(found.landed + ': the click threw (' + threw + ')') };
   // Let the page react before believing anything. A control the page owns can be
   // re-rendered from its own state, and "changed, then reverted" is exactly what
   // reading too early would hide.
@@ -92,10 +94,12 @@ export function checkScript(candidates: readonly Candidate[], state: ControlStat
   });
   // Read the control the page is showing now: the same one when the page kept the
   // node (a revert keeps it), the freshly resolved one when it replaced it.
-  const live = control.isConnected === true ? control : resolveCandidates(candidates).control;
+  // The same walk, filter included: a page that replaced the control must not be
+  // read through whatever else happens to carry the same name.
+  const live = control.isConnected === true ? control : resolveCandidates(candidates, accept).control;
   const after = live === null ? '' : checkedStateOf(live);
-  if (after === '') return { ok: false, acted: landed, why: 'the control could not be read back after ticking it (it is gone, or no longer reports a checked state)', tried: found.tried };
-  return { ok: true, candidate: landed, was: before, state: after, changed: true };
+  if (after === '') return { ok: false, attempted: found.landed, why: 'the control could not be read back after ticking it (it is gone, or no longer reports a checked state)', tried: found.tried };
+  return { ok: true, candidate: found.landed, was: before, state: after, acted: true };
 })()`
 }
 
@@ -137,19 +141,19 @@ export async function checkControl(
   if (typeof answer !== 'object' || answer === null) {
     return { kind: 'unreadable', problem: 'the page answered with something other than a check result' }
   }
-  const shape = answer as { ok?: unknown; candidate?: unknown; state?: unknown; was?: unknown; changed?: unknown; acted?: unknown; why?: unknown; tried?: unknown }
+  const shape = answer as { ok?: unknown; candidate?: unknown; state?: unknown; was?: unknown; acted?: unknown; attempted?: unknown; why?: unknown; tried?: unknown }
   if (shape.ok === true) {
     const now = stateOf(shape.state)
     const was = stateOf(shape.was)
     if (now === null || was === null) return { kind: 'unreadable', problem: 'the page answered with a state that is neither checked nor unchecked' }
     const candidate = typeof shape.candidate === 'string' ? shape.candidate : 'a candidate'
     return now === state
-      ? { kind: 'checked', candidate, state: now, was, changed: shape.changed === true }
-      : { kind: 'reverted', candidate, was, now }
+      ? { kind: 'checked', candidate, state: now, was, acted: shape.acted === true }
+      : { kind: 'unchanged', candidate, was, now }
   }
-  if (typeof shape.acted === 'string') {
+  if (typeof shape.attempted === 'string') {
     const why = typeof shape.why === 'string' ? shape.why : 'the state could not be read back'
-    return { kind: 'unverified', problem: `${shape.acted}: ${why}` }
+    return { kind: 'unverified', problem: `${shape.attempted}: ${why}` }
   }
   const reasons = Array.isArray(shape.tried) ? shape.tried.filter((entry): entry is string => typeof entry === 'string') : []
   return { kind: 'not-checked', reasons }

@@ -91,8 +91,11 @@ export const OBSERVE_SCRIPT = `(() => {
     if (el.disabled === true) out.push('disabled');
     if (el.getAttribute('aria-disabled') === 'true') out.push('aria-disabled');
     if (el.required === true) out.push('required');
-    const kind = kindOf(el);
-    if (kind === 'checkbox' || kind === 'radio') out.push(el.checked === true ? 'checked' : 'unchecked');
+    // The one state read this plugin has (check verifies with the same one), so a
+    // custom control that announces itself with aria-checked is not reported as
+    // unchecked — which is what reading the DOM property alone used to say.
+    const checked = checkedStateOf(el);
+    if (checked !== '') out.push(checked);
     const expanded = el.getAttribute('aria-expanded');
     if (expanded !== null) out.push('expanded=' + expanded);
     return out.join(', ');
@@ -102,7 +105,11 @@ export const OBSERVE_SCRIPT = `(() => {
   try { nodes = Array.prototype.slice.call(document.querySelectorAll(SELECTOR)) } catch (error) { nodes = [] }
   const seen = nodes.map((el) => {
     const state = [stateOf(el), coverageOf(el)].filter((part) => part !== '').join(', ');
-    return { kind: kindOf(el), label: accessibleNameOf(el).slice(0, 60), host: hostOf(el), state: state };
+    // Where a person's click has to land, not merely whether the control itself
+    // is laid out: the two answers differ exactly where it matters (a 1x1 input
+    // under the styled box its own label draws over it).
+    const host = hitTargetOf(el).host;
+    return { kind: kindOf(el), label: accessibleNameOf(el).slice(0, 60), host: host === null ? 'hidden' : host, state: state };
   });
   const named = seen.filter((entry) => entry.label !== '');
   const reachable = named.filter((entry) => entry.host !== 'hidden');

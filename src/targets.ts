@@ -387,21 +387,26 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
     if ('error' in optional) return { error: optional.error }
     return { step: optional.optional ? { verb, condition: parsed.condition, optional: true } : { verb, condition: parsed.condition } }
   }
-  if (verb === 'click' || verb === 'check') {
-    const allowed = verb === 'click' ? ['verb', 'candidates', 'optional'] : ['verb', 'candidates', 'state', 'optional']
-    const unknown = unknownKeys(value, allowed, path)
+  if (verb === 'click') {
+    const unknown = unknownKeys(value, ['verb', 'candidates', 'optional'], path)
     if (unknown !== null) return { error: unknown }
     const candidates = parseCandidates(value['candidates'], path, verb)
     if ('error' in candidates) return { error: candidates.error }
     const optional = parseOptional(value['optional'], path)
     if ('error' in optional) return { error: optional.error }
-    if (verb === 'click') {
-      return { step: optional.optional ? { verb, candidates: candidates.parsed, optional: true } : { verb, candidates: candidates.parsed } }
-    }
+    return { step: optional.optional ? { verb, candidates: candidates.parsed, optional: true } : { verb, candidates: candidates.parsed } }
+  }
+  if (verb === 'check') {
+    const unknown = unknownKeys(value, ['verb', 'candidates', 'state', 'optional'], path)
+    if (unknown !== null) return { error: unknown }
+    const candidates = parseCandidates(value['candidates'], path, verb)
+    if ('error' in candidates) return { error: candidates.error }
     const state = value['state']
     if (state !== undefined && state !== 'checked' && state !== 'unchecked') {
       return { error: `${at(path)}.state: expected "checked" or "unchecked"` }
     }
+    const optional = parseOptional(value['optional'], path)
+    if ('error' in optional) return { error: optional.error }
     const wanted = state === 'unchecked' ? 'unchecked' : 'checked'
     return { step: optional.optional ? { verb, candidates: candidates.parsed, state: wanted, optional: true } : { verb, candidates: candidates.parsed, state: wanted } }
   }

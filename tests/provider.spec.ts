@@ -807,7 +807,7 @@ describe('PlaywrightFetchProvider', () => {
   it('checks a control and says which state it ended in', async () => {
     const targetsFile = targetFor('https://example.com/docs', `${checkText('全选')}, ${waitText('World')}`)
     const result = await new FakeProvider({ targetsFile }, {
-      evaluateQueue: [{ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', changed: true }, true],
+      evaluateQueue: [{ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', acted: true }, true],
     }).fetch({ url: 'https://example.com/docs' })
     const content = (result.body as { content: string }).content
     expect(content.startsWith('> actions: 1. check text "全选" -> label (was unchecked, now checked) — met')).toBe(true)
@@ -817,7 +817,7 @@ describe('PlaywrightFetchProvider', () => {
   it('fails a check the page did not keep, naming the step and the candidate', async () => {
     const targetsFile = targetFor('https://example.com/docs', checkText('全选'))
     const message = await messageOf(new FakeProvider({ targetsFile }, {
-      evaluateQueue: [{ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'unchecked', changed: true }],
+      evaluateQueue: [{ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'unchecked', acted: true }],
     }).fetch({ url: 'https://example.com/docs' }))
     expect(message).toContain('target "docs" step 1 (check) did not hold')
     expect(message).toContain('text "全选" -> label: it was unchecked, the click went out, and it reports unchecked')

@@ -151,7 +151,7 @@ describe('runTargetActions', () => {
 describe('runTargetActions, the check verb', () => {
   it('reports the state the page ended in, and whether the step had to act for it', async () => {
     const acted = await runTargetActions(
-      checkPage({ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', changed: true }),
+      checkPage({ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', acted: true }),
       target(check([{ kind: 'text', text: '全选' }])),
       options,
     )
@@ -160,7 +160,7 @@ describe('runTargetActions, the check verb', () => {
     ])
 
     const already = await runTargetActions(
-      checkPage({ ok: true, candidate: 'text "全选" -> label', was: 'checked', state: 'checked', changed: false }),
+      checkPage({ ok: true, candidate: 'text "全选" -> label', was: 'checked', state: 'checked', acted: false }),
       target(check([{ kind: 'text', text: '全选' }])),
       options,
     )
@@ -171,7 +171,7 @@ describe('runTargetActions, the check verb', () => {
     // The measured failure: the click flips the state and the page reverts it.
     // A check that cannot show the state holds is not a satisfied precondition.
     const outcome = await runTargetActions(
-      checkPage({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'unchecked', changed: true }),
+      checkPage({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'unchecked', acted: true }),
       target(check([{ kind: 'selector', selector: '#cb' }])),
       options,
     )
@@ -180,12 +180,12 @@ describe('runTargetActions, the check verb', () => {
     expect(failure.index).toBe(0)
     expect(failure.verb).toBe('check')
     expect(failure.url).toBe('https://a.example/search')
-    expect(failure.detail).toBe('selector "#cb" -> label: it was unchecked, the click went out, and it reports unchecked — the page did not keep the change')
+    expect(failure.detail).toBe('selector "#cb" -> label: it was unchecked, the click went out, and it reports unchecked — the page does not show the change')
   })
 
   it('fails when no candidate can be checked, naming each one', async () => {
     const outcome = await runTargetActions(
-      checkPage({ ok: false, acted: null, tried: ['text "全选": no match', 'selector "#cb": matched 1, none reachable (not laid out)'] }),
+      checkPage({ ok: false, attempted: null, tried: ['text "全选": no match', 'selector "#cb": matched 1, none reachable (not laid out)'] }),
       target(check([{ kind: 'text', text: '全选' }])),
       options,
     )
@@ -197,7 +197,7 @@ describe('runTargetActions, the check verb', () => {
 
   it('fails when the state could not be read back at all', async () => {
     const outcome = await runTargetActions(
-      checkPage({ ok: false, acted: 'selector "#cb" -> label', why: 'the control could not be read back after ticking it', tried: [] }),
+      checkPage({ ok: false, attempted: 'selector "#cb" -> label', why: 'the control could not be read back after ticking it', tried: [] }),
       target(check([{ kind: 'selector', selector: '#cb' }])),
       options,
     )
@@ -207,7 +207,7 @@ describe('runTargetActions, the check verb', () => {
 
   it('skips an optional check that cannot be satisfied, and runs the rest', async () => {
     const outcome = await runTargetActions(
-      checkPage({ ok: false, acted: null, tried: ['text "记住我": no match'] }),
+      checkPage({ ok: false, attempted: null, tried: ['text "记住我": no match'] }),
       target({ ...check([{ kind: 'text', text: '记住我' }]), optional: true }, { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }),
       options,
     )
