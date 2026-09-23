@@ -81,7 +81,7 @@ import { NetworkRecorder, nextCaptureSessionId as recorderSessionId } from './re
 import { BrowserPool } from './browser-pool.ts'
 import type { BrowserPoolOptions } from './browser-pool.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
-import { htmlToMarkdown } from './markdown.ts'
+import { htmlToMarkdown, stripNonContentHtml } from './markdown.ts'
 import { parseLaunchArgs } from './launch-args.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightProxyOption, PlaywrightResponse, PlaywrightRoute } from './types.ts'
@@ -163,8 +163,36 @@ const MAX_URL_LENGTH = 2048
 /** Cap on the decoded markdown/HTML body this provider returns. */
 const MAX_BODY_CHARS = 100_000
 
-/** Cap on rendered HTML fed into the synchronous denoise pipeline. */
+/**
+ * Cap on rendered HTML fed into the synchronous denoise pipeline.
+ *
+ * Measured *after* {@link boundPipelineInput} deletes non-content subtrees,
+ * so the budget pays for markup that can actually become markdown.
+ */
 const MAX_PIPELINE_INPUT_CHARS = 2_000_000
+
+/**
+ * Shrink rendered HTML to the denoise pipeline's input budget.
+ *
+ * Non-content subtrees go first: they can never reach the returned markdown,
+ * yet on component-heavy sites they are most of the document, and a plain
+ * character-count cut beheads pages whose copy sits late. On a measured
+ * iHerb product page the document was 2.89 MB with the product copy starting
+ * at offset 2,111,410 — past the cap — so the article was discarded and
+ * Readability scored a cookie banner instead; stripping script/style/svg
+ * first left 1.86 MB with the copy intact. Only what survives that reduction
+ * is charged against {@link MAX_PIPELINE_INPUT_CHARS}, so `cut` means the
+ * article itself was clipped rather than merely surrounded by bloat.
+ *
+ * @param html - the rendered page HTML (`page.content()`).
+ * @returns the pipeline input, and whether the budget clipped it.
+ */
+function boundPipelineInput(html: string): { input: string; cut: boolean } {
+  const reduced = stripNonContentHtml(html)
+  return reduced.length > MAX_PIPELINE_INPUT_CHARS
+    ? { input: reduced.slice(0, MAX_PIPELINE_INPUT_CHARS), cut: true }
+    : { input: reduced, cut: false }
+}
 
 /**
  * How long a fetch may sit in the concurrency queue before failing fast.
@@ -900,10 +928,10 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       // governs the Readability/DOMPurify stage this provider owns.
       return capResult(finalUrl, statusCode, { kind: 'html', content: html })
     }
-    const bounded = html.length > MAX_PIPELINE_INPUT_CHARS ? html.slice(0, MAX_PIPELINE_INPUT_CHARS) : html
-    const { markdown } = htmlToMarkdown(bounded, finalUrl)
+    const bounded = boundPipelineInput(html)
+    const { markdown } = htmlToMarkdown(bounded.input, finalUrl)
     const result = capResult(finalUrl, statusCode, { kind: 'text', content: markdown })
-    return bounded !== html
+    return bounded.cut
       ? { ...result, truncated: true }
       : result
   }

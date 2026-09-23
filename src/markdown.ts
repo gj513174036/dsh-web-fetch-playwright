@@ -1,15 +1,18 @@
 /**
  * The denoise pipeline: rendered HTML → sanitized article HTML → markdown.
  *
- * The classic stack, in order: jsdom parses the page Playwright rendered;
- * inline `data:` image payloads are elided to size placeholders (build
- * tools inline images as base64, which would otherwise dominate the body);
- * Mozilla Readability extracts the article (dropping nav bars, sidebars,
- * footers, and ad chrome by scoring link density and text mass); DOMPurify
- * sanitizes whatever HTML remains and forbids the layout tags noise lives in;
- * Turndown with the GFM plugin converts to markdown using the same style
- * options and span-safe table rules as the shipped `dsh-tool-web` renderer,
- * so output is consistent with what `web_fetch` produces elsewhere.
+ * The classic stack, in order: non-content subtrees are deleted textually
+ * (see {@link stripNonContentHtml} — this is what keeps component-heavy
+ * pages inside the caller's input budget); jsdom parses the page Playwright
+ * rendered; inline `data:` image payloads are elided to size placeholders
+ * (build tools inline images as base64, which would otherwise dominate the
+ * body); Mozilla Readability extracts the article (dropping nav bars,
+ * sidebars, footers, and ad chrome by scoring link density and text mass);
+ * DOMPurify sanitizes whatever HTML remains and forbids the layout tags
+ * noise lives in; Turndown with the GFM plugin converts to markdown using
+ * the same style options and span-safe table rules as the shipped
+ * `dsh-tool-web` renderer, so output is consistent with what `web_fetch`
+ * produces elsewhere.
  *
  * Pure and synchronous — unit-tested against fixture pages.
  *
@@ -31,6 +34,50 @@ const FORBID_TAGS = [
 
 /** Attributes stripped from sanitized output (styling survives as noise). */
 const FORBID_ATTR = ['style', 'class', 'id', 'hidden', 'aria-hidden', 'role']
+
+/**
+ * Subtrees removed from the raw HTML before anything else looks at it.
+ *
+ * Every entry here is either invisible in the rendered page (`script`,
+ * `style`, `noscript`, `template` — the last two are also in
+ * {@link FORBID_TAGS}) or unconditionally dropped by the sanitizer below
+ * (`svg`, likewise in {@link FORBID_TAGS} with `KEEP_CONTENT: false`), so
+ * none of them can contribute a character to the returned markdown.
+ *
+ * They are removed *by size*, which is the point: component-heavy sites
+ * inline megabytes of CSS, hydration data, and icon sprites, and the caller
+ * caps pipeline input at a fixed character budget. On a measured iHerb
+ * product page the document was 2.89 MB with the product copy starting at
+ * offset 2,111,410 — past a 2 MB cap — so the cap cut away the entire
+ * article and Readability was left scoring a cookie banner. Stripping these
+ * five tags first brought the same document to 1.86 MB, well inside the
+ * budget, with the product copy intact.
+ */
+const NON_CONTENT_SUBTREES = ['script', 'style', 'noscript', 'svg', 'template'] as const
+
+/**
+ * One pass over the raw HTML that deletes non-content subtrees and comments.
+ *
+ * Matching is deliberately textual rather than DOM-based: this runs *before*
+ * the parse, so it also spares jsdom from parsing the megabytes it drops.
+ * The unterminated alternative (`|$`) covers documents the tool truncated
+ * mid-tree; `</script>` inside a JavaScript string literal is not a special
+ * case here because the HTML parser itself ends the element there too.
+ */
+const NON_CONTENT_PATTERN = new RegExp(
+  `<(${NON_CONTENT_SUBTREES.join('|')})\\b[^>]*>[\\s\\S]*?(?:<\\/\\1\\s*>|$)|<!--[\\s\\S]*?(?:-->|$)`,
+  'gi',
+)
+
+/**
+ * Delete subtrees and comments that cannot reach the markdown output.
+ *
+ * @param html - the rendered page HTML (`page.content()`).
+ * @returns the same markup with those subtrees removed.
+ */
+export function stripNonContentHtml(html: string): string {
+  return html.replace(NON_CONTENT_PATTERN, '')
+}
 
 /**
  * Elide inline `data:` image payloads to `data:<mime>;base64,...<size>`.
@@ -145,12 +192,55 @@ export interface DenoiseResult {
 }
 
 /**
+ * Text below this length is only trusted when it also clears
+ * {@link MIN_ARTICLE_TEXT_SHARE}.
+ */
+const MIN_ARTICLE_TEXT_CHARS = 2_000
+
+/**
+ * Share of the document's text a short extraction must reach to be trusted.
+ *
+ * Calibrated against real pages fetched through the browser: the two that
+ * Readability got wrong scored 0.015 and 0.0003 (iHerb product pages, where
+ * it returned the cookie-consent block), while the two it got right scored
+ * 0.59 (playwright.dev) and 0.45 (MDN) — an order of magnitude of headroom
+ * on either side.
+ */
+const MIN_ARTICLE_TEXT_SHARE = 0.15
+
+/**
+ * Whether a Readability extraction is worth more than the whole document.
+ *
+ * Readability reports failure by returning `null`, but it also *succeeds* on
+ * pages it cannot read, handing back a stray sidebar or consent notice while
+ * the real content sits elsewhere — on an iHerb product page it returned the
+ * 278-character cookie block from an 18,639-character document, and the null
+ * fallback never fired, so 27,937 characters of product copy, spec table, and
+ * image links were dropped in favour of a cookie banner.
+ *
+ * Both signals must agree before an extraction is discarded: it has to be
+ * small in absolute terms *and* a sliver of the page. A genuine short article
+ * on a page bloated with hidden text therefore survives on its absolute size,
+ * and a long extraction is never second-guessed.
+ *
+ * @param articleChars - character count of the text Readability extracted.
+ * @param documentChars - character count of the document's own text.
+ * @returns true when the extraction should be used as-is.
+ */
+export function isUsableExtraction(articleChars: number, documentChars: number): boolean {
+  if (articleChars >= MIN_ARTICLE_TEXT_CHARS) return true
+  return documentChars === 0 || articleChars / documentChars >= MIN_ARTICLE_TEXT_SHARE
+}
+
+/**
  * Convert one rendered HTML document to denoised markdown.
  *
  * Readability failure (non-article pages) degrades to converting the
  * sanitized whole document — layout tags are still forbidden, so the
  * fallback stays cleaner than raw turndown, and a degraded page beats an
- * error for a body the browser already rendered.
+ * error for a body the browser already rendered. A result that fails
+ * {@link isUsableExtraction} is treated as that same failure, because a
+ * misleading extraction is worse than a noisy one.
  *
  * @param html - the rendered page HTML (`page.content()`).
  * @param url - the page URL, used to resolve relative links during parsing.
@@ -175,14 +265,19 @@ export function htmlToMarkdown(html: string, url: string): DenoiseResult {
   try {
     // Ungated: isProbablyReaderable is a conservative hint that rejects
     // sparse-but-real articles (measured on a browser-rendered fixture), so
-    // the extraction is simply attempted; a null or empty result falls back
-    // to the sanitized whole document below. parse() mutates, hence the clone
-    // (typed as Document: DOM lib types cloneNode's return as Node).
+    // the extraction is simply attempted; a null, empty, or unusable result
+    // falls back to the sanitized whole document below. parse() mutates,
+    // hence the clone (typed as Document: DOM lib types cloneNode's return
+    // as Node).
     const cloned = document.cloneNode(true) as typeof document
     const article = new Readability(cloned).parse()
     if (article !== null && typeof article.content === 'string' && article.content !== '') {
-      source = article.content
+      // The title survives the gate: it comes from the document's own
+      // metadata, which is trustworthy even when the body extraction is not.
       title = article.title ?? undefined
+      if (isUsableExtraction((article.textContent ?? '').length, (document.body?.textContent ?? '').length)) {
+        source = article.content
+      }
     }
   } catch {
     // Readability throws on pathological DOMs; the whole-document path below

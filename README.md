@@ -9,7 +9,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 ## Features
 
 - **Real browser rendering** — loads the page the way a user sees it, so client-side rendered (SPA) content is captured, not just the raw HTML.
-- **Denoise pipeline** — Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer. Inline `data:` images (build tools like Docusaurus embed screenshots as base64) are elided to size placeholders such as `![alt](data:image/png;base64,...8.9KB)` so they cannot flood the body.
+- **Denoise pipeline** — subtrees that can never become body text (`script`, `style`, `svg`, `noscript`, `template`) are dropped first, then Mozilla Readability extracts the article, DOMPurify removes layout/noise tags (nav, sidebar, footer, ads, forms), and Turndown with the GFM plugin converts to Markdown with the same style options as the shipped `tool-web` renderer. Readability can "succeed" wrongly on non-article pages — on a live iHerb product page it returned the 278-character cookie banner — so an extraction that is too small is treated as a failure and the whole document is converted instead, keeping the copy. Inline `data:` images (build tools like Docusaurus embed screenshots as base64) are elided to size placeholders such as `![alt](data:image/png;base64,...8.9KB)` so they cannot flood the body.
 - **Three backends** — a throwaway local Playwright browser per fetch, a **DSH-managed persistent browser** (one browser over a `user-data-dir`, reused as tabs, headless by configuration), or an already-running browser driven over CDP.
 - **Outbound proxy** — configure address, bypass list, username, and password once; the proxy is injected into every browser this plugin launches (**local** and **DSH-managed**), and the bundled launcher turns the same settings into the `--proxy-server` command the **CDP** browser must be started with.
 - **Browser resolution** — a configured path, a `playwright` CLI on `$PATH`, or the bundled `playwright-core`; CDP needs no local browser at all.
@@ -36,7 +36,7 @@ web_fetch (tool-web)
         │            └─ ONE browser for the provider's lifetime; each fetch is a tab in it
         ├─ cdp:     connectOverCDP(endpoint) → one shared connection; each fetch is a tab
         ├─ page.goto → settle (networkidle, best-effort) → page.content()
-        ├─ denoise: jsdom → elide data-URI images → Readability → DOMPurify → Turndown(GFM)
+        ├─ denoise: strip non-content subtrees → jsdom → elide data-URI images → Readability (whole-document fallback when the extraction is too small) → DOMPurify → Turndown(GFM)
         └─ Markdown (or raw HTML when denoise is off)
 ```
 

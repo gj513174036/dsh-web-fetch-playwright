@@ -604,6 +604,24 @@ describe('PlaywrightFetchProvider', () => {
     expect((result.body as { content: string }).content.length).toBe(100_000)
   })
 
+  it('charges the pipeline budget for content, not for non-content bloat', async () => {
+    // The iHerb product-page shape: megabytes of inline CSS/JS, then the copy.
+    // Slicing the raw HTML at the cap discarded the whole article, leaving
+    // Readability to score the cookie banner instead; stripping the
+    // non-content subtrees first keeps the copy inside the budget.
+    const bloat = 'a'.repeat(1_100_000)
+    const html =
+      `<!doctype html><html><head><style>${bloat}</style><script>${bloat}</script></head>` +
+      '<body><article><h1>Vitamin D3</h1><p>125 mcg (5,000 IU) per softgel.</p></article></body></html>'
+    expect(html.length).toBeGreaterThan(2_000_000)
+    const result = await new FakeProvider({}, { html }).fetch({ url: 'https://example.com/pdp' })
+    // Nothing of the article was clipped, so this is not a truncated body.
+    expect(result.truncated).toBe(false)
+    const content = (result.body as { content: string }).content
+    expect(content).toContain('125 mcg')
+    expect(content).not.toContain('aaaaaaaa')
+  })
+
   it('maps navigation failures to WEB_PROVIDER_ERROR with the original message', async () => {
     const code = await codeOf(
       new FakeProvider({}, { gotoError: new Error('net::ERR_CONNECTION_REFUSED at https://example.com') })

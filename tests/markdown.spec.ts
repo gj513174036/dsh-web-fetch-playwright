@@ -4,7 +4,7 @@
  * non-article page that must fall back to whole-document conversion.
  */
 import { describe, expect, it } from 'vitest'
-import { htmlToMarkdown } from '../src/markdown.ts'
+import { htmlToMarkdown, isUsableExtraction, stripNonContentHtml } from '../src/markdown.ts'
 
 /** A typical docs/blog page: header nav, sidebar, article, footer, ad slots. */
 const ARTICLE_PAGE = `<!doctype html>
@@ -153,5 +153,66 @@ describe('htmlToMarkdown', () => {
     expect(() => htmlToMarkdown('<html><body>', 'https://example.com/x')).not.toThrow()
     const { markdown } = htmlToMarkdown('<p>hello</p>', 'https://example.com/x')
     expect(markdown.toLowerCase()).toContain('hello')
+  })
+})
+
+describe('stripNonContentHtml', () => {
+  it('deletes subtrees that can never reach the markdown', () => {
+    const html =
+      '<html><head><style>p{color:red}</style><script>var x = 1</script></head><body>' +
+      '<noscript>enable js</noscript><svg><text>chart label</text></svg>' +
+      '<template><p>tpl</p></template><p>kept copy</p><!-- hidden note --></body></html>'
+    const stripped = stripNonContentHtml(html)
+    expect(stripped).toContain('kept copy')
+    for (const gone of ['color:red', 'var x = 1', 'enable js', 'chart label', 'tpl', 'hidden note']) {
+      expect(stripped).not.toContain(gone)
+    }
+  })
+
+  it('consumes an unterminated subtree through the end of a truncated document', () => {
+    // The tool caps bodies mid-tree, so the closing tag can be missing.
+    const stripped = stripNonContentHtml('<body><p>before</p><script>var tail = 1')
+    expect(stripped).toContain('before')
+    expect(stripped).not.toContain('tail')
+  })
+
+  it('ignores tag names that merely start with a stripped one', () => {
+    const stripped = stripNonContentHtml('<SCRIPT>a</SCRIPT><stylesheet>b</stylesheet><p>c</p>')
+    expect(stripped).not.toContain('a')
+    expect(stripped).toContain('<stylesheet>b</stylesheet>')
+    expect(stripped).toContain('c')
+  })
+
+  it('leaves the copy reachable when bloat would otherwise push it past the cap', () => {
+    // The iHerb product-page shape: megabytes of inline CSS/JS up front, the
+    // product copy at the very end of the document.
+    const bloat = `${'a'.repeat(1_100_000)}`
+    const html =
+      `<!doctype html><html><head><style>${bloat}</style><script>${bloat}</script></head>` +
+      '<body><article><h1>Vitamin D3</h1><p>125 mcg (5,000 IU) per softgel.</p></article></body></html>'
+    expect(html.length).toBeGreaterThan(2_000_000)
+    const { markdown } = htmlToMarkdown(stripNonContentHtml(html), 'https://example.com/pdp')
+    expect(markdown).toContain('125 mcg')
+    expect(markdown).not.toContain('aaaaaaaa')
+  })
+})
+
+describe('isUsableExtraction', () => {
+  it('trusts any extraction that is large in absolute terms', () => {
+    expect(isUsableExtraction(2_000, 900_000)).toBe(true)
+    expect(isUsableExtraction(12_000, 20_000)).toBe(true)
+  })
+
+  it('rejects a sliver of a far larger document', () => {
+    // Both measured on live iHerb product pages, where Readability returned
+    // the cookie-consent block and dropped the product copy.
+    expect(isUsableExtraction(278, 18_639)).toBe(false)
+    expect(isUsableExtraction(292, 944_803)).toBe(false)
+  })
+
+  it('trusts a short extraction when the page is short too', () => {
+    expect(isUsableExtraction(400, 700)).toBe(true)
+    expect(isUsableExtraction(50, 60)).toBe(true)
+    expect(isUsableExtraction(0, 0)).toBe(true)
   })
 })

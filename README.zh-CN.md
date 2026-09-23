@@ -36,7 +36,7 @@ web_fetch (tool-web)
         │            └─ 整个生命周期只启动一个浏览器；每次抓取是它的一个标签页
         ├─ cdp:     connectOverCDP(endpoint) → 一条共享连接；每次抓取一个标签页
         ├─ page.goto → 等待稳定（networkidle，尽力而为）→ page.content()
-        ├─ 降噪：jsdom → 内联 data: 图片改占位符 → Readability → DOMPurify → Turndown(GFM)
+        ├─ 降噪：剥离非正文子树 → jsdom → 内联 data: 图片改占位符 → Readability（抽错则整页回退）→ DOMPurify → Turndown(GFM)
         └─ Markdown（关闭降噪时返回原始 HTML）
 ```
 
