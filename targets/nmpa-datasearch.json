@@ -8,6 +8,7 @@
         { "verb": "click", "candidates": [{ "selector": "a[title=\"境内生产药品\"]" }] },
         { "verb": "type", "candidates": [{ "selector": "input[data-step=\"4\"]" }], "value": "阿司匹林" },
         { "verb": "click", "candidates": [{ "selector": "button[data-step=\"5\"]" }], "opensPage": true },
+        { "verb": "waitFor", "condition": { "kind": "response", "match": { "kind": "prefix", "url": "https://datasearch.nmpa.gov.cn/datasearch/data/nmpadata/countNums" } } },
         { "verb": "waitFor", "condition": { "kind": "text", "text": "阿司匹林肠溶片" } }
       ]
     }

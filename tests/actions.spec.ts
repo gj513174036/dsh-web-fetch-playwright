@@ -69,6 +69,54 @@ function statePage(answer: unknown): PlaywrightPage {
   })
 }
 
+/**
+ * A page that reports responses, so a `response` condition is answered the way a
+ * browser answers it: as an event arriving while the run waits.
+ *
+ * `arrivals` are fired one at a time, and the timing is deliberate rather than
+ * hopeful — the first lands on the tick after the run starts watching (the page
+ * fetching something on its own), and every later one lands when the click probe
+ * runs (an act causing the arrival, which is what a recipe waits on). No case
+ * here sleeps and hopes.
+ */
+function responsePage(arrivals: readonly string[], options: { firstInHand?: boolean } = {}): PlaywrightPage {
+  const listeners: ((response: { url(): string }) => void)[] = []
+  let next = 0
+  const fire = (): void => {
+    const url = arrivals[next]
+    if (url === undefined) return
+    next += 1
+    for (const listener of listeners) listener({ url: () => url })
+  }
+  return {
+    url: () => 'https://a.example/search',
+    on: (event: string, listener: (response: { url(): string }) => void) => {
+      if (event !== 'response') return undefined
+      listeners.push(listener)
+      // `firstInHand` fires the first arrival the moment the run opens its
+      // journal — a response already in flight when the actions started — while
+      // the default lets it land on the next tick, during the first wait. The
+      // difference decides whether a later click may be credited with it.
+      if (options.firstInHand === true) fire()
+      else if (listeners.length === 1) setTimeout(fire, 0)
+      return undefined
+    },
+    evaluate: async (script: string) => {
+      if (script.includes(CLICK_SCRIPT_MARKER)) {
+        fire()
+        return { ok: true, candidate: 'a candidate' }
+      }
+      return true
+    },
+  } as unknown as PlaywrightPage
+}
+
+/** A `waitFor` on a response whose URL is under `https://a.example/api/search`. */
+const responseWait = (kind: 'prefix' | 'exact' = 'prefix'): WaitStep => ({
+  verb: 'waitFor',
+  condition: { kind: 'response', match: { kind, url: 'https://a.example/api/search' } },
+})
+
 const allChecked = { ok: true, scope: 'selector "input[type=checkbox]"', total: 5, notInState: 0, holds: true, sample: '' }
 
 const options = { remainingMs: () => 5_000, stepCeilingMs: 20, pollMs: 1 }
@@ -162,6 +210,92 @@ describe('runTargetActions', () => {
     const stayed = await runTargetActions(pageWith({ url: 'https://a.example/search?q=1' }), target(left), options)
     expect(stayed.ok).toBe(false)
     expect((stayed as { failure: ActionFailure }).failure.detail).toContain('to have left')
+  })
+
+  it('holds a response condition once the matching response arrives', async () => {
+    // The one condition the page cannot be asked about: the run listens, and the
+    // arrival is the answer.
+    const outcome = await runTargetActions(responsePage(['https://a.example/api/search?kw=x']), target(responseWait()), options)
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps).toEqual([
+      { index: 0, verb: 'waitFor', detail: 'response under https://a.example/api/search', outcome: 'met' },
+    ])
+  })
+
+  it('ignores a response that does not match, and says what it did see', async () => {
+    const outcome = await runTargetActions(responsePage(['https://a.example/api/other']), target(responseWait()), options)
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.detail).toContain('response under https://a.example/api/search')
+    // A recipe waiting on the wrong endpoint should hear which one the page
+    // actually called, not only that its budget ran out.
+    expect(failure.detail).toContain('the last response was https://a.example/api/other')
+  })
+
+  it('never reports a response condition met when nobody is listening', async () => {
+    // No response seam at all is not "not yet": nothing will ever arrive, so the
+    // step must fail saying the page could not be read.
+    const outcome = await runTargetActions(pageWith({ evaluate: async () => true }), target(responseWait()), options)
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('could not be read')
+  })
+
+  it('credits a click with the response it caused', async () => {
+    // The arrival fires while the click is in flight — the race a listener armed
+    // at the wait would lose — so the wait holds and the click is verified.
+    const page = responsePage(['https://a.example/api/other', 'https://a.example/api/search?kw=x'])
+    const outcome = await runTargetActions(page, target(click({ kind: 'selector', selector: '#go' }), responseWait()), options)
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['clicked', 'met'])
+  })
+
+  it('does not credit a click with a response the run already had', async () => {
+    // The first arrival lands while the run is watching but BEFORE the click, and
+    // nothing has spent it: that is what the wait after the click would consume,
+    // so the wait holding says nothing about the click. The second arrival is
+    // genuinely the click's, but the oldest unspent one answers first — and the
+    // click is left unverified rather than given credit it did not earn.
+    const page = responsePage(
+      ['https://a.example/api/search?kw=1', 'https://a.example/api/search?kw=2'],
+      { firstInHand: true },
+    )
+    const outcome = await runTargetActions(page, target(click({ kind: 'selector', selector: '#go' }), responseWait()), options)
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
+  })
+
+  it('credits a click when the arrival in hand was already spent by an earlier wait', async () => {
+    // The mirror of the case above: an arrival an earlier wait consumed cannot be
+    // consumed again, so it is not evidence against this click — and counting it
+    // as such would mark a genuinely-caused click unverified.
+    const page = responsePage(
+      ['https://a.example/api/search?kw=1', 'https://a.example/api/search?kw=2'],
+      { firstInHand: true },
+    )
+    const outcome = await runTargetActions(page, target(responseWait(), click({ kind: 'selector', selector: '#go' }), responseWait()), options)
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['met', 'clicked', 'met'])
+  })
+
+  it('needs a second response for a second wait on the same endpoint', async () => {
+    // A response is an event, not a state: a paged recipe that waits again must
+    // not be answered by the first arrival, which would be a silent wrong answer.
+    const page = responsePage(['https://a.example/api/other', 'https://a.example/api/search?kw=1'])
+    const outcome = await runTargetActions(page, target(click({ kind: 'selector', selector: '#go' }), responseWait(), click({ kind: 'selector', selector: '#next' }), responseWait()), options)
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.index).toBe(3)
+    expect(failure.verb).toBe('waitFor')
+    expect(failure.detail).toContain('response under https://a.example/api/search')
+  })
+
+  it('describes a response condition as the match it carries', () => {
+    expect(describeCondition(responseWait().condition)).toBe('response under https://a.example/api/search')
+    expect(describeCondition(responseWait('exact').condition)).toBe('response exactly https://a.example/api/search')
   })
 
   it('skips an optional step that does not hold and carries on', async () => {

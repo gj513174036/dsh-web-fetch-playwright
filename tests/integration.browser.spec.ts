@@ -18,9 +18,12 @@
  * and the feature-on provider for the before/after comparison (issue #2).
  */
 import { createServer } from 'node:http'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
-import { PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
+import { PlaywrightFetchProvider, WEB_FETCH_ACTION_CODE, WEB_FETCH_CHALLENGE_CODE } from '../src/provider.ts'
 import { resolvePlaywrightBackend } from '../src/playwright-resolve.ts'
 
 const PAGE = `<!doctype html><html><head><title>Smoke page</title></head><body>
@@ -92,9 +95,62 @@ const CHALLENGE_HEADERS = {
   'server': 'cloudflare',
 } as const
 
+/**
+ * A query page whose data arrives over XHR: pressing the button fires the
+ * request a beat later and renders the answer — the shape a regulator's search
+ * has, and the race a `response` condition exists for (the arrival lands while
+ * the click that caused it is still in flight).
+ */
+const QUERY_PAGE = `<!doctype html><html><head><title>Query</title></head><body>
+<main><article><h1>Query the register</h1>
+<p>This paragraph exists so the article extractor has something to lock onto before the query runs.</p>
+<input id="kw" value="阿司匹林">
+<button id="go">查询</button>
+<div id="out">not asked yet</div>
+<script>
+document.getElementById('go').addEventListener('click', function () {
+  setTimeout(function () {
+    fetch('/api/search?kw=' + encodeURIComponent(document.getElementById('kw').value))
+      .then(function (r) { return r.json() })
+      .then(function (data) { document.getElementById('out').textContent = 'RESULTS ' + data.total })
+  }, 250)
+})
+</script>
+</article></main>
+</body></html>`
+
+/**
+ * The NMPA shape: the button opens a page of its own, and *that* page is the one
+ * that asks the server. The response wait has to be watching from the moment the
+ * tab appears, not from the moment the run adopts it.
+ */
+const OPENER_PAGE = `<!doctype html><html><head><title>Opener</title></head><body>
+<main><article><h1>Opener</h1>
+<p>This paragraph exists so the article extractor has something to lock onto on the opening page.</p>
+<button id="open">查询</button>
+</article></main>
+<script>
+document.getElementById('open').addEventListener('click', function () { window.open('/popup') })
+</script>
+</body></html>`
+
+const POPUP_PAGE = `<!doctype html><html><head><title>Results</title></head><body>
+<main><article><h1>Results</h1>
+<p>This paragraph only exists on the page the click opened, which is where the query answers.</p>
+<p>A second paragraph so the article extractor locks onto the main content region.</p>
+<div id="out">loading</div>
+<script>
+setTimeout(function () {
+  fetch('/api/popup-search?kw=%E9%98%BF%E5%8F%B8%E5%8C%B9%E6%9E%97')
+    .then(function (r) { return r.json() })
+    .then(function (data) { document.getElementById('out').textContent = 'RESULTS ' + data.total })
+}, 300)
+</script>
+</article></main>
+</body></html>`
+
 /** Observable counters of the simulated challenge edge. */
 const challengeState = { challengesServed: 0 }
-
 let server: ReturnType<typeof createServer>
 let baseUrl: string
 let browserAvailable = false
@@ -134,6 +190,35 @@ beforeAll(async () => {
       }
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       res.end(GUARDED_ARTICLE)
+      return
+    }
+    if (url.startsWith('/api/search')) {
+      // The JSON a `response` condition waits for; the page renders it a moment
+      // after the answer arrives, so a text wait alone would be the wrong claim.
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ total: 924 }))
+      return
+    }
+    if (url.startsWith('/query')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(QUERY_PAGE)
+      return
+    }
+    if (url.startsWith('/api/popup-search')) {
+      // The answer the OPENED page waits for — the tab's own traffic, watched
+      // from the moment it opens.
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ total: 924 }))
+      return
+    }
+    if (url.startsWith('/opener')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(OPENER_PAGE)
+      return
+    }
+    if (url.startsWith('/popup')) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(POPUP_PAGE)
       return
     }
     if (url.startsWith('/cookie')) {
@@ -587,6 +672,100 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
     // The second fetch's fresh browser was challenged again — nothing leaked.
     expect(challengeState.challengesServed).toBe(served + 1)
     expect(textOf(second)).toContain('Real protected content')
+    await provider.dispose()
+  })
+})
+
+/**
+ * The `response` condition, through a real browser and a real socket: the
+ * arrival lands while the click that caused it is still in flight, which is the
+ * race the condition exists for and the one a fake can only imitate.
+ */
+describe('PlaywrightFetchProvider response condition (real browser, real XHR)', () => {
+  /** Write a targets file on disk, as the setting requires. */
+  function targetsFile(actions: string, path = '/query'): string {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-responses-'))
+    const file = join(dir, 'targets.json')
+    writeFileSync(
+      file,
+      `{ "targets": [ { "name": "query", "match": { "kind": "prefix", "url": "${baseUrl.replace(/\/$/, '')}${path}" }, "actions": [${actions}] } ] }`,
+      'utf8',
+    )
+    return file
+  }
+
+  function configFor(targets: string) {
+    return () => ({
+      backend: 'local' as const,
+      playwrightPath: '',
+      cdpEndpoint: '',
+      shareBrowserContext: true,
+      denoise: true,
+      dismissConsent: false,
+      observe: false,
+      targetsFile: targets,
+      maxConcurrency: 4,
+      challengeWaitMs: 0,
+      challengeRetries: 0,
+    })
+  }
+
+  function textOf(result: { body: { kind: string; content: string } }): string {
+    return result.body.kind === 'text' ? result.body.content : ''
+  }
+
+  const clickGo = '{ "verb": "click", "candidates": [ { "selector": "#go" } ] }'
+  const waitResponse = (path: string): string =>
+    `{ "verb": "waitFor", "condition": { "kind": "response", "match": { "kind": "prefix", "url": "http://127.0.0.1:${String(new URL(baseUrl).port)}${path}" } } }`
+
+  it('holds on the XHR the click causes, and reads the click as verified', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping response condition (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(configFor(targetsFile(`${clickGo}, ${waitResponse('/api/search')}, { "verb": "waitFor", "condition": { "kind": "text", "text": "RESULTS 924" } }`)))
+    const result = await provider.fetch({ url: `${baseUrl}query` })
+    const text = textOf(result)
+    expect(text).toContain('1. click selector "#go"')
+    // The click is credited because a response arrived that was not there before.
+    expect(text).toMatch(/1\. click [^\n]*— clicked/)
+    expect(text).toContain('2. waitFor response under http://127.0.0.1:')
+    expect(text).toContain('/api/search — met')
+    expect(text).toContain('RESULTS 924')
+    await provider.dispose()
+  })
+
+  it('watches the tab an action opened, from the moment it opens', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping response condition (no launchable browser)')
+      return
+    }
+    const open = '{ "verb": "click", "candidates": [ { "selector": "#open" } ], "opensPage": true }'
+    const provider = new PlaywrightFetchProvider(configFor(targetsFile(`${open}, ${waitResponse('/api/popup-search')}, { "verb": "waitFor", "condition": { "kind": "text", "text": "RESULTS 924" } }`, '/opener')))
+    const result = await provider.fetch({ url: `${baseUrl}opener` })
+    const text = textOf(result)
+    expect(text).toMatch(/1\. click [^\n]*— clicked/)
+    expect(text).toContain('it opened a page; the rest of the target runs there')
+    expect(text).toContain('2. waitFor response under http://127.0.0.1:')
+    expect(text).toContain('/api/popup-search — met')
+    expect(text).toContain('RESULTS 924')
+    await provider.dispose()
+  })
+
+  it('fails loudly on an endpoint the page never calls, naming the last response it did see', { timeout: 120_000 }, async () => {
+    if (!browserAvailable) {
+      console.warn('skipping response condition (no launchable browser)')
+      return
+    }
+    const provider = new PlaywrightFetchProvider(configFor(targetsFile(`${clickGo}, ${waitResponse('/api/never-called')}`)))
+    const error = await provider.fetch({ url: `${baseUrl}query` })
+      .then(() => { throw new Error('expected rejection') }, (e: unknown) => e)
+    expect(error).toBeInstanceOf(WebError)
+    expect((error as WebError).code).toBe(WEB_FETCH_ACTION_CODE)
+    expect((error as WebError).message).toContain('step 2 (waitFor) did not hold')
+    // "The page is calling something else" is what the recipe's author needs.
+    expect((error as WebError).message).toContain('the last response was http://127.0.0.1:')
+    expect((error as WebError).message).toContain('/api/search')
     await provider.dispose()
   })
 })

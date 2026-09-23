@@ -75,6 +75,13 @@ _Avoid_: popup (that is the mechanism, not the thing), 新窗口
 Reading a page's state back so a planner can choose the next action. Replay does not need it.
 _Avoid_: inspect
 
+**Response(响应)**:
+A reply the browser *received*, as a wait can watch for it. It is an event, not a state: it happened once, at
+a moment, and the page may not have rendered it yet — which is what makes it the direct "the data has
+arrived" signal. A target's action run only counts the responses that arrived while it was running, and each
+wait claims one arrival.
+_Avoid_: request (that is what was sent), network log (that is the capture)
+
 **Action recording(动作录制)**:
 Capturing a person's operations on a page so they can become a target. Distinct from **Capture**,
 which records traffic rather than intent.

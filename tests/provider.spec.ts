@@ -258,6 +258,11 @@ interface FakePageSpec {
    * listeners fire with it, exactly as a `target="_blank"` link would.
    */
   popup?: PlaywrightPage
+  /**
+   * Response URLs this fake reports, one per click probe: the arrival an act
+   * causes, which is what a `response` condition waits for.
+   */
+  emitResponses?: readonly string[]
 }
 
 /** The page an `opensPage` step opens: enough prose for the extractor. */
@@ -321,6 +326,7 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
   const scripted = spec.gotoScript ?? []
   let reads = 0
   let cleared = false
+  let emitted = 0
 
   const entryAt = (index: number): NonNullable<FakePageSpec['gotoScript']>[number] | undefined =>
     scripted.length === 0 ? undefined : scripted[Math.min(index, scripted.length - 1)]
@@ -392,6 +398,21 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
         // is when a real popup arrives.
         if (spec.popup !== undefined && script.includes('const watch = ')) {
           for (const listener of [...popupListeners]) listener(spec.popup)
+        }
+        // A response an act causes arrives the same way — while the act runs, and
+        // after the pre-click read that decides whether it proves anything.
+        if (spec.emitResponses !== undefined && script.includes('const watch = ')) {
+          const url = spec.emitResponses[emitted]
+          emitted += 1
+          if (url !== undefined) {
+            const response: PlaywrightResponse = {
+              status: () => 200,
+              headers: () => ({}),
+              text: async () => '',
+              url: () => url,
+            }
+            for (const listener of [...responseListeners]) listener(response)
+          }
         }
         if (spec.evaluateError !== undefined) throw spec.evaluateError
         if (spec.evaluateQueue !== undefined && spec.evaluateQueue.length > 0) return spec.evaluateQueue.shift()
@@ -892,6 +913,21 @@ describe('PlaywrightFetchProvider', () => {
     const content = (result.body as { content: string }).content
     expect(content.startsWith('> actions: 1. click text "查询" -> button — clicked')).toBe(true)
     expect(content).toContain('2. waitFor text "World" — met → final document https://final.example.com/docs (HTTP 200)')
+  })
+
+  it('waits for the response an act caused, and reads the click as verified', async () => {
+    // The arrival fires while the click runs, which is the race a listener armed
+    // at the wait would lose — and it is what turns "a click went out" into "the
+    // page answered".
+    const responseWait = '{ "verb": "waitFor", "condition": { "kind": "response", "match": { "kind": "prefix", "url": "https://example.com/api/search" } } }'
+    const targetsFile = targetFor('https://example.com/docs', `${clickText('查询')}, ${responseWait}`)
+    const result = await new FakeProvider({ targetsFile }, {
+      emitResponses: ['https://example.com/api/search?kw=x'],
+      evaluateQueue: [{ ok: true, candidate: 'text "查询" -> button' }],
+    }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('> actions: 1. click text "查询" -> button — clicked')).toBe(true)
+    expect(content).toContain('2. waitFor response under https://example.com/api/search — met')
   })
 
   it('shows a click that nothing after it confirmed as unverified', async () => {

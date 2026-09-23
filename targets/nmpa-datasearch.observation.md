@@ -120,9 +120,17 @@ Visible text (head):
   paragraph of field names, so the attribute is the only stable identity.
 - `click` the submit by selector (`button[data-step="5"]`) with `"opensPage": true`. It is icon-only and
   unnamed, so no text or role candidate can name it either.
+- `waitFor` the **response the submit is answered by** (0.2.26): the register counts the matches with an XHR
+  to `…/datasearch/data/nmpadata/countNums?…&searchValue=阿司匹林`, which answers
+  `200 {"code":200,"data":[{"name":"境内生产药品","nums":924}]}` (captured on the host in
+  `net-dumps/20260923T151255Z-8c6d-001`). That is "the query reached the server and was answered" — the
+  direct signal, and the one that makes the click above *verified* rather than merely dispatched. The
+  `match` is a prefix on the endpoint's path, so the query string (which carries the keyword and a
+  timestamp) does not have to be written down.
 - `waitFor` a product name the query returns (`阿司匹林肠溶片`): the adopted tab is still loading when it is
   handed over, and a row of the searched listing is what proves the query ran with *this* keyword rather
-  than showing a default listing.
+  than showing a default listing. The response wait above says the *server* answered; this one says the
+  *page* rendered it, and they are two different claims.
 
 **A gotcha worth writing down**: the text conditions compare against the page's raw visible text, while
 `observe` renders its text head with whitespace collapsed. `药品 Drugs` is one control in the observation

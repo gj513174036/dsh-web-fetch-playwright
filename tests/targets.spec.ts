@@ -122,7 +122,8 @@ describe('parseTargets', () => {
       { "verb": "waitFor", "condition": { "kind": "text", "text": "加载中", "absent": true } },
       { "verb": "waitFor", "condition": { "kind": "url", "url": "https://a.example/results" } },
       { "verb": "waitFor", "condition": { "kind": "url", "url": "https://a.example/gate", "absent": true } },
-      { "verb": "waitFor", "condition": { "kind": "time", "ms": 250 }, "optional": true }`
+      { "verb": "waitFor", "condition": { "kind": "time", "ms": 250 }, "optional": true },
+      { "verb": "waitFor", "condition": { "kind": "response", "match": { "kind": "prefix", "url": "https://a.example/api/search" } } }`
     const step = targetsOf(file(actions))[0]?.actions
     const conditionOf = (index: number): unknown => {
       const entry = step?.[index]
@@ -132,6 +133,30 @@ describe('parseTargets', () => {
     expect(conditionOf(2)).toEqual({ kind: 'url', url: 'https://a.example/results' })
     expect(conditionOf(3)).toEqual({ kind: 'url', url: 'https://a.example/gate', absent: true })
     expect(step?.[4]).toEqual({ verb: 'waitFor', condition: { kind: 'time', ms: 250 }, optional: true })
+    expect(conditionOf(5)).toEqual({ kind: 'response', match: { kind: 'prefix', url: 'https://a.example/api/search' } })
+  })
+
+  it('reads a response condition, whose match is a target match', () => {
+    // One match clause in the vocabulary, parsed by the same code: a response is
+    // selected by its URL exactly the way a target is.
+    const cond = (match: string): string => `{ "verb": "waitFor", "condition": { "kind": "response", "match": ${match} } }`
+    expect(targetsOf(file(cond('{ "kind": "exact", "url": "https://a.example/api/search" }')))[0]?.actions[0]).toEqual({
+      verb: 'waitFor',
+      condition: { kind: 'response', match: { kind: 'exact', url: 'https://a.example/api/search' } },
+    })
+    expect(targetsOf(file(cond('{ "kind": "prefix", "url": "https://a.example/api/" }')))[0]?.actions[0]).toMatchObject({
+      condition: { kind: 'response', match: { kind: 'prefix', url: 'https://a.example/api/' } },
+    })
+  })
+
+  it('refuses a response condition whose match is missing, malformed or widened', () => {
+    const cond = (body: string): string => file(`{ "verb": "waitFor", "condition": { "kind": "response"${body} } }`)
+    expect(errorOf(cond(''))).toContain('condition.match: expected an object')
+    expect(errorOf(cond(', "match": { "kind": "regex", "url": "https://a.example/api" }'))).toContain('.condition.match.kind: expected "exact" or "prefix"')
+    // The same silent-widening refusal a target's match gets, for the same reason.
+    expect(errorOf(cond(', "match": { "kind": "prefix", "url": "https://a.example/api?q=1" }'))).toContain('comparison ignores the query string and hash')
+    // No `absent`: a response is an event, and "none ever arrives" is the budget.
+    expect(errorOf(cond(', "match": { "kind": "prefix", "url": "https://a.example/api" }, "absent": true'))).toContain('unknown key "absent" (allowed: "kind", "match")')
   })
 
   it('reads a state condition over a candidate list, in all four states', () => {
@@ -155,7 +180,7 @@ describe('parseTargets', () => {
     expect(errorOf(cond('{ "kind": "state", "state": "checked" }'))).toContain('.condition.candidates')
     expect(errorOf(cond('{ "kind": "state", "state": "checked", "candidates": [] }'))).toContain('a state condition with no candidates')
     expect(errorOf(cond('{ "kind": "state", "state": "checked", "candidates": [ { "text": "x" } ], "absent": true }'))).toContain('unknown key "absent"')
-    expect(errorOf(cond('{ "kind": "regex" }'))).toContain('expected "text", "url", "time" or "state"')
+    expect(errorOf(cond('{ "kind": "regex" }'))).toContain('expected "text", "url", "time", "state" or "response"')
   })
 
   it('names the place in the file that is wrong', () => {

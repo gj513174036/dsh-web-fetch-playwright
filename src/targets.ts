@@ -42,12 +42,21 @@ export type WaitState = 'checked' | 'unchecked' | 'enabled' | 'disabled'
  * - `state` — every control the candidates name is in that state. The condition
  *   text cannot express: a gate that refuses to continue until all five consents
  *   are ticked says so in no label, only in state.
+ * - `response` — the browser has received a response whose URL matches. The one
+ *   condition the page cannot be asked about: "the data has arrived" is the
+ *   direct signal, and it says nothing about whether the page has rendered it
+ *   yet, which is what makes it more stable than waiting for the markup. It takes
+ *   the same match clause a target does, and — being an event rather than a state
+ *   — each wait claims its own arrival, so a recipe that waits on the same
+ *   endpoint twice needs two responses. There is no `absent`: "no response ever
+ *   arrives" is the whole timeout, which the step's budget already is.
  */
 export type WaitCondition =
   | { readonly kind: 'text'; readonly text: string; readonly absent?: boolean }
   | { readonly kind: 'url'; readonly url: string; readonly absent?: boolean }
   | { readonly kind: 'time'; readonly ms: number }
   | { readonly kind: 'state'; readonly state: WaitState; readonly candidates: readonly Candidate[] }
+  | { readonly kind: 'response'; readonly match: TargetMatch }
 
 /**
  * One way to name a control: an intent's ordered candidates, tried until one is
@@ -284,6 +293,19 @@ export function describeCandidate(candidate: Candidate): string {
   return `role ${candidate.role} ${JSON.stringify(candidate.name)}`
 }
 
+/**
+ * How a URL match reads in a summary or a failure message.
+ *
+ * One wording for the target's own match and for a `response` condition's, so a
+ * reader who has seen one recognises the other.
+ *
+ * @param match - the match clause.
+ * @returns e.g. `under https://example.com/search`, `exactly https://example.com/`.
+ */
+export function describeMatch(match: TargetMatch): string {
+  return match.kind === 'exact' ? `exactly ${match.url}` : `under ${match.url}`
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -354,7 +376,17 @@ function parseCondition(value: unknown, path: string): { condition: WaitConditio
     if ('error' in candidates) return { error: candidates.error }
     return { condition: { kind: 'state', state, candidates: candidates.parsed } }
   }
-  return { error: `${at(path)}.kind: expected "text", "url", "time" or "state"` }
+  if (kind === 'response') {
+    const unknown = unknownKeys(value, ['kind', 'match'], path)
+    if (unknown !== null) return { error: unknown }
+    // The same match clause a target carries, parsed by the same code: a
+    // response is selected by its URL exactly the way a target is, including the
+    // refusal to write a query string or hash that comparison ignores.
+    const match = parseMatch(value['match'], `${path}.match`)
+    if ('error' in match) return { error: match.error }
+    return { condition: { kind: 'response', match: match.match } }
+  }
+  return { error: `${at(path)}.kind: expected "text", "url", "time", "state" or "response"` }
 }
 
 /**

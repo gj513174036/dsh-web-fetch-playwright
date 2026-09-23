@@ -27,7 +27,7 @@ import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
 import { raceTimeout, TIMED_OUT } from './race.ts'
 import { readState } from './state.ts'
 import { describeTypeFailure, typeInto } from './type.ts'
-import { describeCandidate, urlIsUnder, type ActionStep, type Candidate, type Target, type WaitCondition, type WaitStep } from './targets.ts'
+import { describeCandidate, describeMatch, matchesTarget, normalizedUrl, urlIsUnder, type ActionStep, type Candidate, type Target, type TargetMatch, type WaitCondition, type WaitStep } from './targets.ts'
 
 /** Longest one step may take, before the fetch's own remaining budget caps it. */
 export const STEP_CEILING_MS = 10_000
@@ -112,7 +112,104 @@ export function describeCondition(condition: WaitCondition): string {
   if (condition.kind === 'state') {
     return `all ${condition.state} over ${condition.candidates.map(describeCandidate).join(' or ')}`
   }
+  if (condition.kind === 'response') return `response ${describeMatch(condition.match)}`
   return `wait ${String(condition.ms)}ms`
+}
+
+/**
+ * The responses the run has watched arrive.
+ *
+ * A `response` condition is the one condition the page cannot be asked about: the
+ * browser reports responses as they arrive, so the run listens from the moment it
+ * starts and remembers what came. Two consequences, both deliberate:
+ *
+ * - **What happened before the run is not evidence.** The journal starts empty
+ *   when the actions do, so a response the page fetched while it loaded can never
+ *   satisfy a wait. If the data was already there, a text or state condition is
+ *   the honest way to say so.
+ * - **Each arrival answers one wait.** A response is an event, not a state: a
+ *   recipe that walks a paged list and waits on the same endpoint again needs a
+ *   second response, and the first one's arrival must not be read as the second
+ *   one's. That is what an arrival being *spent* means.
+ */
+interface ResponseLog {
+  /**
+   * Start watching one page's responses.
+   *
+   * @returns false when the page offers no response seam at all — a `response`
+   *   condition cannot be answered then, and the step must fail saying the page
+   *   could not be read rather than spend its budget on a wait nobody is feeding.
+   */
+  arm(page: PlaywrightPage): boolean
+  /** Has a matching response arrived? Claims it for this wait when it has. */
+  arrived(match: TargetMatch): boolean
+  /**
+   * Is there a matching response in hand that no wait has spent yet?
+   *
+   * The read taken *before* a click, and the reason it is unspent ones that
+   * matter: a wait after the click consumes the OLDEST unspent arrival, so an
+   * unspent one already in hand is exactly what could satisfy that wait without
+   * the click having done anything. An arrival an earlier wait already spent
+   * cannot be consumed again, so it is not evidence either way (and counting it
+   * would mark a genuinely-caused click unverified).
+   */
+  unspent(match: TargetMatch): boolean
+  /** The last response watched, for the sentence a timed-out wait fails with. */
+  last(): string | null
+}
+
+/** How many arrivals one fetch keeps. A page cannot spend them all, and a chatty
+ *  SPA must not grow the journal for the whole budget. */
+const RESPONSE_LOG_LIMIT = 2_000
+
+function watchResponses(): ResponseLog {
+  /** One arrival: its URL, and whether a wait has already read it. */
+  const arrivals: { url: string; spent: boolean }[] = []
+  const watching = new WeakSet<PlaywrightPage>()
+  const find = (match: TargetMatch, spend: boolean): boolean => {
+    for (const arrival of arrivals) {
+      // Spent either way: an arrival a wait has consumed can never answer
+      // anything again, so it is not evidence against a click either. The only
+      // difference between the two reads is whether this one marks it spent.
+      if (arrival.spent) continue
+      if (!matchesTarget(match, arrival.url)) continue
+      if (spend) arrival.spent = true
+      return true
+    }
+    return false
+  }
+  return {
+    arm(page) {
+      // A page is watched once. The caller arms a page when it opens and again
+      // when it adopts it, and a second listener would record every response
+      // twice — which would let one arrival answer two waits.
+      if (watching.has(page)) return true
+      if (page.on === undefined) return false
+      try {
+        page.on('response', (response) => {
+          const url = response.url?.() ?? ''
+          // Only a URL that can be compared with a match clause is worth keeping:
+          // a `data:` or `blob:` URL has no host to match against.
+          if (url === '' || normalizedUrl(url) === null) return
+          arrivals.push({ url, spent: false })
+          // Spent arrivals go first — they can never answer anything again — and
+          // only then the oldest, so the bounded journal still holds what a wait
+          // could still consume.
+          while (arrivals.length > RESPONSE_LOG_LIMIT) {
+            const spentAt = arrivals.findIndex((arrival) => arrival.spent)
+            arrivals.splice(spentAt === -1 ? 0 : spentAt, 1)
+          }
+        })
+        watching.add(page)
+        return true
+      } catch {
+        return false
+      }
+    },
+    arrived: (match) => find(match, true),
+    unspent: (match) => find(match, false),
+    last: () => arrivals.at(-1)?.url ?? null,
+  }
 }
 
 /**
@@ -147,6 +244,8 @@ function sleep(ms: number): Promise<void> {
  * @param condition - the condition to evaluate.
  * @param evaluate - the page's scripting seam, when it has one.
  * @param remainingMs - what is left of the step's budget; one read never outlives it.
+ * @param responses - the run's response journal, when the page can report
+ *   responses at all; `null` leaves a `response` condition unanswerable.
  * @returns the verdict, or null when the condition cannot be evaluated at all.
  */
 async function conditionHolds(
@@ -154,11 +253,23 @@ async function conditionHolds(
   condition: WaitCondition,
   evaluate: ((script: string) => Promise<unknown>) | undefined,
   remainingMs: number,
+  responses: ResponseLog | null = null,
 ): Promise<{ held: boolean; why: string } | null> {
   if (condition.kind === 'time') return { held: true, why: '' }
   if (condition.kind === 'url') {
     const under = urlIsUnder(currentUrl, condition.url)
     return { held: condition.absent === true ? !under : under, why: '' }
+  }
+  if (condition.kind === 'response') {
+    // A page nobody is listening to is not "not yet": nothing will ever arrive,
+    // so the honest answer is that this condition cannot be read here.
+    if (responses === null) return null
+    if (responses.arrived(condition.match)) return { held: true, why: '' }
+    // What the run did see is the most useful thing a failed wait can say — a
+    // recipe waiting on `/api/search` while the page is calling `/api/other`
+    // should hear that, not only that its budget ran out.
+    const last = responses.last()
+    return { held: false, why: last === null ? '' : `the last response was ${last}` }
   }
   if (evaluate === undefined) return null
   if (condition.kind === 'state') {
@@ -316,6 +427,11 @@ export async function runTargetActions(
   // belongs to the page the act opened.
   let current = page
   const reports: StepReport[] = []
+  // The run's window onto the network, armed only when a step asks for it: a
+  // recipe of waits, clicks and fields must not pay for a listener it never reads.
+  const responses = watchResponses()
+  const watchesResponses = target.actions.some((step) => step.verb === 'waitFor' && step.condition.kind === 'response')
+  let responsesReadable = watchesResponses && responses.arm(page)
   // What the confirming condition was at click time, per click step: a wait that
   // already held cannot be evidence that the click changed anything. `null`
   // means the state could not be read, which is not the same as "it held".
@@ -366,12 +482,25 @@ export async function runTargetActions(
         const read = await readState(evaluate, confirming.step.condition.candidates, confirming.step.condition.state, budget)
         heldBeforeClick.set(index, read?.held ?? null)
       }
+      // A response watch is read here for the same reason the other two are: an
+      // arrival the run already had in hand cannot be evidence that this click
+      // did anything — the wait after it may still hold, but the click it was
+      // supposed to prove is marked unverified rather than credited.
+      if (confirming !== null && confirming.step.condition.kind === 'response') {
+        heldBeforeClick.set(index, responsesReadable && responses.unspent(confirming.step.condition.match))
+      }
       // Registered before the act: the page can open while the click is in
       // flight, and a listener added afterwards would miss it. Both the wait and
       // the click live inside the step's one budget.
       const leftOfStep = (): number => Math.max(1, budget - (Date.now() - startedAtClick))
       const pageWait = step.opensPage === true
-        ? awaitOpenedPage(current, leftOfStep(), poll, options.claimPage)
+        ? awaitOpenedPage(current, leftOfStep(), poll, (opened) => {
+            options.claimPage?.(opened)
+            // Watch the page from the moment it opens, not from the moment the
+            // run adopts it: what it fetches while it loads is exactly what a
+            // wait after this step is about.
+            if (watchesResponses) responses.arm(opened)
+          })
         : null
       /** A click that does not end up adopting must let its wait go. */
       const giveUpPage = (): void => { pageWait?.cancel() }
@@ -407,6 +536,10 @@ export async function runTargetActions(
           continue
         }
         current = adopted.page
+        // The rest of the target runs on this page, so the responses a wait can
+        // see are this page's. A page that refuses listeners leaves a later
+        // response condition unanswerable, which is what it is.
+        if (watchesResponses) responsesReadable = responses.arm(adopted.page)
         landed = adopted.detail
       }
       reports.push({ index, verb: step.verb, detail: landed, outcome: 'clicked' })
@@ -481,7 +614,7 @@ export async function runTargetActions(
       held = true
     } else {
       for (;;) {
-        const state = await conditionHolds(current.url(), step.condition, evaluate, budget - (Date.now() - startedAt)).catch(() => null)
+        const state = await conditionHolds(current.url(), step.condition, evaluate, budget - (Date.now() - startedAt), responsesReadable ? responses : null).catch(() => null)
         if (state === null) {
           unanswerable = true
           break
