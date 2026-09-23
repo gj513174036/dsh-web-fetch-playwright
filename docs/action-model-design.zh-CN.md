@@ -385,3 +385,21 @@ ticket #4 推翻，修订记录见 §9 之后的「修订」小节。
 - **请求事件缝是可选的，且缺失时只会更保守**：后端不报请求时，一条响应**无法与任何动作对上**，于是它被当作
   "早于所有水位"（`0`）——等待仍然成立，但**永远不会**被算成某个点击的功劳（点击只会记 `unverified`）。
   功劳只在有证据时给出，这正是评审配方 #1 的教训。
+
+### 真机验收（2026-09-24，宿主浏览器 Chrome 149 / CDP，提交 `8c69d13`）
+
+```
+> actions: 1. waitFor text "使用提示" — met · 2. click selector "a[title=\"境内生产药品\"]" -> a — clicked (unverified)
+  · 3. type selector "input[data-step=\"4\"]" -> textbox (now "阿司匹林") — met
+  · 4. click selector "button[data-step=\"5\"]" -> button (it opened a page; the rest of the target runs there) — clicked
+  · 5. waitFor response under https://datasearch.nmpa.gov.cn/datasearch/data/nmpadata/countNums — met
+  · 6. waitFor text "阿司匹林肠溶片" — met
+  → final document https://datasearch.nmpa.gov.cn/datasearch/search-result.html (HTTP 200)
+```
+
+- **第 4 步的点击因此记 `clicked`**（不是 `clicked (unverified)`）：提交引发的 XHR 就是它的证据。
+- **第 2 步如实记 `clicked (unverified)`**：它后面紧挨着的是 `type` 而不是等待，按上表第五条不算被确认。
+- 正文是登记册自己的结果表；抓取前后标签页 **1 → 1，野标签页 0**。
+- 负向对照（等一个页面从不调用的端点）在真机上同样跑过，响亮失败并点名最后一条响应：
+  `… the last response was https://datasearch.nmpa.gov.cn/datasearch/config/ff80808183cad75001840881f848179f.json?date=… (HTTP 200) — at …/search-result.html`。
+- 另有真浏览器集成用例 3 条（本地 HTTP 服务 + 真 Chromium）覆盖"点击引发的到达""接管页从弹出起被监听""端点从不被调用"，与上面这条真机记录相互独立。
