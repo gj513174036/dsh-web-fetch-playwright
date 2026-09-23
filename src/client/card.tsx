@@ -251,6 +251,18 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onEdit={(text) => { props.edit('denoise', text) }}
         onReset={() => { props.resetField('denoise') }}
       />
+      <CheckboxField
+        id="plugin-config-playwright-dismiss-consent"
+        label={t('dismissConsent')}
+        hint={t('dismissConsentHint')}
+        checked={state.dismissConsent.text === 'true'}
+        overridden={state.dismissConsent.overridden}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        disabled={disabled}
+        onEdit={(text) => { props.edit('dismissConsent', text) }}
+        onReset={() => { props.resetField('dismissConsent') }}
+      />
       <ValueField
         id="plugin-config-playwright-concurrency"
         label={t('maxConcurrency')}

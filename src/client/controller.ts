@@ -33,6 +33,8 @@ export interface PlaywrightSettings {
   shareBrowserContext?: boolean
   /** Whether the Readability + DOMPurify pipeline runs. */
   denoise?: boolean
+  /** Whether a known consent banner is clicked away before reading. */
+  dismissConsent?: boolean
   /** How many fetches may render at once (1–200); blank = backend default. */
   maxConcurrency?: number
   /**
@@ -93,6 +95,8 @@ export interface PlaywrightCardState extends CardShell {
   shareBrowserContext: CardFieldState
   /** Denoise checkbox (draft 'true'/'false'). */
   denoise: CardFieldState
+  /** Consent-banner checkbox (draft 'true'/'false'). */
+  dismissConsent: CardFieldState
   /** Concurrency input (draft decimal integer). */
   maxConcurrency: CardFieldState
   /** Challenge wait input (draft decimal integer of milliseconds). */
@@ -153,6 +157,7 @@ export class PlaywrightCardController {
         textField('cdpEndpoint'),
         checkboxField('shareBrowserContext'),
         checkboxField('denoise'),
+        checkboxField('dismissConsent'),
         numberField('maxConcurrency', 1, 200),
         numberField('challengeWaitMs', 0, 60_000),
         textField('proxyServer'),
@@ -180,6 +185,7 @@ export class PlaywrightCardController {
       cdpEndpoint: this.form.field('cdpEndpoint'),
       shareBrowserContext: this.form.field('shareBrowserContext'),
       denoise: this.form.field('denoise'),
+      dismissConsent: this.form.field('dismissConsent'),
       maxConcurrency: this.form.field('maxConcurrency'),
       challengeWaitMs: this.form.field('challengeWaitMs'),
       proxyServer: this.form.field('proxyServer'),

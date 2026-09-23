@@ -122,6 +122,16 @@ export interface Config {
   /** Whether the Readability + DOMPurify denoise pipeline runs before markdown. */
   denoise?: boolean
   /**
+   * Whether a known consent-management banner is dismissed before the
+   * document is read (see `CONSENT_SELECTORS` in `./consent.ts`).
+   *
+   * Off by default, because the click is not a neutral act: it records the
+   * user's consent in whichever profile the fetch runs in — the real one on
+   * the CDP and DSH-managed backends. Best-effort either way; it can never
+   * fail a fetch.
+   */
+  dismissConsent?: boolean
+  /**
    * Bounded wait (ms) for a Cloudflare challenge to clear naturally inside
    * the same page/context. `0` (or any config leaving this at 0) restores the
    * legacy behavior: the first response is final, no waiting — the A/B
@@ -223,6 +233,7 @@ export const Config: z<Config> = z.object({
   cdpEndpoint: z.string().default(''),
   shareBrowserContext: z.boolean().default(true),
   denoise: z.boolean().default(true),
+  dismissConsent: z.boolean().default(false),
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
   maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING),

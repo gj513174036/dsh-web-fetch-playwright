@@ -24,6 +24,7 @@ export type PlaywrightCardLocaleKey =
   | 'recordAllResources' | 'recordAllResourcesHint'
   | 'recordWarning'
   | 'denoise' | 'denoiseHint'
+  | 'dismissConsent' | 'dismissConsentHint'
   | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
   | 'challengeWaitMs' | 'challengeWaitMsHint' | 'challengeWaitMsPlaceholder'
   | 'proxyServer' | 'proxyServerHint' | 'proxyServerPlaceholder'
@@ -83,6 +84,8 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   recordWarning: 'These dumps contain PLAINTEXT credentials \u2014 Cookie/Set-Cookie, Authorization headers, tokens, and request/response bodies are stored verbatim, on purpose, so the offline pipeline can replay the session. Keep the directory private (the defaults are 0700/0600 under a gitignored path), never commit it, and never share it. Recorder failures never fail a fetch.',
   denoise: 'Enable the denoise algorithm',
   denoiseHint: 'Readability + DOMPurify strip nav bars, sidebars, footers, and ads before converting to markdown.',
+  dismissConsent: 'Dismiss consent banners before reading the page',
+  dismissConsentHint: 'Clicks the "accept all" control of the consent managers this plugin knows (OneTrust, TrustArc, Cookiebot, Didomi, Osano, Usercentrics, CookieYes, Complianz, Iubenda, Klaro, Google, Quantcast). Off by default: the click records YOUR consent in whichever profile the fetch uses — the real one on the CDP and DSH-managed backends — and consent cookies then persist there. Best effort; it can never fail a fetch.',
   maxConcurrency: 'Max concurrent fetches',
   maxConcurrencyHint: 'How many pages may render at once (1–200). Blank = auto: 4 local browsers, 50 tabs for the CDP and DSH-managed backends (one browser is already alive; a slot is a tab in it).',
   maxConcurrencyPlaceholder: '(auto: local 4 / CDP 50 / managed 50)',
@@ -155,6 +158,8 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   recordWarning: '抓包产物含明文凭据——Cookie/Set-Cookie、Authorization 头、token 与请求/响应正文均按原样保存（这是刻意设计，供离线流水线复现会话）。请把目录当作敏感数据：默认路径已 gitignore 且权限为目录 0700 / 文件 0600，切勿提交或外发。录制失败绝不会让抓取失败。',
   denoise: '启用降噪算法',
   denoiseHint: '使用 Readability + DOMPurify 清洗导航栏、侧边栏、页脚与贴片广告后再转为 Markdown。',
+  dismissConsent: '读页面前自动关掉 Cookie 同意横幅',
+  dismissConsentHint: '点击本插件已知同意管理器的"全部接受"控件（OneTrust、TrustArc、Cookiebot、Didomi、Osano、Usercentrics、CookieYes、Complianz、Iubenda、Klaro、Google、Quantcast）。默认关闭：这次点击会在抓取所用的 profile 里记录**你的**同意（CDP 与托管后端下就是你的真实 profile），同意 cookie 会留在那里。尽力而为，绝不会让抓取失败。',
   maxConcurrency: '最大并发抓取数',
   maxConcurrencyHint: '同时渲染的页面上限（1–200）；留空自动：本地 4 个浏览器，CDP 与 DSH 托管后端 50 个标签页（浏览器已在运行，一个并发名额就是一个标签页）。',
   maxConcurrencyPlaceholder: '（自动：本地 4 / CDP 50 / 托管 50）',

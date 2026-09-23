@@ -82,6 +82,7 @@ import { BrowserPool } from './browser-pool.ts'
 import type { BrowserPoolOptions } from './browser-pool.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown, stripNonContentHtml } from './markdown.ts'
+import { CONSENT_TIMEOUT_MS, dismissConsentBanner } from './consent.ts'
 import { parseLaunchArgs } from './launch-args.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightProxyOption, PlaywrightResponse, PlaywrightRoute } from './types.ts'
@@ -921,6 +922,20 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // Best-effort settle for client-rendered content; a timeout just keeps
     // what domcontentloaded already produced.
     await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
+
+    // After the settle, not before: a consent manager injects its banner from
+    // an async script, so the control usually does not exist yet at
+    // domcontentloaded. Opt-in and never load-bearing — a page with no
+    // banner, a backend whose page handle has no `evaluate`, and a click that
+    // throws all leave the fetch's own outcome alone.
+    if (config.dismissConsent === true) {
+      const consent = await dismissConsentBanner(page, Math.min(CONSENT_TIMEOUT_MS, deadline.remainingMs()))
+      if (consent.problem !== null) {
+        console.warn(
+          `dsh-web-fetch-playwright: consent banner dismissal problem (the fetch is unaffected): ${consent.problem}`,
+        )
+      }
+    }
 
     const html = await page.content()
     if (!config.denoise) {

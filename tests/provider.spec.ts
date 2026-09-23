@@ -201,6 +201,7 @@ function resolvedConfig(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
     cdpEndpoint: '',
     shareBrowserContext: true,
     denoise: true,
+    dismissConsent: false,
     maxConcurrency: 4,
     challengeWaitMs: 0,
     challengeRetries: 0,
@@ -244,6 +245,10 @@ interface FakePageSpec {
   emitOnClear?: { status?: number; contentType?: string }
   /** Omit `evaluate` so the provider's probe falls back to content polling. */
   noEvaluate?: boolean
+  /** What the fake's `evaluate` answers (default: the challenge verdict). */
+  evaluateResult?: unknown
+  /** Make the fake's `evaluate` reject with this error. */
+  evaluateError?: Error
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -363,6 +368,8 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
     ...(spec.noEvaluate === true ? {} : {
       evaluate: async (): Promise<unknown> => {
         noteRead()
+        if (spec.evaluateError !== undefined) throw spec.evaluateError
+        if (spec.evaluateResult !== undefined) return spec.evaluateResult
         return onChallenge()
       },
     }),
@@ -409,6 +416,7 @@ class FakeProvider extends PlaywrightFetchProvider {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      dismissConsent: false,
       maxConcurrency: 4,
       // Legacy default: the challenge path stays off unless a test opts in.
       challengeWaitMs: 0,
@@ -439,6 +447,7 @@ class GatedProvider extends PlaywrightFetchProvider {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      dismissConsent: false,
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -577,6 +586,48 @@ describe('PlaywrightFetchProvider', () => {
       expect(result.body.content).toContain('<article>')
       expect(result.body.content).toContain('nav noise')
     }
+  })
+
+  it('dismissConsent off (the default): the page is never probed for a banner', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await new FakeProvider({}, { evaluateResult: { clicked: null, problem: 'exploded' } })
+        .fetch({ url: 'https://example.com/docs' })
+      expect(warn.mock.calls.flat().map(String).join(' ')).not.toContain('consent banner dismissal')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('dismissConsent on: probes the page and stays quiet when a control is clicked', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const result = await new FakeProvider({ dismissConsent: true }, { evaluateResult: { clicked: '#onetrust-accept-btn-handler', problem: null } })
+        .fetch({ url: 'https://example.com/docs' })
+      expect(result.statusCode).toBe(200)
+      expect(warn.mock.calls.flat().map(String).join(' ')).not.toContain('consent banner dismissal')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('dismissConsent on: a failing click is reported and never fails the fetch', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const result = await new FakeProvider({ dismissConsent: true }, { evaluateResult: { clicked: null, problem: 'selector exploded' } })
+        .fetch({ url: 'https://example.com/docs' })
+      expect(result.statusCode).toBe(200)
+      expect((result.body as { content: string }).content).toContain('World')
+      expect(warn.mock.calls.flat().map(String).join(' ')).toContain('consent banner dismissal problem')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('dismissConsent on: a page handle without evaluate still fetches', async () => {
+    const result = await new FakeProvider({ dismissConsent: true }, { noEvaluate: true })
+      .fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
   })
 
   it('decodes non-html text bodies verbatim', async () => {
@@ -749,6 +800,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: false,
       denoise: true,
+      dismissConsent: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -779,6 +831,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: false,
       denoise: true,
+      dismissConsent: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -801,6 +854,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      dismissConsent: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -833,6 +887,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      dismissConsent: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -854,6 +909,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      dismissConsent: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -881,6 +937,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '',
       shareBrowserContext: true,
       denoise: true,
+      dismissConsent: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -910,6 +967,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       cdpEndpoint: '127.0.0.1:1',
       shareBrowserContext: true,
       denoise: true,
+      dismissConsent: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
