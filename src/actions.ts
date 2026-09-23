@@ -214,8 +214,9 @@ export async function runTargetActions(
         return failure(`${detail} (only 0ms of the step budget is left)`)
       }
       const confirming = confirmingWaitAfter(target.actions, index)
+      const urlBefore = page.url()
       if (confirming !== null && confirming.step.condition.kind === 'url') {
-        heldBeforeClick.set(index, urlConditionHeld(page.url(), confirming.step.condition))
+        heldBeforeClick.set(index, urlConditionHeld(urlBefore, confirming.step.condition))
       }
       const outcome = await clickCandidate(page, step.candidates, budget, confirming?.step.condition)
       if (outcome.kind === 'clicked') {
@@ -227,7 +228,13 @@ export async function runTargetActions(
       }
       if (outcome.kind === 'clicked-unreported') {
         // The click went out and the page navigated before the script could say
-        // which candidate landed. The following wait, if any, is what judges it.
+        // which candidate landed — and with it died the pre-click state. A URL
+        // that moved is independent evidence the page changed, so a following
+        // wait may judge the click; on the same URL nothing here can show a text
+        // wait changed, so the click must not borrow its credit.
+        if (confirming !== null && confirming.step.condition.kind === 'text' && page.url() === urlBefore) {
+          heldBeforeClick.set(index, true)
+        }
         reports.push({ index, verb: step.verb, detail: 'a candidate (the page navigated before it could say which)', outcome: 'clicked' })
         continue
       }

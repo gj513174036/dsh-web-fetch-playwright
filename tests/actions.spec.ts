@@ -145,7 +145,10 @@ describe('runTargetActions, the click verb', () => {
   const landed = { ok: true, candidate: 'text "查询" -> button' }
 
   it('clicks, and counts the click as confirmed by the wait that follows', async () => {
-    const outcome = await runTargetActions(clickPage(landed), target(click({ kind: 'text', text: '查询' }), text('结果')), options)
+    // The page answered the pre-click read with "not there yet", which is what
+    // makes the wait that follows evidence: it changed.
+    const read = { ok: true, candidate: 'text "查询" -> button', before: false }
+    const outcome = await runTargetActions(clickPage(read), target(click({ kind: 'text', text: '查询' }), text('结果')), options)
     expect(outcome.ok).toBe(true)
     if (!outcome.ok) return
     expect(outcome.run.steps).toEqual([
@@ -204,15 +207,34 @@ describe('runTargetActions, the click verb', () => {
   })
 
   it('counts a click whose page navigated out from under it, and lets the wait judge it', async () => {
+    // The script's answer — including the pre-click read — died with the page,
+    // but the URL moved, which is evidence enough for the wait to judge.
+    let url = 'https://a.example/search'
     const navigated = await runTargetActions(
-      clickPage(() => { throw new Error('Execution context was destroyed, most likely because of a navigation') }),
+      {
+        url: () => url,
+        evaluate: async (script: string) => {
+          if (!script.includes('const candidates = ')) return true
+          url = 'https://a.example/results'
+          throw new Error('Execution context was destroyed, most likely because of a navigation')
+        },
+      } as unknown as PlaywrightPage,
       target(click({ kind: 'text', text: '商品标题' }), text('结果')),
       options,
     )
     expect(navigated.ok).toBe(true)
     if (!navigated.ok) return
-    expect(navigated.run.steps[0]?.outcome).toBe('clicked')
+    expect(navigated.run.steps.map((step) => step.outcome)).toEqual(['clicked', 'met'])
     expect(navigated.run.steps[0]?.detail).toContain('the page navigated')
+
+    // Same URL after the lost answer: nothing here can show the text wait
+    // changed, so the click does not get to call itself confirmed.
+    const samePage = await runTargetActions(
+      clickPage(() => { throw new Error('Execution context was destroyed, most likely because of a navigation') }),
+      target(click({ kind: 'text', text: '商品标题' }), text('结果')),
+      options,
+    )
+    expect(samePage.ok && samePage.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
   })
 
   it('fails loudly when every candidate was passed over, and says why for each', async () => {

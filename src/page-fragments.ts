@@ -148,7 +148,10 @@ export const FRAGMENT_ROLE = `const roleOf = (el) => {
  * The single answer to "is this reachable", asked *before* anything is clicked:
  * a disabled control does nothing, a control with no box cannot be hit, and a
  * laid-out control can still be covered by the element that would really receive
- * the click. The last one is measured on whatever a person would hit — the
+ * the click. A control inside a disabled `<fieldset>` counts as disabled too: it
+ * carries no `disabled` of its own, yet activating it does nothing. The HTML
+ * exception for a fieldset's first `<legend>` is deliberately not modelled —
+ * refusing a control that would in fact have worked is the cheap direction. The last one is measured on whatever a person would hit — the
  * element itself, or the `<label>` that forwards a click to it — because that is
  * the difference between "the click was dispatched" and "the page did what the
  * target claims".
