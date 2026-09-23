@@ -2,8 +2,9 @@
  * Running a target's actions.
  *
  * The runner is deliberately dull: for each step it evaluates the step's condition
- * until it holds, clicks the first reachable candidate, or puts the first
- * reachable control into a state and reads it back; a step that does not get
+ * until it holds, clicks the first reachable candidate, puts the first reachable
+ * control into a state and reads it back, or writes a value into the first
+ * reachable field and reads that back; a step that does not get
  * there either fails the whole fetch (loudly, naming the step) or, if it was
  * declared `optional`, is skipped and recorded. Nothing here guesses
  * and nothing degrades quietly — the failure modes this project keeps paying for
@@ -25,6 +26,7 @@ import { clickCandidate } from './click.ts'
 import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
 import { raceTimeout, TIMED_OUT } from './race.ts'
 import { readState } from './state.ts'
+import { typeInto } from './type.ts'
 import { describeCandidate, urlIsUnder, type ActionStep, type Candidate, type Target, type WaitCondition, type WaitStep } from './targets.ts'
 
 /** Longest one step may take, before the fetch's own remaining budget caps it. */
@@ -288,6 +290,35 @@ export async function runTargetActions(
       }
       // Every candidate was passed over: the page says so, with one reason each.
       const why = `no candidate could be clicked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
+      const stopped = endStep(why)
+      if (stopped !== null) return stopped
+      continue
+    }
+
+    if (step.verb === 'type') {
+      const detail = `candidates: ${describeCandidates(step)}, value ${JSON.stringify(step.value)}`
+      if (budget === 0) {
+        const stopped = endStep(`${detail} (only 0ms of the step budget is left)`)
+        if (stopped !== null) return stopped
+        continue
+      }
+      const outcome = await typeInto(page, step.candidates, step.value, budget)
+      if (outcome.kind === 'typed') {
+        // The read-back is the verdict, and `was` says whether it replaced
+        // something — a field the recipe filled from empty reads differently from
+        // one it overwrote, and the summary says which.
+        const how = outcome.was === '' ? `now ${JSON.stringify(outcome.value)}` : `was ${JSON.stringify(outcome.was)}, now ${JSON.stringify(outcome.value)}`
+        reports.push({ index, verb: step.verb, detail: `${outcome.candidate} (${how})`, outcome: 'met' })
+        continue
+      }
+      const why =
+        outcome.kind === 'mismatch'
+          ? `${outcome.candidate}: ${JSON.stringify(outcome.wanted)} was written into it (it held ${JSON.stringify(outcome.was)}) and it now holds ${JSON.stringify(outcome.value)} — the page did not take it`
+          : outcome.kind === 'unverified'
+            ? `${detail} (${outcome.problem})`
+            : outcome.kind === 'unreadable'
+              ? `${detail} (the page could not be read: ${outcome.problem})`
+              : `no candidate could be typed into, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
       const stopped = endStep(why)
       if (stopped !== null) return stopped
       continue

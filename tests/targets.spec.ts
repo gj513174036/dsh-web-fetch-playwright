@@ -238,6 +238,28 @@ describe('parseTargets', () => {
     expect(errorOf(check('{ "verb": "check", "candidates": [ { "text": "x" } ], "condition": { "kind": "text", "text": "y" } }'))).toContain('unknown key "condition"')
   })
 
+  it('reads a type step, with the value it has to write', () => {
+    const typed = `{ "verb": "type", "candidates": [ { "selector": "#kw" }, { "text": "关键字" } ], "value": "维生素D" }`
+    expect(targetsOf(file(typed))[0]?.actions[0]).toEqual({
+      verb: 'type',
+      candidates: [{ kind: 'selector', selector: '#kw' }, { kind: 'text', text: '关键字' }],
+      value: '维生素D',
+    })
+    // An empty value is a real instruction: clear the field.
+    expect(targetsOf(file('{ "verb": "type", "candidates": [ { "selector": "#kw" } ], "value": "" }'))[0]?.actions[0])
+      .toMatchObject({ value: '' })
+    expect(targetsOf(file('{ "verb": "type", "candidates": [ { "selector": "#kw" } ], "value": "x", "optional": true }'))[0]?.actions[0])
+      .toMatchObject({ optional: true })
+  })
+
+  it('refuses a type step with no value, no field, or a value that is not text', () => {
+    const typed = (body: string): string => file(body)
+    expect(errorOf(typed('{ "verb": "type", "candidates": [ { "selector": "#kw" } ] }'))).toContain('.value: expected the text')
+    expect(errorOf(typed('{ "verb": "type", "candidates": [ { "selector": "#kw" } ], "value": 250 }'))).toContain('.value: expected the text')
+    expect(errorOf(typed('{ "verb": "type", "value": "x" }'))).toContain('.candidates')
+    expect(errorOf(typed('{ "verb": "type", "candidates": [ { "selector": "#kw" } ], "value": "x", "condition": { "kind": "time", "ms": 1 } }'))).toContain('unknown key "condition"')
+  })
+
   it('describes a candidate the same way everywhere it is named', () => {
     expect(describeCandidate({ kind: 'selector', selector: '#a' })).toBe('selector "#a"')
     expect(describeCandidate({ kind: 'text', text: '查询' })).toBe('text "查询"')

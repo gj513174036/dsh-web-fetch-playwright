@@ -814,6 +814,28 @@ describe('PlaywrightFetchProvider', () => {
     expect(content).toContain('2. waitFor text "World" — met')
   })
 
+  it('types a value into a field and says what it wrote', async () => {
+    const typeStep = '{ "verb": "type", "candidates": [ { "selector": "#kw" } ], "value": "维生素D" }'
+    const targetsFile = targetFor('https://example.com/docs', `${typeStep}, ${waitText('World')}`)
+    const result = await new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, candidate: 'selector "#kw" -> searchbox', was: '', value: '维生素D', wanted: '维生素D' }, true],
+    }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('> actions: 1. type selector "#kw" -> searchbox (now "维生素D") — met')).toBe(true)
+    expect(content).toContain('2. waitFor text "World" — met')
+  })
+
+  it('fails a type the page did not take, naming the step and the field', async () => {
+    const typeStep = '{ "verb": "type", "candidates": [ { "selector": "#kw" } ], "value": "维生素D" }'
+    const targetsFile = targetFor('https://example.com/docs', typeStep)
+    const message = await messageOf(new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, candidate: 'selector "#kw" -> searchbox', was: '', value: '', wanted: '维生素D' }],
+    }).fetch({ url: 'https://example.com/docs' }))
+    expect(message).toContain('target "docs" step 1 (type) did not hold')
+    expect(message).toContain('"维生素D" was written into it (it held "") and it now holds ""')
+    expect(message).toContain('at https://final.example.com/docs')
+  })
+
   it('waits on a state condition and says what it was about', async () => {
     const stateWait = '{ "verb": "waitFor", "condition": { "kind": "state", "state": "checked", "candidates": [ { "selector": "input[type=checkbox]" } ] } }'
     const targetsFile = targetFor('https://example.com/docs', stateWait)

@@ -371,6 +371,37 @@ export const FRAGMENT_STATE_MATCH = `const DISABLEABLE_ROLES = ['button', 'link'
     return state === wanted;
   };`
 
+/**
+ * Does this control take text?
+ *
+ * The question `type` has to ask before it writes anything, and the answer is
+ * about *what a person could do with it*, not about the tag: a checkbox is an
+ * `<input>` and takes none, a `contenteditable` div is not an input and takes
+ * plenty. The roles are here for the custom fields a framework builds, and the
+ * input types that carry a value the page owns (file, range, color, hidden) are
+ * refused rather than written into behind the page's back.
+ */
+export const FRAGMENT_TEXT_FIELD = `const TEXT_FIELD_INPUT_TYPES = ['checkbox', 'radio', 'submit', 'button', 'reset', 'image', 'file', 'hidden', 'range', 'color'];
+  const takesTextField = (el) => {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'input') return TEXT_FIELD_INPUT_TYPES.indexOf(type) < 0;
+    if (tag === 'textarea') return true;
+    // A native select plays the combobox role and takes no text: choosing an
+    // option is a different act, and this plugin has no verb for it on purpose.
+    if (tag === 'select' || tag === 'button' || tag === 'option') return false;
+    if (el.getAttribute('contenteditable') === 'true') return true;
+    const role = roleOf(el);
+    return role === 'textbox' || role === 'searchbox' || role === 'combobox';
+  };
+
+  /** What the field holds right now, as a string ('' for an empty one). */
+  const valueOfField = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'input' || tag === 'textarea') return String(el.value === undefined || el.value === null ? '' : el.value);
+    return String(el.textContent === undefined || el.textContent === null ? '' : el.textContent);
+  };`
+
 /** The page-reading fragments, in the order they must be declared. */
 export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_VISIBLE_TEXT,
@@ -386,6 +417,7 @@ export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_RESOLVE,
   FRAGMENT_CHECKED_STATE,
   FRAGMENT_STATE_MATCH,
+  FRAGMENT_TEXT_FIELD,
 ]
 
 /** The consent fragments, in the order they must be declared. */

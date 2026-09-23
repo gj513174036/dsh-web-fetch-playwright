@@ -1,0 +1,28 @@
+{
+  "targets": [
+    {
+      "name": "verify-type-bing",
+      "match": { "kind": "prefix", "url": "https://cn.bing.com/" },
+      "actions": [
+        { "verb": "type", "candidates": [{ "selector": "#sb_form_q" }], "value": "维生素D" },
+        { "verb": "click", "candidates": [{ "selector": "#sb_form_go" }, { "role": "button", "name": "搜索" }, { "text": "搜索" }] },
+        { "verb": "waitFor", "condition": { "kind": "url", "url": "https://cn.bing.com/search" } }
+      ]
+    },
+    {
+      "name": "verify-type-unreachable",
+      "match": { "kind": "prefix", "url": "https://cn.bing.com/search" },
+      "actions": [
+        {
+          "verb": "type",
+          "candidates": [
+            { "selector": "#does-not-exist" },
+            { "text": "绝不存在的输入框" },
+            { "selector": "input[type=checkbox]" }
+          ],
+          "value": "x"
+        }
+      ]
+    }
+  ]
+}

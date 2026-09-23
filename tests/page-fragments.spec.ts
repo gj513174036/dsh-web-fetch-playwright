@@ -40,7 +40,7 @@ describe('page fragments', () => {
   it('ships bundles that are self-contained', () => {
     // The failure this catches is the one that bit the extraction: a consumer
     // picked the fragments it thought it needed and named one it had left out.
-    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof matchesOf === "function" && typeof resolveCandidates === "function" && typeof checkedStateOf === "function" && typeof isDisabled === "function" && typeof matchesState === "function"', '')).toBe(true)
+    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof matchesOf === "function" && typeof resolveCandidates === "function" && typeof checkedStateOf === "function" && typeof isDisabled === "function" && typeof matchesState === "function" && typeof takesTextField === "function" && typeof valueOfField === "function"', '')).toBe(true)
     expect(withFragments<boolean>(DISMISS_FRAGMENTS, 'typeof isConsentDocument === "function" && typeof accessibleNameOf === "function"', '')).toBe(true)
   })
 
@@ -241,6 +241,30 @@ describe('page fragments', () => {
       // …and the act lands on the label, which is the part a person can click.
       expect(answer.hit).toBe('all')
       expect(answer.tried).toEqual([])
+    })
+  })
+
+  describe('takesTextField and valueOfField', () => {
+    const of = (expression: string, html: string): unknown => withFragments<unknown>(PAGE_FRAGMENTS, expression, html)
+
+    it('says which controls a person could write into', () => {
+      expect(of('takesTextField(document.querySelector("input"))', '<input type="text">')).toBe(true)
+      expect(of('takesTextField(document.querySelector("input"))', '<input type="search">')).toBe(true)
+      expect(of('takesTextField(document.querySelector("textarea"))', '<textarea></textarea>')).toBe(true)
+      expect(of('takesTextField(document.querySelector("div"))', '<div contenteditable="true"></div>')).toBe(true)
+      expect(of('takesTextField(document.querySelector("div"))', '<div role="searchbox"></div>')).toBe(true)
+      // An `<input>` that takes no text is still an `<input>`.
+      expect(of('takesTextField(document.querySelector("input"))', '<input type="checkbox">')).toBe(false)
+      expect(of('takesTextField(document.querySelector("input"))', '<input type="file">')).toBe(false)
+      expect(of('takesTextField(document.querySelector("select"))', '<select></select>')).toBe(false)
+      expect(of('takesTextField(document.querySelector("button"))', '<button>go</button>')).toBe(false)
+    })
+
+    it('reads what a field holds, from the property or from the content', () => {
+      expect(of('valueOfField(document.querySelector("input"))', '<input type="text" value="旧值">')).toBe('旧值')
+      expect(of('valueOfField(document.querySelector("input"))', '<input type="text">')).toBe('')
+      expect(of('valueOfField(document.querySelector("textarea"))', '<textarea>旧值</textarea>')).toBe('旧值')
+      expect(of('valueOfField(document.querySelector("div"))', '<div contenteditable="true">旧内容</div>')).toBe('旧内容')
     })
   })
 

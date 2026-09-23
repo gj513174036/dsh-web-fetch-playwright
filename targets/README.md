@@ -8,6 +8,7 @@ prose.
 | File | What it proves | Which plugin version it needs |
 | --- | --- | --- |
 | `verify.json` | URL selection, the action summary, a step that does not hold failing loudly, a non-document body being refused, and the per-fetch re-read of the file (edit it between two fetches and the second one sees the change) | 0.2.18 |
+| `verify-type.json` | the `type` verb: writing into bing's own search box and letting its own submit carry the value (the results URL proves the page held it), plus a recipe whose candidates are all untypable, so the failure names each one | 0.2.23 |
 | `verify-state.json` | the `state` condition: the gate's opening state (`all unchecked` over its five boxes), then `check` and `all checked`; and a w3schools recipe whose optional condition is *not* met, so a run of it shows the condition failing without failing the fetch | 0.2.21 |
 | `verify-check.json` | the `check` verb: reaching the gate's 1×1 consent checkboxes through the 897×20 `<label>` beside them, reading the state back, leaving a control that is already ticked alone, and naming every candidate when none can be checked | 0.2.20 |
 | `verify-click.json` | the `click` verb: an ordered candidate list (role / text / selector), reachability checked before the act, a Chinese and an English candidate each resolving on a real page, the wait after a click confirming it, `clicked (unverified)` when nothing follows, and every candidate being named when none can be clicked | 0.2.19 |

@@ -103,8 +103,28 @@ export interface CheckStep {
   readonly optional?: boolean
 }
 
+/**
+ * A step that writes a value into a field, and reads it back.
+ *
+ * Like `check`, it asserts the part of its own effect the page can be asked
+ * about — does the field now hold what the recipe wrote? — and leaves what the
+ * page *does* with that value to the `waitFor` that follows. Writing into the DOM
+ * without the events a page listens for is the same class of false success as a
+ * click that lands nowhere, so the value goes in through the setter the page's own
+ * framework tracks and is announced with `input` and `change`.
+ */
+export interface TypeStep {
+  readonly verb: 'type'
+  /** Tried in order; the first reachable field that takes text is written into. */
+  readonly candidates: readonly Candidate[]
+  /** The text to write; it replaces whatever the field held. */
+  readonly value: string
+  /** When true, failing this step is skipped and recorded instead of fatal. */
+  readonly optional?: boolean
+}
+
 /** One step of a recipe. */
-export type ActionStep = WaitStep | ClickStep | CheckStep
+export type ActionStep = WaitStep | ClickStep | CheckStep | TypeStep
 
 /** A named recipe for one page. */
 export interface Target {
@@ -442,7 +462,20 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
     const wanted = state === 'unchecked' ? 'unchecked' : 'checked'
     return { step: optional.optional ? { verb, candidates: candidates.parsed, state: wanted, optional: true } : { verb, candidates: candidates.parsed, state: wanted } }
   }
-  return { error: `${at(path)}.verb: expected "waitFor", "click" or "check" (the other verbs are not implemented yet)` }
+  if (verb === 'type') {
+    const unknown = unknownKeys(value, ['verb', 'candidates', 'value', 'optional'], path)
+    if (unknown !== null) return { error: unknown }
+    const candidates = parseCandidates(value['candidates'], path, verb)
+    if ('error' in candidates) return { error: candidates.error }
+    const written = value['value']
+    if (typeof written !== 'string') {
+      return { error: `${at(path)}.value: expected the text to write into the field, e.g. "维生素D"` }
+    }
+    const optional = parseOptional(value['optional'], path)
+    if ('error' in optional) return { error: optional.error }
+    return { step: optional.optional ? { verb, candidates: candidates.parsed, value: written, optional: true } : { verb, candidates: candidates.parsed, value: written } }
+  }
+  return { error: `${at(path)}.verb: expected "waitFor", "click", "check" or "type" (the other verbs are not implemented yet)` }
 }
 
 function parseTarget(value: unknown, path: string): { target: Target } | { error: string } {

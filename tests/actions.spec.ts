@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest'
 import { describeCondition, renderActionSummary, runTargetActions, textProbeScript } from '../src/actions.ts'
 import type { ActionFailure, ActionRun } from '../src/actions.ts'
-import type { ActionStep, Candidate, CheckStep, ClickStep, Target, WaitStep } from '../src/targets.ts'
+import type { ActionStep, Candidate, CheckStep, ClickStep, Target, TypeStep, WaitStep } from '../src/targets.ts'
 import type { PlaywrightPage } from '../src/types.ts'
 
 const target = (...steps: readonly ActionStep[]): Target => ({
@@ -23,6 +23,8 @@ const text = (value: string, absent?: boolean): WaitStep =>
 const click = (...candidates: readonly Candidate[]): ClickStep => ({ verb: 'click', candidates })
 
 const check = (candidates: readonly Candidate[], state: 'checked' | 'unchecked' = 'checked'): CheckStep => ({ verb: 'check', candidates, state })
+
+const type = (candidates: readonly Candidate[], value: string): TypeStep => ({ verb: 'type', candidates, value })
 
 function pageWith(options: { url?: string; evaluate?: (script: string) => Promise<unknown> }): PlaywrightPage {
   const base = { url: () => options.url ?? 'https://a.example/search' }
@@ -52,6 +54,11 @@ function clickPage(answer: unknown | (() => unknown)): PlaywrightPage {
  */
 function checkPage(answer: unknown): PlaywrightPage {
   return pageWith({ evaluate: async (script) => (script.includes('const accept = ') ? answer : true) })
+}
+
+/** A page that answers the type probe and nothing else. */
+function typePage(answer: unknown): PlaywrightPage {
+  return pageWith({ evaluate: async (script) => (script.includes('const value = ') ? answer : true) })
 }
 
 /** A page that answers the state probe and nothing else. */
@@ -178,6 +185,74 @@ describe('runTargetActions', () => {
   it('reports the document it ended on', async () => {
     const outcome = await runTargetActions(pageWith({ url: 'https://a.example/after', evaluate: async () => true }), target(text('结果')), options)
     expect(outcome.ok && outcome.run.finalUrl).toBe('https://a.example/after')
+  })
+})
+
+describe('runTargetActions, the type verb', () => {
+  it('reports what it wrote, and whether it replaced something', async () => {
+    const filled = await runTargetActions(
+      typePage({ ok: true, candidate: 'selector "#kw" -> searchbox', was: '', value: '维生素D', wanted: '维生素D' }),
+      target(type([{ kind: 'selector', selector: '#kw' }], '维生素D')),
+      options,
+    )
+    expect(filled.ok && filled.run.steps).toEqual([
+      { index: 0, verb: 'type', detail: 'selector "#kw" -> searchbox (now "维生素D")', outcome: 'met' },
+    ])
+
+    const replaced = await runTargetActions(
+      typePage({ ok: true, candidate: 'selector "#kw" -> searchbox', was: '旧查询', value: '维生素D', wanted: '维生素D' }),
+      target(type([{ kind: 'selector', selector: '#kw' }], '维生素D')),
+      options,
+    )
+    expect(replaced.ok && replaced.run.steps[0]?.detail).toBe('selector "#kw" -> searchbox (was "旧查询", now "维生素D")')
+  })
+
+  it('fails when the page did not take the value, saying what it holds instead', async () => {
+    // The controlled-component revert: the write landed and the page re-rendered
+    // the old value, so the field a person sees is still empty.
+    const outcome = await runTargetActions(
+      typePage({ ok: true, candidate: 'selector "#kw" -> searchbox', was: '', value: '', wanted: '维生素D' }),
+      target(type([{ kind: 'selector', selector: '#kw' }], '维生素D')),
+      options,
+    )
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.verb).toBe('type')
+    expect(failure.url).toBe('https://a.example/search')
+    expect(failure.detail).toBe('selector "#kw" -> searchbox: "维生素D" was written into it (it held "") and it now holds "" — the page did not take it')
+  })
+
+  it('fails when no candidate is a field that takes text, naming each one', async () => {
+    const outcome = await runTargetActions(
+      typePage({ ok: false, attempted: null, tried: ['selector "#cb": matched 1, not usable (it is not a field that takes text)', 'text "关键字": no match'] }),
+      target(type([{ kind: 'selector', selector: '#cb' }], 'x')),
+      options,
+    )
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.detail).toContain('no candidate could be typed into, out of selector "#cb"')
+    expect(failure.detail).toContain('selector "#cb": matched 1, not usable (it is not a field that takes text)')
+    expect(failure.detail).toContain('text "关键字": no match')
+  })
+
+  it('skips an optional type that cannot be written, and runs the rest', async () => {
+    const outcome = await runTargetActions(
+      typePage({ ok: false, attempted: null, tried: ['text "关键字": no match'] }),
+      target({ ...type([{ kind: 'text', text: '关键字' }], 'x'), optional: true }, { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }),
+      options,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['skipped', 'met'])
+  })
+
+  it('does not send a write to a page it has no budget left for', async () => {
+    let asked = 0
+    const page = pageWith({ evaluate: async () => { asked += 1; return { ok: true } } })
+    const outcome = await runTargetActions(page, target(type([{ kind: 'selector', selector: '#kw' }], 'x')), { remainingMs: () => 0, stepCeilingMs: 20, pollMs: 1 })
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('only 0ms of the step budget is left')
+    expect(asked).toBe(0)
   })
 })
 
