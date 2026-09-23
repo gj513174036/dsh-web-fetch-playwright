@@ -77,6 +77,7 @@ import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERV
 import type { ChallengeVerdict } from './challenge.ts'
 import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, captureOptionsFor, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveHeadless, effectiveMaxConcurrency, managedLaunchFor, managedLaunchKey, normalizeCdpEndpoint, proxyOptionFor, redactProxyServer } from './config.ts'
 import type { ManagedLaunch, ProxySettings, ResolvedConfig } from './config.ts'
+import { isMainFrameDocument } from './race.ts'
 import { NetworkRecorder, nextCaptureSessionId as recorderSessionId } from './recorder.ts'
 import { BrowserPool } from './browser-pool.ts'
 import type { BrowserPoolOptions } from './browser-pool.ts'
@@ -1194,25 +1195,6 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
 /** Resolve after `ms` — the bounded wait's inter-poll nap. */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => { setTimeout(resolve, ms) })
-}
-
-/**
- * Whether a response event belongs to the page's main frame as a document
- * navigation — the filter the challenge wait uses to keep the LAST such
- * response (challenge pages reload the same URL into the real document).
- * Structural members are optional; when the backend does not expose them the
- * check degrades to "looks like a document" so fakes stay usable.
- */
-function isMainFrameDocument(response: PlaywrightResponse, page: PlaywrightPage): boolean {
-  const request = response.request?.()
-  if (request === undefined) return true
-  if (typeof request.isNavigationRequest === 'function' && !request.isNavigationRequest()) return false
-  const resourceType = typeof request.resourceType === 'function' ? request.resourceType() : undefined
-  if (resourceType !== undefined && resourceType !== 'document') return false
-  if (typeof request.frame === 'function' && typeof page.mainFrame === 'function') {
-    return request.frame() === page.mainFrame()
-  }
-  return true
 }
 
 /** The running record of the last main-frame navigation response. */

@@ -70,41 +70,93 @@ function statePage(answer: unknown): PlaywrightPage {
 }
 
 /**
- * A page that reports responses, so a `response` condition is answered the way a
- * browser answers it: as an event arriving while the run waits.
- *
- * `arrivals` are fired one at a time, and the timing is deliberate rather than
- * hopeful — the first lands on the tick after the run starts watching (the page
- * fetching something on its own), and every later one lands when the click probe
- * runs (an act causing the arrival, which is what a recipe waits on). No case
- * here sleeps and hopes.
+ * One beat of a scripted page, as a browser reports it: a request going out and
+ * its response landing. `requestAt` and `at` are when each happens — `arm` is the
+ * moment the run opens its journal (something already in flight), `probe` is when
+ * an act runs, `timer` is after `afterMs`.
  */
-function responsePage(arrivals: readonly string[], options: { firstInHand?: boolean } = {}): PlaywrightPage {
-  const listeners: ((response: { url(): string }) => void)[] = []
-  let next = 0
-  const fire = (): void => {
-    const url = arrivals[next]
-    if (url === undefined) return
-    next += 1
-    for (const listener of listeners) listener({ url: () => url })
+interface ResponseBeat {
+  url: string
+  at: 'arm' | 'probe' | 'timer'
+  afterMs?: number
+  /** When the request went out; defaults to the moment the response lands. */
+  requestAt?: 'arm' | 'probe'
+  /** The status the response carries; 500 models a failed fetch. */
+  status?: number
+  /** True when the response is a document navigation, not a fetch. */
+  document?: boolean
+}
+
+/**
+ * A page that reports requests and responses the way a browser does, so the
+ * journal's rules can be stated one at a time: what the run already had in hand,
+ * what was in flight when an act went out, what a burst leaves behind.
+ *
+ * The click probe is the act (`CLICK_SCRIPT_MARKER`), which is also when a beat
+ * marked `probe` fires — while the click is in flight, the race the condition
+ * exists for.
+ */
+function responsePage(beats: readonly ResponseBeat[]): PlaywrightPage {
+  const requestListeners: ((request: { url(): string }) => void)[] = []
+  const responseListeners: ((response: unknown) => void)[] = []
+  /** One stable request object per beat — a browser hands back the same one. */
+  const requests = beats.map((beat) => ({
+    url: () => beat.url,
+    resourceType: () => (beat.document === true ? 'document' : 'xhr'),
+  }))
+  let armed = false
+  const fireRequest = (index: number): void => {
+    for (const listener of requestListeners) listener(requests[index] as { url(): string })
+  }
+  const fireResponse = (index: number): void => {
+    const beat = beats[index]
+    const response = {
+      url: () => beat?.url ?? '',
+      status: () => beat?.status ?? 200,
+      headers: () => ({}),
+      text: async () => '',
+      // A document beat says so through its request, the way a real one does.
+      request: () => requests[index],
+    }
+    for (const listener of responseListeners) listener(response)
   }
   return {
     url: () => 'https://a.example/search',
-    on: (event: string, listener: (response: { url(): string }) => void) => {
+    on: (event: string, listener: (() => void) | ((request: { url(): string }) => void)) => {
+      if (event === 'request') {
+        requestListeners.push(listener as (request: { url(): string }) => void)
+        return undefined
+      }
       if (event !== 'response') return undefined
-      listeners.push(listener)
-      // `firstInHand` fires the first arrival the moment the run opens its
-      // journal — a response already in flight when the actions started — while
-      // the default lets it land on the next tick, during the first wait. The
-      // difference decides whether a later click may be credited with it.
-      if (options.firstInHand === true) fire()
-      else if (listeners.length === 1) setTimeout(fire, 0)
+      responseListeners.push(listener as (response: unknown) => void)
+      if (!armed) {
+        armed = true
+        // Everything in flight when the run opens its journal goes out now, in
+        // order — a page that fetched on load — and the beats whose response is
+        // already in hand land now too.
+        for (const [index, beat] of beats.entries()) {
+          if (beat.requestAt === 'arm' || (beat.requestAt === undefined && beat.at !== 'probe')) fireRequest(index)
+        }
+        for (const [index, beat] of beats.entries()) {
+          if (beat.at === 'arm') fireResponse(index)
+          else if (beat.at === 'timer') {
+            setTimeout(() => {
+              if (beat.requestAt === undefined) fireRequest(index)
+              fireResponse(index)
+            }, beat.afterMs ?? 5)
+          }
+        }
+      }
       return undefined
     },
     evaluate: async (script: string) => {
       if (script.includes(CLICK_SCRIPT_MARKER)) {
-        fire()
-        return { ok: true, candidate: 'a candidate' }
+        for (const [index, beat] of beats.entries()) {
+          if (beat.at !== 'probe') continue
+          if (beat.requestAt !== 'arm') fireRequest(index)
+          fireResponse(index)
+        }
+        return { ok: true, candidate: 'selector "#go"' }
       }
       return true
     },
@@ -215,7 +267,7 @@ describe('runTargetActions', () => {
   it('holds a response condition once the matching response arrives', async () => {
     // The one condition the page cannot be asked about: the run listens, and the
     // arrival is the answer.
-    const outcome = await runTargetActions(responsePage(['https://a.example/api/search?kw=x']), target(responseWait()), options)
+    const outcome = await runTargetActions(responsePage([{ url: 'https://a.example/api/search?kw=x', at: 'arm' }]), target(responseWait()), options)
     expect(outcome.ok).toBe(true)
     if (!outcome.ok) return
     expect(outcome.run.steps).toEqual([
@@ -224,7 +276,7 @@ describe('runTargetActions', () => {
   })
 
   it('ignores a response that does not match, and says what it did see', async () => {
-    const outcome = await runTargetActions(responsePage(['https://a.example/api/other']), target(responseWait()), options)
+    const outcome = await runTargetActions(responsePage([{ url: 'https://a.example/api/other', at: 'arm' }]), target(responseWait()), options)
     expect(outcome.ok).toBe(false)
     const failure = (outcome as { failure: ActionFailure }).failure
     expect(failure.detail).toContain('response under https://a.example/api/search')
@@ -241,27 +293,56 @@ describe('runTargetActions', () => {
     expect((outcome as { failure: ActionFailure }).failure.detail).toContain('could not be read')
   })
 
+  it('will not call a failed fetch or the page itself "the data arrived"', async () => {
+    // A 500 is a failed fetch and a document is the page shell: neither is the
+    // answer a recipe is waiting for. Both are still named in the failure, so the
+    // author hears what the page actually did.
+    const failed = await runTargetActions(responsePage([{ url: 'https://a.example/api/search', at: 'arm', status: 500 }]), target(responseWait()), options)
+    expect(failed.ok).toBe(false)
+    expect((failed as { failure: ActionFailure }).failure.detail).toContain('the last response was https://a.example/api/search (HTTP 500)')
+
+    const document = await runTargetActions(responsePage([{ url: 'https://a.example/api/search', at: 'arm', document: true }]), target(responseWait()), options)
+    expect(document.ok).toBe(false)
+    // A document is the page itself, and `url` is the condition for "where am I".
+    expect((document as { failure: ActionFailure }).failure.detail).toContain('response under https://a.example/api/search')
+  })
+
   it('credits a click with the response it caused', async () => {
-    // The arrival fires while the click is in flight — the race a listener armed
-    // at the wait would lose — so the wait holds and the click is verified.
-    const page = responsePage(['https://a.example/api/other', 'https://a.example/api/search?kw=x'])
-    const outcome = await runTargetActions(page, target(click({ kind: 'selector', selector: '#go' }), responseWait()), options)
+    // The request goes out while the click is in flight — the race a listener
+    // armed at the wait would lose — so the wait holds and the click is verified.
+    const outcome = await runTargetActions(
+      responsePage([{ url: 'https://a.example/api/search?kw=x', at: 'probe' }]),
+      target(click({ kind: 'selector', selector: '#go' }), responseWait()),
+      options,
+    )
     expect(outcome.ok).toBe(true)
     if (!outcome.ok) return
     expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['clicked', 'met'])
   })
 
   it('does not credit a click with a response the run already had', async () => {
-    // The first arrival lands while the run is watching but BEFORE the click, and
-    // nothing has spent it: that is what the wait after the click would consume,
-    // so the wait holding says nothing about the click. The second arrival is
-    // genuinely the click's, but the oldest unspent one answers first — and the
-    // click is left unverified rather than given credit it did not earn.
-    const page = responsePage(
-      ['https://a.example/api/search?kw=1', 'https://a.example/api/search?kw=2'],
-      { firstInHand: true },
+    // The arrival is in the journal before the click even goes out, and nothing
+    // has spent it: the wait after the click consumes it, so the wait holding
+    // says nothing about the click.
+    const outcome = await runTargetActions(
+      responsePage([{ url: 'https://a.example/api/search?kw=1', at: 'arm' }]),
+      target(click({ kind: 'selector', selector: '#go' }), responseWait()),
+      options,
     )
-    const outcome = await runTargetActions(page, target(click({ kind: 'selector', selector: '#go' }), responseWait()), options)
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
+  })
+
+  it('does not credit a click with a response that was already in flight', async () => {
+    // The request went out before the click, and only its answer lands during the
+    // wait: an arrival in hand at dispatch time is invisible to any "what is in
+    // hand" read, so the watermarks are what tell the two apart.
+    const outcome = await runTargetActions(
+      responsePage([{ url: 'https://a.example/api/search?kw=1', requestAt: 'arm', at: 'probe' }]),
+      target(click({ kind: 'selector', selector: '#go' }), responseWait()),
+      options,
+    )
     expect(outcome.ok).toBe(true)
     if (!outcome.ok) return
     expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
@@ -271,26 +352,103 @@ describe('runTargetActions', () => {
     // The mirror of the case above: an arrival an earlier wait consumed cannot be
     // consumed again, so it is not evidence against this click — and counting it
     // as such would mark a genuinely-caused click unverified.
-    const page = responsePage(
-      ['https://a.example/api/search?kw=1', 'https://a.example/api/search?kw=2'],
-      { firstInHand: true },
+    const outcome = await runTargetActions(
+      responsePage([
+        { url: 'https://a.example/api/search?kw=1', at: 'arm' },
+        { url: 'https://a.example/api/search?kw=2', at: 'probe' },
+      ]),
+      target(responseWait(), click({ kind: 'selector', selector: '#go' }), responseWait()),
+      options,
     )
-    const outcome = await runTargetActions(page, target(responseWait(), click({ kind: 'selector', selector: '#go' }), responseWait()), options)
     expect(outcome.ok).toBe(true)
     if (!outcome.ok) return
     expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['met', 'clicked', 'met'])
   })
 
-  it('needs a second response for a second wait on the same endpoint', async () => {
-    // A response is an event, not a state: a paged recipe that waits again must
-    // not be answered by the first arrival, which would be a silent wrong answer.
-    const page = responsePage(['https://a.example/api/other', 'https://a.example/api/search?kw=1'])
-    const outcome = await runTargetActions(page, target(click({ kind: 'selector', selector: '#go' }), responseWait(), click({ kind: 'selector', selector: '#next' }), responseWait()), options)
+  it('spends a burst, so a duplicate cannot answer the next wait', async () => {
+    // A React double-fetch leaves two arrivals behind one act. If only the first
+    // were spent, the next wait would hold instantly on the leftover and the run
+    // would read a page whose data has not arrived — the silent wrong answer.
+    const outcome = await runTargetActions(
+      responsePage([
+        { url: 'https://a.example/api/search?kw=1', at: 'arm' },
+        { url: 'https://a.example/api/search?kw=1', at: 'arm' },
+      ]),
+      target(responseWait(), responseWait()),
+      options,
+    )
     expect(outcome.ok).toBe(false)
     const failure = (outcome as { failure: ActionFailure }).failure
-    expect(failure.index).toBe(3)
-    expect(failure.verb).toBe('waitFor')
+    expect(failure.index).toBe(1)
     expect(failure.detail).toContain('response under https://a.example/api/search')
+  })
+
+  it('never lets the page it left answer for the one it moved to', async () => {
+    // After an `opensPage` adoption the run is on the opened page, and the page it
+    // left is still reporting traffic — which must not satisfy a wait on the new
+    // one. Without page tagging this wait holds, and the fetch reads the old
+    // page's data as the new page's answer.
+    const opened = responsePage([])
+    let fromThePageItLeft: ((response: unknown) => void) | undefined
+    const lateUrl = 'https://a.example/api/search?from=the-first-page'
+    const opener = {
+      url: () => 'https://a.example/search',
+      evaluate: async (script: string) => (script.includes(CLICK_SCRIPT_MARKER) ? { ok: true, candidate: 'selector "#go" -> link' } : true),
+      on: (event: string, listener: (payload: never) => void) => {
+        if (event === 'response') {
+          fromThePageItLeft = listener as unknown as (response: unknown) => void
+          return undefined
+        }
+        if (event !== 'popup') return undefined
+        queueMicrotask(() => {
+          listener(opened as never)
+          // In flight when the click went out; it lands while the NEW page is
+          // being waited on.
+          setTimeout(() => {
+            fromThePageItLeft?.({
+              url: () => lateUrl,
+              status: () => 200,
+              headers: () => ({}),
+              text: async () => '',
+              request: () => ({ url: () => lateUrl }),
+            })
+          }, 5)
+        })
+        return undefined
+      },
+    } as unknown as PlaywrightPage
+    const outcome = await runTargetActions(
+      opener,
+      target({ verb: 'click', candidates: [{ kind: 'selector', selector: '#go' }], opensPage: true }, responseWait()),
+      options,
+    )
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.index).toBe(1)
+    expect(failure.detail).toContain('response under https://a.example/api/search')
+  })
+
+  it('never lets one wait verify a click that another act came after', async () => {
+    // The chain stop: a wait may only confirm the act immediately before it. Here
+    // the cookie click is followed by another click, so the response the second
+    // click caused says nothing about the first — reporting it "clicked" would be
+    // a click credited with somebody else's arrival.
+    const outcome = await runTargetActions(
+      responsePage([
+        { url: 'https://a.example/api/other', at: 'arm' },
+        { url: 'https://a.example/api/search?kw=x', at: 'probe' },
+      ]),
+      target(
+        click({ kind: 'selector', selector: '#cookie' }),
+        { verb: 'waitFor', condition: { kind: 'time', ms: 1 } },
+        click({ kind: 'selector', selector: '#go' }),
+        responseWait(),
+      ),
+      options,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met', 'clicked', 'met'])
   })
 
   it('describes a response condition as the match it carries', () => {

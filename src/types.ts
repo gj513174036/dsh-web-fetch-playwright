@@ -33,6 +33,8 @@ export interface PlaywrightResponse {
 
 /** The request side of a response, for main-frame filtering. */
 export interface PlaywrightRequest {
+  /** This request's URL; absent on minimal fakes. */
+  url?(): string
   /** True for navigations (document loads and their redirect hops). */
   isNavigationRequest?(): boolean
   /** `'document'` for frame navigations; absent on minimal fakes. */
@@ -61,6 +63,12 @@ export interface PlaywrightPage {
    * document). Absent on minimal fakes (content polling covers them).
    */
   on?(event: 'response', listener: (response: PlaywrightResponse) => void): unknown
+  /**
+   * Request notification — a `waitFor` response condition uses it to tell a
+   * response the act caused from one already in flight when the act went out.
+   * Absent on minimal fakes, where a response is attributed to its own moment.
+   */
+  on?(event: 'request', listener: (request: PlaywrightRequest) => void): unknown
   /**
    * Evaluate an expression in the page — the challenge probe's live-DOM
    * path. Absent on minimal fakes (content polling covers them).

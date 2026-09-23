@@ -323,6 +323,7 @@ function fakeResponse(spec: FakePageSpec, entry?: NonNullable<FakePageSpec['goto
 function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: Array<(page: PlaywrightPage) => void> = []): PlaywrightPage {
   const gotoRejecters: Array<(error: Error) => void> = []
   const responseListeners: Array<(response: PlaywrightResponse) => void> = []
+  const requestListeners: Array<(request: { url(): string }) => void> = []
   const scripted = spec.gotoScript ?? []
   let reads = 0
   let cleared = false
@@ -387,9 +388,12 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
       for (const reject of gotoRejecters.splice(0)) reject(new Error('Target closed'))
     },
     route: async () => {},
-    on: (event: 'popup' | 'response', listener: ((page: PlaywrightPage) => void) | ((response: PlaywrightResponse) => void)) => {
-      if (event === 'popup') popupListeners.push(listener as (page: PlaywrightPage) => void)
-      else responseListeners.push(listener as (response: PlaywrightResponse) => void)
+    on: (event: 'popup' | 'response' | 'request', listener: (payload: never) => void) => {
+      if (event === 'popup') popupListeners.push(listener as unknown as (page: PlaywrightPage) => void)
+      else if (event === 'response') responseListeners.push(listener as unknown as (response: PlaywrightResponse) => void)
+      // Requests are only reported so a response can be traced to its start; the
+      // fake answers the response side directly.
+      else requestListeners.push(listener as unknown as (request: { url(): string }) => void)
     },
     ...(spec.noEvaluate === true ? {} : {
       evaluate: async (script: string): Promise<unknown> => {

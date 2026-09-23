@@ -121,16 +121,25 @@ export function describeCondition(condition: WaitCondition): string {
  *
  * A `response` condition is the one condition the page cannot be asked about: the
  * browser reports responses as they arrive, so the run listens from the moment it
- * starts and remembers what came. Two consequences, both deliberate:
+ * starts and remembers what came. Four rules, all deliberate:
  *
  * - **What happened before the run is not evidence.** The journal starts empty
  *   when the actions do, so a response the page fetched while it loaded can never
  *   satisfy a wait. If the data was already there, a text or state condition is
  *   the honest way to say so.
- * - **Each arrival answers one wait.** A response is an event, not a state: a
- *   recipe that walks a paged list and waits on the same endpoint again needs a
- *   second response, and the first one's arrival must not be read as the second
- *   one's. That is what an arrival being *spent* means.
+ * - **Only the page the run is on.** An arrival is remembered with the page that
+ *   reported it, and a wait matches only its own page: after an `opensPage`
+ *   adoption, the page the run left cannot answer for the one it moved to.
+ * - **An arrival answers one wait, and a burst is one arrival.** A response is an
+ *   event, not a state: a wait consumes every matching arrival in hand, so the
+ *   duplicate a React double-fetch or a prefetch leaves behind cannot satisfy the
+ *   NEXT wait — which would read a page whose data has not arrived, the silent
+ *   wrong answer this plugin refuses to give.
+ * - **"Arrived" means the data, not the shell.** A main-frame document is the
+ *   page itself (`url` is the condition for "where am I"), and a 4xx/5xx is a
+ *   failed fetch, so neither can satisfy a wait — though both are still reported
+ *   by {@link ResponseLog.last}, because "the page asked for the wrong thing" and
+ *   "the page's request failed" are the sentences an author needs.
  */
 interface ResponseLog {
   /**
@@ -141,21 +150,46 @@ interface ResponseLog {
    *   could not be read rather than spend its budget on a wait nobody is feeding.
    */
   arm(page: PlaywrightPage): boolean
-  /** Has a matching response arrived? Claims it for this wait when it has. */
-  arrived(match: TargetMatch): boolean
   /**
-   * Is there a matching response in hand that no wait has spent yet?
+   * Has a matching response arrived on this page? Spends every one it finds.
    *
-   * The read taken *before* a click, and the reason it is unspent ones that
-   * matter: a wait after the click consumes the OLDEST unspent arrival, so an
-   * unspent one already in hand is exactly what could satisfy that wait without
-   * the click having done anything. An arrival an earlier wait already spent
-   * cannot be consumed again, so it is not evidence either way (and counting it
-   * would mark a genuinely-caused click unverified).
+   * @param page - the page the run is on; another page's arrivals never answer.
+   * @param match - the URL pattern.
    */
-  unspent(match: TargetMatch): boolean
-  /** The last response watched, for the sentence a timed-out wait fails with. */
-  last(): string | null
+  arrived(page: PlaywrightPage, match: TargetMatch): boolean
+  /**
+   * When did the run's requests reach? A watermark taken before a click.
+   *
+   * A response already in flight when the click was dispatched proves nothing
+   * about the click, and only the request's own start can tell the two apart.
+   */
+  watermark(): number
+  /**
+   * Has a matching response arrived on this page from a request that started
+   * after this watermark — that is, one this act could have caused?
+   */
+  caused(page: PlaywrightPage, match: TargetMatch, since: number): boolean
+  /** The last response this page saw, matching or not, for a failure sentence. */
+  last(page: PlaywrightPage): string | null
+}
+
+/**
+ * Is this response the page's own document rather than something it fetched?
+ *
+ * Deliberately the opposite default from the challenge wait's filter (which must
+ * treat an unknown shape as a document, because it is looking for a navigation):
+ * here an unidentifiable response must stay USABLE, or a backend that reports
+ * URLs without request details could never satisfy a wait. A document is skipped
+ * only when its request actually says so.
+ *
+ * @param response - the response the page reported.
+ * @returns true when the request identifies itself as a document navigation.
+ */
+function isDocumentResponse(response: { request?: () => { isNavigationRequest?(): boolean; resourceType?(): string } | undefined }): boolean {
+  const request = response.request?.()
+  if (request === undefined) return false
+  if (typeof request.isNavigationRequest === 'function' && request.isNavigationRequest()) return true
+  return typeof request.resourceType === 'function' && request.resourceType() === 'document'
 }
 
 /** How many arrivals one fetch keeps. A page cannot spend them all, and a chatty
@@ -163,20 +197,51 @@ interface ResponseLog {
 const RESPONSE_LOG_LIMIT = 2_000
 
 function watchResponses(): ResponseLog {
-  /** One arrival: its URL, and whether a wait has already read it. */
-  const arrivals: { url: string; spent: boolean }[] = []
+  /** One response the browser reported. */
+  interface Arrival {
+    url: string
+    page: PlaywrightPage
+    /** The sequence number of the request that produced it. */
+    started: number
+    /** Can it satisfy a wait at all (a fetch that succeeded, not the document)? */
+    usable: boolean
+    /** Has a wait already consumed it? */
+    spent: boolean
+    /** The status as reported, for the sentence a timed-out wait fails with. */
+    status: number | null
+  }
+  const arrivals: Arrival[] = []
   const watching = new WeakSet<PlaywrightPage>()
-  const find = (match: TargetMatch, spend: boolean): boolean => {
-    for (const arrival of arrivals) {
-      // Spent either way: an arrival a wait has consumed can never answer
-      // anything again, so it is not evidence against a click either. The only
-      // difference between the two reads is whether this one marks it spent.
-      if (arrival.spent) continue
-      if (!matchesTarget(match, arrival.url)) continue
-      if (spend) arrival.spent = true
-      return true
+  /** Requests seen, by identity, so a response can be traced to its start. */
+  const started = new WeakMap<object, number>()
+  /**
+   * Requests seen, by URL, oldest first — the fallback for a backend whose
+   * response does not hand back the same request object it reported. Without it
+   * every arrival would look brand new, and an act already in flight would be
+   * credited to the next click.
+   */
+  const byUrl = new Map<string, number[]>()
+  let requests = 0
+  const noteRequest = (url: string): number => {
+    requests += 1
+    const waiting = byUrl.get(url)
+    if (waiting === undefined) byUrl.set(url, [requests])
+    else waiting.push(requests)
+    return requests
+  }
+  const startOf = (request: object | undefined, url: string): number => {
+    const known = request === undefined ? undefined : started.get(request)
+    if (known !== undefined) return known
+    const waiting = byUrl.get(url)
+    const oldest = waiting?.shift()
+    return oldest ?? (requests += 1)
+  }
+  const statusOf = (response: { status?: () => number }): number | null => {
+    try {
+      return typeof response.status === 'function' ? response.status() : null
+    } catch {
+      return null
     }
-    return false
   }
   return {
     arm(page) {
@@ -186,17 +251,35 @@ function watchResponses(): ResponseLog {
       if (watching.has(page)) return true
       if (page.on === undefined) return false
       try {
+        page.on('request', (request) => {
+          const url = request.url?.() ?? ''
+          const seq = noteRequest(url)
+          if (typeof request === 'object' && request !== null) started.set(request, seq)
+        })
         page.on('response', (response) => {
           const url = response.url?.() ?? ''
           // Only a URL that can be compared with a match clause is worth keeping:
           // a `data:` or `blob:` URL has no host to match against.
           if (url === '' || normalizedUrl(url) === null) return
-          arrivals.push({ url, spent: false })
+          const request = response.request?.()
+          const status = statusOf(response as { status?: () => number })
+          const arrival: Arrival = {
+            url,
+            page,
+            // Traced to its request's start when the backend reports one, and to
+            // this moment when nobody did (a response-only seam): an arrival with
+            // no request behind it cannot be older than now.
+            started: startOf(request, url),
+            usable: !isDocumentResponse(response) && (status === null || status < 400),
+            spent: false,
+            status,
+          }
+          arrivals.push(arrival)
           // Spent arrivals go first — they can never answer anything again — and
           // only then the oldest, so the bounded journal still holds what a wait
           // could still consume.
           while (arrivals.length > RESPONSE_LOG_LIMIT) {
-            const spentAt = arrivals.findIndex((arrival) => arrival.spent)
+            const spentAt = arrivals.findIndex((entry) => entry.spent)
             arrivals.splice(spentAt === -1 ? 0 : spentAt, 1)
           }
         })
@@ -206,9 +289,32 @@ function watchResponses(): ResponseLog {
         return false
       }
     },
-    arrived: (match) => find(match, true),
-    unspent: (match) => find(match, false),
-    last: () => arrivals.at(-1)?.url ?? null,
+    arrived(page, match) {
+      let held = false
+      for (const arrival of arrivals) {
+        if (arrival.page !== page || arrival.spent || !arrival.usable) continue
+        if (!matchesTarget(match, arrival.url)) continue
+        // Every match goes, not just the first: a burst is one arrival's worth of
+        // evidence, and the leftover must not answer the next wait.
+        arrival.spent = true
+        held = true
+      }
+      return held
+    },
+    watermark: () => requests,
+    caused(page, match, since) {
+      return arrivals.some(
+        (arrival) => arrival.page === page && arrival.usable && arrival.started > since && matchesTarget(match, arrival.url),
+      )
+    },
+    last(page) {
+      for (let index = arrivals.length - 1; index >= 0; index--) {
+        const arrival = arrivals[index]
+        if (arrival === undefined || arrival.page !== page) continue
+        return arrival.status === null ? arrival.url : `${arrival.url} (HTTP ${String(arrival.status)})`
+      }
+      return null
+    },
   }
 }
 
@@ -254,6 +360,7 @@ async function conditionHolds(
   evaluate: ((script: string) => Promise<unknown>) | undefined,
   remainingMs: number,
   responses: ResponseLog | null = null,
+  page: PlaywrightPage | null = null,
 ): Promise<{ held: boolean; why: string } | null> {
   if (condition.kind === 'time') return { held: true, why: '' }
   if (condition.kind === 'url') {
@@ -263,12 +370,12 @@ async function conditionHolds(
   if (condition.kind === 'response') {
     // A page nobody is listening to is not "not yet": nothing will ever arrive,
     // so the honest answer is that this condition cannot be read here.
-    if (responses === null) return null
-    if (responses.arrived(condition.match)) return { held: true, why: '' }
+    if (responses === null || page === null) return null
+    if (responses.arrived(page, condition.match)) return { held: true, why: '' }
     // What the run did see is the most useful thing a failed wait can say — a
     // recipe waiting on `/api/search` while the page is calling `/api/other`
     // should hear that, not only that its budget ran out.
-    const last = responses.last()
+    const last = responses.last(page)
     return { held: false, why: last === null ? '' : `the last response was ${last}` }
   }
   if (evaluate === undefined) return null
@@ -316,7 +423,12 @@ function describeCandidates(step: { readonly candidates: readonly Candidate[] })
 function confirmingWaitAfter(actions: readonly ActionStep[], index: number): { index: number; step: WaitStep } | null {
   for (let at = index + 1; at < actions.length; at++) {
     const step = actions[at]
-    if (step !== undefined && step.verb === 'waitFor' && step.condition.kind !== 'time') return { index: at, step }
+    if (step === undefined) continue
+    // Another act breaks the chain: a wait that follows it is evidence about
+    // THAT act, not about this click. Without this stop, one arrival would
+    // verify every click before it — including clicks that did nothing.
+    if (step.verb !== 'waitFor') return null
+    if (step.condition.kind !== 'time') return { index: at, step }
   }
   return null
 }
@@ -436,6 +548,10 @@ export async function runTargetActions(
   // already held cannot be evidence that the click changed anything. `null`
   // means the state could not be read, which is not the same as "it held".
   const heldBeforeClick = new Map<number, boolean | null>()
+  /** Per click step: the request watermark it was dispatched at. */
+  const dispatchedAt = new Map<number, number>()
+  /** The page each response wait ran on, so a click is judged on that page. */
+  const waitPage = new Map<number, PlaywrightPage>()
 
   for (const [index, step] of target.actions.entries()) {
     const budget = Math.max(0, Math.min(ceiling, options.remainingMs()))
@@ -482,12 +598,14 @@ export async function runTargetActions(
         const read = await readState(evaluate, confirming.step.condition.candidates, confirming.step.condition.state, budget)
         heldBeforeClick.set(index, read?.held ?? null)
       }
-      // A response watch is read here for the same reason the other two are: an
-      // arrival the run already had in hand cannot be evidence that this click
-      // did anything — the wait after it may still hold, but the click it was
-      // supposed to prove is marked unverified rather than credited.
-      if (confirming !== null && confirming.step.condition.kind === 'response') {
-        heldBeforeClick.set(index, responsesReadable && responses.unspent(confirming.step.condition.match))
+      // A response watch is judged by the requests, not by a point-in-time read
+      // of what is in hand: a response already IN FLIGHT when the click goes out
+      // is invisible to such a read, and it would credit a click that did
+      // nothing. The watermark says where the run's requests had reached; the
+      // click is credited only if a matching response came from a request that
+      // started after it.
+      if (confirming !== null && confirming.step.condition.kind === 'response' && responsesReadable) {
+        dispatchedAt.set(index, responses.watermark())
       }
       // Registered before the act: the page can open while the click is in
       // flight, and a listener added afterwards would miss it. Both the wait and
@@ -614,7 +732,8 @@ export async function runTargetActions(
       held = true
     } else {
       for (;;) {
-        const state = await conditionHolds(current.url(), step.condition, evaluate, budget - (Date.now() - startedAt), responsesReadable ? responses : null).catch(() => null)
+        if (step.condition.kind === 'response') waitPage.set(index, current)
+        const state = await conditionHolds(current.url(), step.condition, evaluate, budget - (Date.now() - startedAt), responsesReadable ? responses : null, current).catch(() => null)
         if (state === null) {
           unanswerable = true
           break
@@ -647,16 +766,25 @@ export async function runTargetActions(
   }
 
   // The gap a click cannot close by itself: the wait that follows has to have
-  // held *and* to have been false at click time, or it says nothing about this
-  // click. Deciding it here, once, keeps the verdict out of the verb's own code.
+  // held *and* to have been about something this click did. Deciding it here,
+  // once, keeps the verdict out of the verb's own code.
   const marked = reports.map((report) => {
     if (report.outcome !== 'clicked') return report
     const confirming = confirmingWaitAfter(target.actions, report.index)
-    const confirmed =
-      confirming !== null &&
-      reports[confirming.index]?.outcome === 'met' &&
-      heldBeforeClick.get(report.index) !== true
-    return confirmed ? report : { ...report, outcome: 'unverified' as const }
+    const held = confirming !== null && reports[confirming.index]?.outcome === 'met'
+    // A response watch is asked a different question, because it is the one
+    // condition that can be satisfied by something the click did not do: did a
+    // matching response come from a request that started after the click? The
+    // other kinds are read before the click, and one that already held proves
+    // nothing about it.
+    const confirmingKind = confirming?.step.condition.kind
+    const aboutThisClick =
+      confirmingKind === 'response'
+        ? confirming !== null &&
+          dispatchedAt.has(report.index) &&
+          responses.caused(waitPage.get(confirming.index) ?? current, confirming.step.condition.match, dispatchedAt.get(report.index) ?? 0)
+        : heldBeforeClick.get(report.index) !== true
+    return held && aboutThisClick ? report : { ...report, outcome: 'unverified' as const }
   })
   const clicked = marked.some((report) => report.verb === 'click' && report.outcome !== 'skipped')
   return { ok: true, run: { steps: marked, finalUrl: current.url(), clicked }, page: current }
