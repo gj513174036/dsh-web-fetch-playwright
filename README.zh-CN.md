@@ -84,7 +84,7 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 | `proxyBypass` | 空 | 逗号分隔的绕过主机；回环地址（`127.0.0.1`、`localhost`、`::1`）始终并入；启动器会把它改写成 Chromium 的 `;` 分隔形式。 |
 | `proxyUsername` / `proxyPassword` | 空 | 供**本插件自己启动的浏览器**（本地与 DSH 托管）以 `Proxy-Authorization` 发送的代理凭据；与其他设置一同保存，密码永远不会出现在错误信息里（卡片以掩码显示）。**CDP/启动器拓扑下不会下发**——Chromium 命令行无处承载，启动器会改为给出警告（见[两种拓扑](#两种拓扑可视浏览器--服务器无头)）。 |
 | `denoise` | `true` | 是否启用降噪；关闭时返回整页渲染 HTML，交由工具层转换。 |
-| `dismissConsent` | `false` | 页面稳定后、读取之前，点击已知同意管理器的"全部接受"控件（OneTrust、TrustArc、Cookiebot、Didomi、Osano、Usercentrics、CookieYes、Complianz、Iubenda、Klaro、Google Funding Choices、Quantcast）。默认关闭：这次点击会在抓取所用的 profile 里记录**你的**同意（CDP 与托管后端下就是你的真实 profile），同意 cookie 会留在那里。尽力而为：没有横幅、后端不支持 `evaluate`、点击抛错，都不会影响抓取结果。 |
+| `dismissConsent` | `false` | 页面稳定后、读取之前，点击已知同意管理器的"全部接受"控件（OneTrust、TrustArc、Cookiebot、Didomi、Osano、Usercentrics、CookieYes、Complianz、Iubenda、Klaro、Google Funding Choices、Quantcast）；这些都没命中时，退而点击任何位于同意类界面里的"全部接受 / accept all"控件（判据：位于对话框、同意命名的祖先容器、或固定/粘性浮层之中）。默认关闭：这次点击会在抓取所用的 profile 里记录**你的**同意（CDP 与托管后端下就是你的真实 profile），同意 cookie 会留在那里。尽力而为：没有横幅、后端不支持 `evaluate`、点击抛错，都不会影响抓取结果。 |
 | `maxConcurrency` | *（自动）* | 同时渲染的页面上限（1–200）。留空按后端取默认：本地 **4**（每个槽位启动一个浏览器）/ CDP 与 DSH 托管后端 **50 个标签页**（浏览器已在运行，一个并发名额就是一个标签页）。超出的请求短暂排队；20s 内等不到空位则以 `WEB_FETCH_TIMEOUT` 尽快失败并提示重试或调大该值，而不是一直挂起直到工具层预算中止。 |
 | `challengeWaitMs` | `15000` | Cloudflare 挑战的**有界**自然等待上限（毫秒，0–60000），在同一标签页内等待浏览器自行通过验证。`0` 关闭整条挑战处理链路——直接返回首次响应（0.2.5 之前的旧行为）。 |
 | `challengeRetries` | `1` | 一个等待窗口耗尽后的**同标签页**重新导航次数（0–3）；浏览器已拿到的通关 cookie 留在上下文里供重试使用。总耗时始终受 45s 单次抓取预算约束。 |
