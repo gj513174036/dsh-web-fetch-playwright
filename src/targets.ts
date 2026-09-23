@@ -279,6 +279,24 @@ function parseCondition(value: unknown, path: string): { condition: WaitConditio
 }
 
 /**
+ * A required non-empty string field, trimmed.
+ *
+ * `what` is the sentence the author reads when it is missing, so every kind
+ * keeps its own advice while the shape check lives in one place.
+ */
+function requiredString(value: unknown, path: string, key: string, what: string): { text: string } | { error: string } {
+  if (typeof value !== 'string' || value.trim() === '') return { error: `${at(path)}.${key}: expected ${what}` }
+  return { text: value.trim() }
+}
+
+/** A step's `optional` flag, absent meaning false. */
+function parseOptional(value: unknown, path: string): { optional: boolean } | { error: string } {
+  if (value === undefined) return { optional: false }
+  if (typeof value !== 'boolean') return { error: `${at(path)}.optional: expected a boolean` }
+  return { optional: value }
+}
+
+/**
  * Parse one candidate.
  *
  * A candidate is exactly one kind — `{ selector }`, `{ text }` or
@@ -291,33 +309,25 @@ function parseCandidate(value: unknown, path: string): { candidate: Candidate } 
   if ('selector' in value) {
     const unknown = unknownKeys(value, ['selector'], path)
     if (unknown !== null) return { error: unknown }
-    const selector = value['selector']
-    if (typeof selector !== 'string' || selector.trim() === '') {
-      return { error: `${at(path)}.selector: expected a non-empty CSS selector` }
-    }
-    return { candidate: { kind: 'selector', selector: selector.trim() } }
+    const selector = requiredString(value['selector'], path, 'selector', 'a non-empty CSS selector')
+    if ('error' in selector) return { error: selector.error }
+    return { candidate: { kind: 'selector', selector: selector.text } }
   }
   if ('text' in value) {
     const unknown = unknownKeys(value, ['text'], path)
     if (unknown !== null) return { error: unknown }
-    const text = value['text']
-    if (typeof text !== 'string' || text.trim() === '') {
-      return { error: `${at(path)}.text: expected the visible text of the control, e.g. "查询"` }
-    }
-    return { candidate: { kind: 'text', text: text.trim() } }
+    const text = requiredString(value['text'], path, 'text', 'the visible text of the control, e.g. "查询"')
+    if ('error' in text) return { error: text.error }
+    return { candidate: { kind: 'text', text: text.text } }
   }
   if ('role' in value) {
     const unknown = unknownKeys(value, ['role', 'name'], path)
     if (unknown !== null) return { error: unknown }
-    const role = value['role']
-    const name = value['name']
-    if (typeof role !== 'string' || role.trim() === '') {
-      return { error: `${at(path)}.role: expected an accessible role, e.g. "button" or "link"` }
-    }
-    if (typeof name !== 'string' || name.trim() === '') {
-      return { error: `${at(path)}.name: expected the accessible name the control must have, e.g. "查询"` }
-    }
-    return { candidate: { kind: 'role', role: role.trim().toLowerCase(), name: name.trim() } }
+    const role = requiredString(value['role'], path, 'role', 'an accessible role, e.g. "button" or "link"')
+    if ('error' in role) return { error: role.error }
+    const name = requiredString(value['name'], path, 'name', 'the accessible name the control must have, e.g. "查询"')
+    if ('error' in name) return { error: name.error }
+    return { candidate: { kind: 'role', role: role.text.toLowerCase(), name: name.text } }
   }
   if ('name' in value) return { error: `${at(path)}.name: only means something beside a "role"` }
   return {
@@ -333,9 +343,9 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
     if (unknown !== null) return { error: unknown }
     const parsed = parseCondition(value['condition'], `${path}.condition`)
     if ('error' in parsed) return { error: parsed.error }
-    const optional = value['optional']
-    if (optional !== undefined && typeof optional !== 'boolean') return { error: `${at(path)}.optional: expected a boolean` }
-    return { step: optional === true ? { verb, condition: parsed.condition, optional: true } : { verb, condition: parsed.condition } }
+    const optional = parseOptional(value['optional'], path)
+    if ('error' in optional) return { error: optional.error }
+    return { step: optional.optional ? { verb, condition: parsed.condition, optional: true } : { verb, condition: parsed.condition } }
   }
   if (verb === 'click') {
     const unknown = unknownKeys(value, ['verb', 'candidates', 'optional'], path)
@@ -353,9 +363,9 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
       if ('error' in candidate) return { error: candidate.error }
       parsed.push(candidate.candidate)
     }
-    const optional = value['optional']
-    if (optional !== undefined && typeof optional !== 'boolean') return { error: `${at(path)}.optional: expected a boolean` }
-    return { step: optional === true ? { verb, candidates: parsed, optional: true } : { verb, candidates: parsed } }
+    const optional = parseOptional(value['optional'], path)
+    if ('error' in optional) return { error: optional.error }
+    return { step: optional.optional ? { verb, candidates: parsed, optional: true } : { verb, candidates: parsed } }
   }
   return { error: `${at(path)}.verb: expected "waitFor" or "click" (the other verbs are not implemented yet)` }
 }

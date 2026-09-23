@@ -27,6 +27,7 @@
 
 import type { PlaywrightPage } from './types.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
+import { raceTimeout, TIMED_OUT } from './race.ts'
 
 /** How long the page gets to answer the observation probe. */
 export const OBSERVE_TIMEOUT_MS = 5_000
@@ -73,6 +74,10 @@ export interface Observation {
 export const OBSERVE_SCRIPT = `(() => {
   ${spliceFragments(PAGE_FRAGMENTS)}
   const kindOf = (el) => {
+    // Deliberately NOT the shared roleOf: this field reports the markup a planner
+    // is looking at (submit, search, link), while roleOf answers the ARIA role a
+    // candidate is matched against (button, searchbox). Merging them would rename
+    // every control in this report.
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute('type') || '').toLowerCase();
     const role = (el.getAttribute('role') || '').toLowerCase();
@@ -123,23 +128,6 @@ export const OBSERVE_SCRIPT = `(() => {
     controls: ordered.slice(0, ${String(OBSERVE_CONTROL_LIMIT)}),
   };
 })()`
-
-/** Settle `work`, or give up after `ms`. Mirrors the consent probe's budget. */
-function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { resolve(TIMED_OUT) }, ms)
-    work.then(
-      (value) => { clearTimeout(timer); resolve(value) },
-      (error: unknown) => {
-        clearTimeout(timer)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      },
-    )
-  })
-}
-
-/** Sentinel for {@link raceTimeout}. */
-const TIMED_OUT = Symbol('observe-timeout')
 
 /**
  * Read the page's actionable state.

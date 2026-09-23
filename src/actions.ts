@@ -54,6 +54,12 @@ export interface ActionRun {
   readonly steps: readonly StepReport[]
   /** The document the actions ended on. */
   readonly finalUrl: string
+  /**
+   * Did a click actually go out? A click can navigate, so the caller may have to
+   * let that land before it describes the document — and only this run knows
+   * whether one was dispatched (an `optional` click that was skipped is not).
+   */
+  readonly clicked: boolean
 }
 
 /** Why a run stopped. */
@@ -142,19 +148,31 @@ function describeCandidates(step: ClickStep): string {
 }
 
 /**
- * Does a step after this one confirm that a click's effect happened?
+ * Where a click's judgement comes from: the first `waitFor` after it whose
+ * condition is about the page.
  *
- * A `waitFor` confirms when it reported `met` and its condition is about the
- * page — text or URL. A fixed wait asserts nothing (the clock passed whether or
- * not the page moved), and an `optional` wait that was skipped confirms nothing
- * either, which is why this reads the reports rather than the recipe alone.
+ * A fixed wait is not one (the clock passes whether or not the page moved), and
+ * neither is an `optional` wait that was skipped — which is why the caller reads
+ * the run's reports as well as this recipe position.
  */
-function clickConfirmed(actions: readonly ActionStep[], reports: readonly StepReport[], index: number): boolean {
-  return reports.some((report) => {
-    if (report.index <= index || report.outcome !== 'met') return false
-    const step = actions[report.index]
-    return step !== undefined && step.verb === 'waitFor' && step.condition.kind !== 'time'
-  })
+function confirmingWaitAfter(actions: readonly ActionStep[], index: number): { index: number; step: WaitStep } | null {
+  for (let at = index + 1; at < actions.length; at++) {
+    const step = actions[at]
+    if (step !== undefined && step.verb === 'waitFor' && step.condition.kind !== 'time') return { index: at, step }
+  }
+  return null
+}
+
+/**
+ * Does a URL condition already hold, read from the URL the page is on?
+ *
+ * The half of "did it already hold before the click" that needs no scripting: a
+ * text condition is answered by the click script itself, which can see the page.
+ */
+function urlConditionHeld(url: string, condition: WaitCondition): boolean {
+  if (condition.kind !== 'url') return false
+  const under = urlIsUnder(url, condition.url)
+  return condition.absent === true ? !under : under
 }
 
 /**
@@ -174,6 +192,10 @@ export async function runTargetActions(
   const poll = options.pollMs ?? POLL_MS
   const evaluate = page.evaluate?.bind(page)
   const reports: StepReport[] = []
+  // What the confirming condition was at click time, per click step: a wait that
+  // already held cannot be evidence that the click changed anything. `null`
+  // means the state could not be read, which is not the same as "it held".
+  const heldBeforeClick = new Map<number, boolean | null>()
 
   for (const [index, step] of target.actions.entries()) {
     const budget = Math.max(0, Math.min(ceiling, options.remainingMs()))
@@ -191,8 +213,15 @@ export async function runTargetActions(
         }
         return failure(`${detail} (only 0ms of the step budget is left)`)
       }
-      const outcome = await clickCandidate(page, step.candidates, budget)
+      const confirming = confirmingWaitAfter(target.actions, index)
+      if (confirming !== null && confirming.step.condition.kind === 'url') {
+        heldBeforeClick.set(index, urlConditionHeld(page.url(), confirming.step.condition))
+      }
+      const outcome = await clickCandidate(page, step.candidates, budget, confirming?.step.condition)
       if (outcome.kind === 'clicked') {
+        // The script answers for a text watch; a URL watch was answered above,
+        // and the script's `null` must not erase that answer.
+        heldBeforeClick.set(index, outcome.before ?? heldBeforeClick.get(index) ?? null)
         reports.push({ index, verb: step.verb, detail: outcome.candidate, outcome: 'clicked' })
         continue
       }
@@ -266,15 +295,20 @@ export async function runTargetActions(
     )
   }
 
-  // The gap a click cannot close by itself: with no later `waitFor` that held,
-  // the summary must not imply the page changed. Marking it here, once, keeps
-  // the verdict out of the verb's own code.
-  const marked = reports.map((report) =>
-    report.outcome === 'clicked' && !clickConfirmed(target.actions, reports, report.index)
-      ? { ...report, outcome: 'unverified' as const }
-      : report,
-  )
-  return { ok: true, run: { steps: marked, finalUrl: page.url() } }
+  // The gap a click cannot close by itself: the wait that follows has to have
+  // held *and* to have been false at click time, or it says nothing about this
+  // click. Deciding it here, once, keeps the verdict out of the verb's own code.
+  const marked = reports.map((report) => {
+    if (report.outcome !== 'clicked') return report
+    const confirming = confirmingWaitAfter(target.actions, report.index)
+    const confirmed =
+      confirming !== null &&
+      reports[confirming.index]?.outcome === 'met' &&
+      heldBeforeClick.get(report.index) !== true
+    return confirmed ? report : { ...report, outcome: 'unverified' as const }
+  })
+  const clicked = marked.some((report) => report.verb === 'click' && report.outcome !== 'skipped')
+  return { ok: true, run: { steps: marked, finalUrl: page.url(), clicked } }
 }
 
 /**

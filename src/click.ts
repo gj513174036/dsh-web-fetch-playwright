@@ -27,7 +27,8 @@
 
 import type { PlaywrightPage } from './types.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { describeCandidate, type Candidate } from './targets.ts'
+import { raceTimeout, TIMED_OUT } from './race.ts'
+import { describeCandidate, type Candidate, type WaitCondition } from './targets.ts'
 
 /** How long the page gets to answer the click probe. */
 export const CLICK_TIMEOUT_MS = 5_000
@@ -46,8 +47,13 @@ export const CANDIDATE_CONTROLS = 'button, a[href], input, select, textarea, lab
 
 /** What one click attempt came to. */
 export type ClickOutcome =
-  /** A candidate was reachable and its click was dispatched. */
-  | { readonly kind: 'clicked'; readonly candidate: string }
+  /**
+   * A candidate was reachable and its click was dispatched. `before` is the
+   * watched condition's state *at the moment of the click* — `true` means the
+   * condition the recipe waits for next was already true, so that wait cannot be
+   * evidence that this click did anything.
+   */
+  | { readonly kind: 'clicked'; readonly candidate: string; readonly before: boolean | null }
   /**
    * The click went out and the page navigated before the script could report
    * which candidate landed. Not a failure — the following `waitFor` is what says
@@ -67,15 +73,25 @@ export type ClickOutcome =
  * wording for the summary, the failure message and the recipe, instead of a
  * second copy of the phrasing that can drift.
  *
+ * `watch` is the condition a later `waitFor` will check. Reading it *before* the
+ * click is what lets the runner tell "the page moved because of this click" from
+ * "the text was already there" — a wait that already held proves nothing about
+ * the click. Only text can be read here; a URL condition is the runner's to
+ * answer, since it has the page's own URL.
+ *
  * @param candidates - the recipe's ordered candidates.
+ * @param watch - the text condition the next `waitFor` will check, if any.
  * @returns a script returning a `ClickOutcome`-shaped object.
  */
-export function clickScript(candidates: readonly Candidate[]): string {
+export function clickScript(candidates: readonly Candidate[], watch?: WaitCondition): string {
   const encoded = candidates.map((candidate) => ({ ...candidate, label: describeCandidate(candidate) }))
+  const watched = watch !== undefined && watch.kind === 'text' ? JSON.stringify({ text: watch.text, absent: watch.absent === true }) : 'null'
   return `(() => {
   const candidates = ${JSON.stringify(encoded)};
   const CONTROLS = ${JSON.stringify(CANDIDATE_CONTROLS)};
+  const watch = ${watched};
   ${spliceFragments(PAGE_FRAGMENTS)}
+  const before = watch === null ? null : (visibleTextOf().indexOf(watch.text) >= 0) !== watch.absent;
   const collapsed = (value) => String(value || '').trim().replace(/\\s+/g, ' ').toLowerCase();
   const matchesOf = (candidate) => {
     if (candidate.kind === 'selector') {
@@ -115,34 +131,10 @@ export function clickScript(candidates: readonly Candidate[]): string {
     // order is the recipe's, so a later candidate must not be tried behind the
     // author's back. A throw is reported rather than silently moved past.
     try { hit.click() } catch (error) { return { ok: false, tried: tried.concat(landed + ': the click threw (' + String(error) + ')') } }
-    return { ok: true, candidate: landed };
+    return { ok: true, candidate: landed, before: before };
   }
   return { ok: false, tried: tried };
 })()`
-}
-
-/** Sentinel for {@link raceTimeout}, distinct from any page answer. */
-const TIMED_OUT = Symbol('click-timeout')
-
-/**
- * Settle `work`, or give up after `ms` — a stalled probe must not spend the
- * fetch's budget.
- *
- * @param work - the promise to bound.
- * @param ms - the budget in milliseconds.
- * @returns the value, or {@link TIMED_OUT}.
- */
-function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { resolve(TIMED_OUT) }, ms)
-    work.then(
-      (value) => { clearTimeout(timer); resolve(value) },
-      (error: unknown) => {
-        clearTimeout(timer)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      },
-    )
-  })
 }
 
 /**
@@ -166,12 +158,16 @@ export function looksLikeNavigation(error: unknown): boolean {
  * @param page - the page the fetch has open.
  * @param candidates - the recipe's ordered candidates.
  * @param timeoutMs - budget for the attempt; must stay inside the step's ceiling.
+ * @param watch - the condition the next `waitFor` will check, when it is a text
+ *   one; the page reads it before clicking, so a wait that already held is not
+ *   mistaken for proof that the click did something.
  * @returns what happened, in the four shapes {@link ClickOutcome} allows.
  */
 export async function clickCandidate(
   page: PlaywrightPage,
   candidates: readonly Candidate[],
   timeoutMs: number = CLICK_TIMEOUT_MS,
+  watch?: WaitCondition,
 ): Promise<ClickOutcome> {
   const evaluate = page.evaluate?.bind(page)
   if (evaluate === undefined) {
@@ -179,7 +175,7 @@ export async function clickCandidate(
   }
   let answer: unknown
   try {
-    answer = await raceTimeout(evaluate(clickScript(candidates)), Math.max(0, timeoutMs))
+    answer = await raceTimeout(evaluate(clickScript(candidates, watch)), Math.max(0, timeoutMs))
   } catch (error: unknown) {
     if (looksLikeNavigation(error)) return { kind: 'clicked-unreported' }
     return { kind: 'unreadable', problem: error instanceof Error ? error.message : String(error) }
@@ -188,9 +184,15 @@ export async function clickCandidate(
   if (typeof answer !== 'object' || answer === null) {
     return { kind: 'unreadable', problem: 'the page answered with something other than a click result' }
   }
-  const shape = answer as { ok?: unknown; candidate?: unknown; tried?: unknown }
+  const shape = answer as { ok?: unknown; candidate?: unknown; tried?: unknown; before?: unknown }
   if (shape.ok === true) {
-    return { kind: 'clicked', candidate: typeof shape.candidate === 'string' ? shape.candidate : 'a candidate' }
+    return {
+      kind: 'clicked',
+      candidate: typeof shape.candidate === 'string' ? shape.candidate : 'a candidate',
+      // Only a real boolean is an answer; anything else leaves the pre-click
+      // state unknown, which the runner reads as "not known to have held".
+      before: typeof shape.before === 'boolean' ? shape.before : null,
+    }
   }
   const reasons = Array.isArray(shape.tried) ? shape.tried.filter((entry): entry is string => typeof entry === 'string') : []
   return { kind: 'not-clicked', reasons }

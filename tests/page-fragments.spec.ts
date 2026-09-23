@@ -107,6 +107,10 @@ describe('page fragments', () => {
     it('refuses a disabled control, however it says so', () => {
       expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<button disabled>go</button>')).toBe('disabled')
       expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("div"))', '<div role="button" aria-disabled="true">go</div>')).toBe('disabled')
+      // A control inside a disabled fieldset has no `disabled` of its own, yet
+      // activating it does nothing — which is the "clicked, so it worked"
+      // failure this check exists to pre-empt.
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<fieldset disabled><button>go</button></fieldset>')).toBe('disabled')
     })
 
     it('refuses a control something else is sitting on', () => {

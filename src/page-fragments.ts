@@ -155,6 +155,7 @@ export const FRAGMENT_ROLE = `const roleOf = (el) => {
  */
 export const FRAGMENT_REACHABILITY = `const reachabilityOf = (el) => {
     if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') return 'disabled';
+    if (el.closest !== undefined && el.closest('fieldset[disabled]') !== null) return 'disabled';
     const host = hostOf(el);
     if (host === 'hidden') return 'not laid out';
     const visible = host === 'label' ? labelHostOf(el) : el;

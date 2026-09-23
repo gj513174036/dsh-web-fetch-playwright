@@ -41,7 +41,7 @@
 
 import type { PlaywrightPage } from './types.ts'
 import { CONSENT_FRAGMENTS, DISMISS_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-
+import { raceTimeout, TIMED_OUT } from './race.ts'
 
 /**
  * The accept-all controls of the consent managers this plugin knows by name,
@@ -161,9 +161,6 @@ export interface ConsentOutcome {
   gate: boolean
 }
 
-/** Sentinel for {@link raceTimeout}, distinct from any page answer. */
-const TIMED_OUT = Symbol('consent-timeout')
-
 /**
  * The in-page half of the dismissal: walk the candidates in order, take the
  * first one that is really there, and click it.
@@ -220,27 +217,6 @@ export const DISMISS_SCRIPT = `(() => {
   }
   return { clicked: null, problem: null, gate: false };
 })()`
-
-/**
- * Settle `work`, or give up after `ms` — the page's execution context can be
- * destroyed mid-call, and a stalled probe must not spend the fetch's budget.
- *
- * @param work - the promise to bound.
- * @param ms - the budget in milliseconds.
- * @returns the value, or {@link TIMED_OUT}.
- */
-function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { resolve(TIMED_OUT) }, ms)
-    work.then(
-      (value) => { clearTimeout(timer); resolve(value) },
-      (error: unknown) => {
-        clearTimeout(timer)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      },
-    )
-  })
-}
 
 /**
  * Whether the document currently on screen is a consent gate.

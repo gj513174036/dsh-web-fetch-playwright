@@ -175,6 +175,34 @@ describe('runTargetActions, the click verb', () => {
     expect(skipped.ok && skipped.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'skipped'])
   })
 
+  it('does not accept a wait that was already true as proof the click worked', async () => {
+    // The wait the recipe puts after a click only means something if it was
+    // false when the click went out; otherwise a no-op click reads as verified.
+    const already = { ok: true, candidate: 'text "查询" -> button', before: true }
+    const outcome = await runTargetActions(clickPage(already), target(click({ kind: 'text', text: '查询' }), text('结果')), options)
+    expect(outcome.ok && outcome.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
+  })
+
+  it('reads a URL confirmation from where the page was before the click', async () => {
+    const after: WaitStep = { verb: 'waitFor', condition: { kind: 'url', url: 'https://a.example/results' } }
+    let url = 'https://a.example/search'
+    const moving = {
+      url: () => url,
+      evaluate: async (script: string) => {
+        if (!script.includes('const candidates = ')) return true
+        url = 'https://a.example/results'
+        return landed
+      },
+    } as unknown as PlaywrightPage
+    const moved = await runTargetActions(moving, target(click({ kind: 'text', text: '查询' }), after), options)
+    expect(moved.ok && moved.run.steps.map((step) => step.outcome)).toEqual(['clicked', 'met'])
+
+    // Already on the results URL: the wait proves nothing about the click.
+    const waiting = { url: () => 'https://a.example/results', evaluate: async () => landed } as unknown as PlaywrightPage
+    const stayed = await runTargetActions(waiting, target(click({ kind: 'text', text: '查询' }), after), options)
+    expect(stayed.ok && stayed.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
+  })
+
   it('counts a click whose page navigated out from under it, and lets the wait judge it', async () => {
     const navigated = await runTargetActions(
       clickPage(() => { throw new Error('Execution context was destroyed, most likely because of a navigation') }),
@@ -245,6 +273,7 @@ describe('renderActionSummary', () => {
       { index: 3, verb: 'click', detail: 'selector "#next" -> link', outcome: 'clicked' },
     ],
     finalUrl: 'https://a.example/results',
+    clicked: true,
   }
 
   it('is one line that says what ran and where it ended', () => {

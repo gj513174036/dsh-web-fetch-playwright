@@ -44,8 +44,9 @@ The purpose behind an action, stated independently of how it is achieved. An int
 exactly one of its candidates.
 
 **Candidate(候选)**:
-One way to satisfy an intent — a CSS selector, a visible text, or a role. Candidates are ordered and
-the first visible one wins, which is what lets a target survive a redesign.
+One way to satisfy an intent — a CSS selector, a visible text, or a role with an accessible name.
+Candidates are ordered and the first *reachable* one wins (laid out, not covered, not disabled), which is
+what lets a target survive a redesign.
 _Avoid_: selector (a candidate may not be one)
 
 **Target(目标)**:

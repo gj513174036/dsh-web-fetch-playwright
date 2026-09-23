@@ -11,7 +11,7 @@
 import { JSDOM } from 'jsdom'
 import { describe, expect, it } from 'vitest'
 import { CANDIDATE_CONTROLS, CLICK_TIMEOUT_MS, clickCandidate, clickScript, looksLikeNavigation } from '../src/click.ts'
-import type { Candidate } from '../src/targets.ts'
+import type { Candidate, WaitCondition } from '../src/targets.ts'
 import type { PlaywrightPage } from '../src/types.ts'
 
 const LAID_OUT = { width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10, x: 0, y: 0, toJSON: () => ({}) }
@@ -20,10 +20,12 @@ interface ClickAnswer {
   ok: boolean
   candidate?: string
   tried?: string[]
+  /** The watched condition's state at the moment of the click. */
+  before?: boolean | null
 }
 
 /** Run the real script against real markup. */
-function runScript(html: string, candidates: readonly Candidate[], tweak?: (dom: JSDOM) => void): ClickAnswer {
+function runScript(html: string, candidates: readonly Candidate[], tweak?: (dom: JSDOM) => void, watch?: WaitCondition): ClickAnswer {
   const dom = new JSDOM(`<!doctype html><html><head><title>t</title></head><body>${html}</body></html>`, {
     runScripts: 'outside-only',
     url: 'https://example.com/search',
@@ -34,7 +36,7 @@ function runScript(html: string, candidates: readonly Candidate[], tweak?: (dom:
   }
   dom.window.document.elementFromPoint = (() => null) as unknown as Document['elementFromPoint']
   tweak?.(dom)
-  return dom.window.eval(clickScript(candidates)) as ClickAnswer
+  return dom.window.eval(clickScript(candidates, watch)) as ClickAnswer
 }
 
 /** Record clicks on one element, so a test can prove which one was hit. */
@@ -47,14 +49,14 @@ function track(dom: JSDOM, selector: string, into: string[]): void {
 describe('clickScript', () => {
   it('clicks the first reachable candidate and says what it landed on', () => {
     const html = '<button id="zh">查询</button><button id="en">Search</button>'
-    expect(runScript(html, [{ kind: 'text', text: '查询' }])).toEqual({ ok: true, candidate: 'text "查询" -> button' })
-    expect(runScript(html, [{ kind: 'text', text: 'Search' }])).toEqual({ ok: true, candidate: 'text "Search" -> button' })
+    expect(runScript(html, [{ kind: 'text', text: '查询' }])).toEqual({ ok: true, candidate: 'text "查询" -> button', before: null })
+    expect(runScript(html, [{ kind: 'text', text: 'Search' }])).toEqual({ ok: true, candidate: 'text "Search" -> button', before: null })
   })
 
   it('resolves a role with its accessible name', () => {
     // A fragment href, so jsdom does not try to fetch a page it cannot.
     const html = '<a id="go" href="#results">搜索结果</a><button id="other">搜索结果</button>'
-    expect(runScript(html, [{ kind: 'role', role: 'link', name: '搜索结果' }])).toEqual({ ok: true, candidate: 'role link "搜索结果" -> link' })
+    expect(runScript(html, [{ kind: 'role', role: 'link', name: '搜索结果' }])).toEqual({ ok: true, candidate: 'role link "搜索结果" -> link', before: null })
   })
 
   it('stops at the first reachable candidate instead of trying the later ones', () => {
@@ -65,7 +67,7 @@ describe('clickScript', () => {
       track(dom, '#first', clicked)
       track(dom, '#second', clicked)
     })
-    expect(answer).toEqual({ ok: true, candidate: 'selector "#first" -> button' })
+    expect(answer).toEqual({ ok: true, candidate: 'selector "#first" -> button', before: null })
     expect(clicked).toEqual(['#first'])
   })
 
@@ -75,7 +77,7 @@ describe('clickScript', () => {
     const answer = runScript(html, [{ kind: 'selector', selector: '#off' }, { kind: 'selector', selector: '#on' }], (dom) => {
       track(dom, '#on', clicked)
     })
-    expect(answer).toEqual({ ok: true, candidate: 'selector "#on" -> button' })
+    expect(answer).toEqual({ ok: true, candidate: 'selector "#on" -> button', before: null })
     expect(clicked).toEqual(['#on'])
   })
 
@@ -86,7 +88,7 @@ describe('clickScript', () => {
     const answer = runScript(html, [{ kind: 'selector', selector: '#consent' }], (dom) => {
       track(dom, '#consent-label', clicked)
     })
-    expect(answer).toEqual({ ok: true, candidate: 'selector "#consent" -> label' })
+    expect(answer).toEqual({ ok: true, candidate: 'selector "#consent" -> label', before: null })
     expect(clicked[0]).toBe('#consent-label')
   })
 
@@ -140,7 +142,26 @@ describe('clickScript', () => {
   it('compares a name as a person reads it, not byte for byte', () => {
     // Collapsed whitespace and case: markup rarely matches a recipe exactly.
     const html = '<button id="a">  Search\u00a0 Results </button>'
-    expect(runScript(html, [{ kind: 'text', text: 'search results' }])).toEqual({ ok: true, candidate: 'text "search results" -> button' })
+    expect(runScript(html, [{ kind: 'text', text: 'search results' }])).toEqual({ ok: true, candidate: 'text "search results" -> button', before: null })
+  })
+
+  it('reads the condition the next wait will check before it clicks', () => {
+    // A wait that was already true is not evidence that the click did anything,
+    // so the state has to be read at click time — and this is the only moment it
+    // exists.
+    const html = '<button id="go">查询</button>'
+    const absent: WaitCondition = { kind: 'text', text: '查询结果' }
+    expect(runScript(html, [{ kind: 'text', text: '查询' }], undefined, absent)).toEqual({
+      ok: true,
+      candidate: 'text "查询" -> button',
+      before: false,
+    })
+    const present: WaitCondition = { kind: 'text', text: '查询' }
+    expect(runScript(html, [{ kind: 'text', text: '查询' }], undefined, present)).toMatchObject({ before: true })
+    // A disappearance condition that is already true is not proof either.
+    const gone: WaitCondition = { kind: 'text', text: '加载中', absent: true }
+    expect(runScript(html, [{ kind: 'text', text: '查询' }], undefined, gone)).toMatchObject({ before: true })
+    expect(runScript(html, [{ kind: 'text', text: '查询' }], undefined, { kind: 'url', url: 'https://example.com/x' })).toMatchObject({ before: null })
   })
 
   it('carries whatever text the recipe holds, without breaking the script', () => {
@@ -157,7 +178,21 @@ describe('clickCandidate', () => {
 
   it('reads a click, and names the candidate that landed', async () => {
     const outcome = await clickCandidate(pageWith(async () => ({ ok: true, candidate: 'text "查询" -> button' })), [{ kind: 'text', text: '查询' }])
-    expect(outcome).toEqual({ kind: 'clicked', candidate: 'text "查询" -> button' })
+    expect(outcome).toEqual({ kind: 'clicked', candidate: 'text "查询" -> button', before: null })
+  })
+
+  it('carries the pre-click state back, and refuses to invent one', async () => {
+    const watch: WaitCondition = { kind: 'text', text: '查询结果' }
+    let sent = ''
+    const held = await clickCandidate(pageWith(async (script) => {
+      sent = script
+      return { ok: true, candidate: 'text "查询" -> button', before: true }
+    }), [{ kind: 'text', text: '查询' }], 5_000, watch)
+    expect(held).toMatchObject({ before: true })
+    expect(sent).toContain(JSON.stringify('查询结果'))
+
+    const invented = await clickCandidate(pageWith(async () => ({ ok: true, candidate: 'x', before: 'yes' })), [{ kind: 'text', text: '查询' }])
+    expect(invented).toMatchObject({ before: null })
   })
 
   it('reads a navigation as a click the page moved away from, not as a failure', async () => {
