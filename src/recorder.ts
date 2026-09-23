@@ -446,6 +446,13 @@ export class NetworkRecorder {
     } catch (error: unknown) {
       recorder.note(`Network.enable failed: ${describe(error)}`)
     }
+    // The header is on disk before this resolves. It is the line that makes a
+    // capture self-describing, and a reader can open the dump as soon as the
+    // fetch starts; leaving it to land later made the file's existence a race
+    // (seen under load: the header still queued while `create` had returned).
+    // Appends stay best-effort — a failed one is noted, never thrown — so
+    // waiting here cannot fail a fetch.
+    await recorder.settleWrites()
     return recorder
   }
 
