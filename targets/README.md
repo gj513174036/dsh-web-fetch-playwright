@@ -8,7 +8,7 @@ prose.
 | File | What it proves | Which plugin version it needs |
 | --- | --- | --- |
 | `verify.json` | URL selection, the action summary, a step that does not hold failing loudly, a non-document body being refused, and the per-fetch re-read of the file (edit it between two fetches and the second one sees the change) | 0.2.18 |
-| `verify-click.json` | the `click` verb: an ordered candidate list (role / text / selector), reachability checked before the act, a Chinese and an English candidate each resolving on a real page, the wait after a click confirming it, and every candidate being named when none can be clicked | 0.2.19 |
+| `verify-click.json` | the `click` verb: an ordered candidate list (role / text / selector), reachability checked before the act, a Chinese and an English candidate each resolving on a real page, the wait after a click confirming it, `clicked (unverified)` when nothing follows, and every candidate being named when none can be clicked | 0.2.19 |
 
 Point `targetsFile` at one file at a time. Both are deliberately chosen to be
 harmless: `example.com`, `baidu.com`'s own search button, and the IANA page that

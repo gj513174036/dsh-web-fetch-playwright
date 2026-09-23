@@ -38,6 +38,14 @@
           ]
         }
       ]
+    },
+    {
+      "name": "verify-click-unverified",
+      "match": { "kind": "prefix", "url": "https://www.163.com/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "新闻" } },
+        { "verb": "click", "candidates": [{ "text": "新闻" }] }
+      ]
     }
   ]
 }
