@@ -70,6 +70,37 @@ describe('runTargetActions', () => {
     expect(outcome.ok).toBe(true)
   })
 
+  it('does not pretend a fixed wait happened when it cannot fit', async () => {
+    // Sleeping the shortened time and reporting met would be a step claiming
+    // something untrue; the wait did not elapse.
+    const tight = { remainingMs: () => 5_000, stepCeilingMs: 20, pollMs: 1 }
+    const outcome = await runTargetActions(pageWith({}), target({ verb: 'waitFor', condition: { kind: 'time', ms: 60_000 } }), tight)
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('of the step budget is left')
+  })
+
+  it('keeps polling when a read fails transiently', async () => {
+    // A click's navigation destroys the execution context, and the next poll is
+    // the one that answers: a transient failure is "not yet", not "unreadable".
+    let calls = 0
+    const outcome = await runTargetActions(
+      pageWith({ evaluate: async () => { calls += 1; if (calls === 1) throw new Error('Execution context was destroyed'); return true } }),
+      target(text('结果')),
+      options,
+    )
+    expect(outcome.ok).toBe(true)
+    expect(calls).toBeGreaterThan(1)
+  })
+
+  it('can wait to have left a URL, not only to have arrived at one', async () => {
+    const left: WaitStep = { verb: 'waitFor', condition: { kind: 'url', url: 'https://a.example/search', absent: true } }
+    const gone = await runTargetActions(pageWith({ url: 'https://a.example/results' }), target(left), options)
+    expect(gone.ok).toBe(true)
+    const stayed = await runTargetActions(pageWith({ url: 'https://a.example/search?q=1' }), target(left), options)
+    expect(stayed.ok).toBe(false)
+    expect((stayed as { failure: ActionFailure }).failure.detail).toContain('to have left')
+  })
+
   it('skips an optional step that does not hold and carries on', async () => {
     const outcome = await runTargetActions(
       pageWith({ evaluate: async (script) => script.includes('late') }),
@@ -113,8 +144,9 @@ describe('renderActionSummary', () => {
   }
 
   it('is one line that says what ran and where it ended', () => {
+    // No markup: the caller wraps it for the body it is writing.
     const summary = renderActionSummary(run, 200)
-    expect(summary.startsWith('> actions: ')).toBe(true)
+    expect(summary.startsWith('actions: ')).toBe(true)
     expect(summary).not.toContain('\n')
     expect(summary).toContain('1. waitFor text "结果" — met')
     expect(summary).toContain('2. waitFor text "弹窗" to disappear — skipped')

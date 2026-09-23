@@ -32,13 +32,14 @@ export interface TargetMatch {
  *
  * - `text` — the page's visible text contains it (or, with `absent`, no longer
  *   does).
- * - `url` — the browser is on this URL, or on one below it in the same tree.
- *   This is how a target waits to be back on the page a gate interrupted.
+ * - `url` — the browser is on this URL, or on one below it in the same tree (or,
+ *   with `absent`, no longer is). This is how a target waits to be back on the
+ *   page a gate interrupted, or to have left the one it clicked through.
  * - `time` — a fixed wait, still bounded by the step's ceiling.
  */
 export type WaitCondition =
   | { readonly kind: 'text'; readonly text: string; readonly absent?: boolean }
-  | { readonly kind: 'url'; readonly url: string }
+  | { readonly kind: 'url'; readonly url: string; readonly absent?: boolean }
   | { readonly kind: 'time'; readonly ms: number }
 
 /** A step that waits for a condition before the fetch reads the document. */
@@ -49,14 +50,11 @@ export interface WaitStep {
   readonly optional?: boolean
 }
 
-/** Every step a target may run. One member today; the verbs land one at a time. */
-export type TargetStep = WaitStep
-
 /** A named recipe for one page. */
 export interface Target {
   readonly name: string
   readonly match: TargetMatch
-  readonly actions: readonly TargetStep[]
+  readonly actions: readonly WaitStep[]
 }
 
 /** The parsed file, or the reason it is unusable. */
@@ -81,6 +79,31 @@ export function normalizedUrl(raw: string): string | null {
 }
 
 /**
+ * Does this URL sit at or below that one?
+ *
+ * The prefix rule, named on its own so a caller that simply wants "am I on this
+ * page or below it" does not have to fabricate a match clause to ask. Scheme,
+ * host and path are compared; the query string and hash are ignored.
+ *
+ * @param rawUrl - the URL to test.
+ * @param base - the URL it should be at or below.
+ * @returns true when it is.
+ */
+export function urlIsUnder(rawUrl: string, base: string): boolean {
+  const candidate = normalizedUrl(rawUrl)
+  const pattern = normalizedUrl(base)
+  if (candidate === null || pattern === null) return false
+  const candidateUrl = new URL(candidate)
+  const patternUrl = new URL(pattern)
+  if (candidateUrl.protocol !== patternUrl.protocol || candidateUrl.host !== patternUrl.host) return false
+  const path = candidateUrl.pathname
+  const prefix = patternUrl.pathname
+  if (path === prefix) return true
+  if (prefix.endsWith('/')) return path.startsWith(prefix)
+  return path.startsWith(prefix) && path.charAt(prefix.length) === '/'
+}
+
+/**
  * Does this match apply to this URL?
  *
  * The query string and hash are ignored, so one target covers a page however it
@@ -93,18 +116,12 @@ export function normalizedUrl(raw: string): string | null {
  * @returns true when the target applies.
  */
 export function matchesTarget(match: TargetMatch, rawUrl: string): boolean {
-  const candidate = normalizedUrl(rawUrl)
-  const pattern = normalizedUrl(match.url)
-  if (candidate === null || pattern === null) return false
-  const candidateUrl = new URL(candidate)
-  const patternUrl = new URL(pattern)
-  if (candidateUrl.protocol !== patternUrl.protocol || candidateUrl.host !== patternUrl.host) return false
-  const path = candidateUrl.pathname
-  const prefix = patternUrl.pathname
-  if (match.kind === 'exact') return path === prefix
-  if (path === prefix) return true
-  if (prefix.endsWith('/')) return path.startsWith(prefix)
-  return path.startsWith(prefix) && path.charAt(prefix.length) === '/'
+  if (match.kind === 'exact') {
+    const candidate = normalizedUrl(rawUrl)
+    const pattern = normalizedUrl(match.url)
+    return candidate !== null && candidate === pattern
+  }
+  return urlIsUnder(rawUrl, match.url)
 }
 
 /**
@@ -132,6 +149,22 @@ export function selectTarget(targets: readonly Target[], rawUrl: string): Target
   return { ok: true, target: first.target }
 }
 
+/**
+ * Does this URL carry a query string or hash?
+ *
+ * Comparison deliberately ignores both, so a pattern that writes them would mean
+ * something wider than it looks — `.../search?q=1` would match `.../search/other`.
+ * That is a silent widening, so such a URL is refused rather than reinterpreted.
+ */
+function carriesQueryOrHash(raw: string): boolean {
+  try {
+    const url = new URL(raw)
+    return url.search !== '' || url.hash !== ''
+  } catch {
+    return false
+  }
+}
+
 /** Where a problem is, in the shape of the file. */
 function at(path: string): string {
   return path === '' ? 'targets file' : path
@@ -157,6 +190,9 @@ function parseMatch(value: unknown, path: string): { match: TargetMatch } | { er
   if (typeof url !== 'string' || url === '' || normalizedUrl(url) === null) {
     return { error: `${at(path)}.url: expected an absolute http(s) URL` }
   }
+  if (carriesQueryOrHash(url)) {
+    return { error: `${at(path)}.url: comparison ignores the query string and hash, so writing them here would widen the match silently — write the URL without them` }
+  }
   return { match: { kind, url } }
 }
 
@@ -173,13 +209,18 @@ function parseCondition(value: unknown, path: string): { condition: WaitConditio
     return { condition: absent === true ? { kind: 'text', text, absent: true } : { kind: 'text', text } }
   }
   if (kind === 'url') {
-    const unknown = unknownKeys(value, ['kind', 'url'], path)
+    const unknown = unknownKeys(value, ['kind', 'url', 'absent'], path)
     if (unknown !== null) return { error: unknown }
     const url = value['url']
     if (typeof url !== 'string' || url === '' || normalizedUrl(url) === null) {
       return { error: `${at(path)}.url: expected an absolute http(s) URL` }
     }
-    return { condition: { kind: 'url', url } }
+    if (carriesQueryOrHash(url)) {
+      return { error: `${at(path)}.url: comparison ignores the query string and hash, so writing them here would widen the condition silently — write the URL without them` }
+    }
+    const absent = value['absent']
+    if (absent !== undefined && typeof absent !== 'boolean') return { error: `${at(path)}.absent: expected a boolean` }
+    return { condition: absent === true ? { kind: 'url', url, absent: true } : { kind: 'url', url } }
   }
   if (kind === 'time') {
     const unknown = unknownKeys(value, ['kind', 'ms'], path)
@@ -191,7 +232,7 @@ function parseCondition(value: unknown, path: string): { condition: WaitConditio
   return { error: `${at(path)}.kind: expected "text", "url" or "time"` }
 }
 
-function parseStep(value: unknown, path: string): { step: TargetStep } | { error: string } {
+function parseStep(value: unknown, path: string): { step: WaitStep } | { error: string } {
   if (!isRecord(value)) return { error: `${at(path)}: expected an object` }
   const unknown = unknownKeys(value, ['verb', 'condition', 'optional'], path)
   if (unknown !== null) return { error: unknown }
@@ -217,7 +258,7 @@ function parseTarget(value: unknown, path: string): { target: Target } | { error
   const actions = value['actions']
   if (!Array.isArray(actions)) return { error: `${at(path)}.actions: expected an array` }
   if (actions.length === 0) return { error: `${at(path)}.actions: a target with no actions does nothing; remove it or give it one` }
-  const steps: TargetStep[] = []
+  const steps: WaitStep[] = []
   for (const [index, raw] of actions.entries()) {
     const step = parseStep(raw, `${path}.actions[${String(index)}]`)
     if ('error' in step) return { error: step.error }
@@ -253,11 +294,6 @@ export function parseTargets(text: string): TargetParseResult {
     const target = parseTarget(raw, `targets[${String(index)}]`)
     if ('error' in target) return { ok: false, error: target.error }
     targets.push(target.target)
-  }
-  const names = new Set<string>()
-  for (const target of targets) {
-    if (names.has(target.name)) return { ok: false, error: `targets: two targets are named "${target.name}"` }
-    names.add(target.name)
   }
   return { ok: true, targets }
 }

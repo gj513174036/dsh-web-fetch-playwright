@@ -773,6 +773,28 @@ describe('PlaywrightFetchProvider', () => {
     expect(code).toBe('WEB_FETCH_TARGET')
   })
 
+  it('refuses to skip a target just because the body is not HTML', async () => {
+    // The early return for non-HTML bodies used to swallow a matching target
+    // silently: no actions, no summary, no error. A target needs a document, so
+    // saying so is the only honest outcome.
+    const targetsFile = targetFor('https://example.com/api', waitText('ok'))
+    const code = await codeOf(
+      new FakeProvider({ targetsFile }, { contentType: 'application/json', textBody: '{"ok":true}' }).fetch({ url: 'https://example.com/api' }),
+    )
+    expect(code).toBe('WEB_FETCH_TARGET')
+  })
+
+  it('wraps the summary as a blockquote element when the body is raw HTML', async () => {
+    // A literal "> actions:" line in front of raw HTML renders as text inside the
+    // page; the same line has to be a blockquote element there.
+    const targetsFile = targetFor('https://example.com/docs', waitText('World'))
+    const result = await new FakeProvider({ targetsFile, denoise: false }, { evaluateResult: true }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('<blockquote>actions: ')).toBe(true)
+    expect(content).not.toContain('> actions:')
+    expect(content).toContain('</blockquote>')
+  })
+
   it('decodes non-html text bodies verbatim', async () => {
     const result = await new FakeProvider({}, { contentType: 'application/json', textBody: '{"ok":true}' })
       .fetch({ url: 'https://example.com/api' })

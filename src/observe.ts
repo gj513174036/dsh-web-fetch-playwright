@@ -102,9 +102,7 @@ export const OBSERVE_SCRIPT = `(() => {
   const named = seen.filter((entry) => entry.label !== '');
   const reachable = named.filter((entry) => entry.host !== 'hidden');
   const ordered = reachable.concat(named.filter((entry) => entry.host === 'hidden'));
-  const body = document.body;
-  const inner = body === null ? '' : body.innerText;
-  const text = typeof inner === 'string' && inner !== '' ? inner : (body === null ? '' : (body.textContent || ''));
+  const text = visibleTextOf();
   const count = (predicate) => seen.filter(predicate).length;
   return {
     url: location.href,

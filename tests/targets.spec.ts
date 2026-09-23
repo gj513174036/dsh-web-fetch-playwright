@@ -103,11 +103,13 @@ describe('parseTargets', () => {
     const actions = `${waitText},
       { "verb": "waitFor", "condition": { "kind": "text", "text": "加载中", "absent": true } },
       { "verb": "waitFor", "condition": { "kind": "url", "url": "https://a.example/results" } },
+      { "verb": "waitFor", "condition": { "kind": "url", "url": "https://a.example/gate", "absent": true } },
       { "verb": "waitFor", "condition": { "kind": "time", "ms": 250 }, "optional": true }`
     const step = targetsOf(file(actions))[0]?.actions
     expect(step?.[1]?.condition).toEqual({ kind: 'text', text: '加载中', absent: true })
     expect(step?.[2]?.condition).toEqual({ kind: 'url', url: 'https://a.example/results' })
-    expect(step?.[3]).toEqual({ verb: 'waitFor', condition: { kind: 'time', ms: 250 }, optional: true })
+    expect(step?.[3]?.condition).toEqual({ kind: 'url', url: 'https://a.example/gate', absent: true })
+    expect(step?.[4]).toEqual({ verb: 'waitFor', condition: { kind: 'time', ms: 250 }, optional: true })
   })
 
   it('names the place in the file that is wrong', () => {
@@ -125,8 +127,15 @@ describe('parseTargets', () => {
     expect(errorOf(file(waitText, undefined, ''))).toContain('targets[0].name')
   })
 
-  it('refuses two targets with the same name', () => {
+  it('allows two targets to share a name, since names never select', () => {
     const two = `{ "targets": [ { "name": "same", "match": { "kind": "exact", "url": "https://a.example/x" }, "actions": [${waitText}] }, { "name": "same", "match": { "kind": "exact", "url": "https://a.example/y" }, "actions": [${waitText}] } ] }`
-    expect(errorOf(two)).toContain('two targets are named "same"')
+    expect(targetsOf(two)).toHaveLength(2)
+  })
+
+  it('refuses a URL that carries a query string or hash, which comparison ignores', () => {
+    // Writing them would widen the match silently: .../search?q=1 would also
+    // match .../search/other.
+    expect(errorOf(file(waitText, '{ "kind": "prefix", "url": "https://a.example/search?q=1" }'))).toContain('ignores the query string')
+    expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "url", "url": "https://a.example/x#top" } }'))).toContain('ignores the query string')
   })
 })

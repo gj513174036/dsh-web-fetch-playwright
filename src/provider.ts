@@ -85,7 +85,7 @@ import { htmlToMarkdown, stripNonContentHtml } from './markdown.ts'
 import { CONSENT_TIMEOUT_MS, dismissConsentBanner, isConsentGate } from './consent.ts'
 import { OBSERVE_TIMEOUT_MS, observePage, renderObservation } from './observe.ts'
 import { runTargetActions, renderActionSummary } from './actions.ts'
-import { selectTarget } from './targets.ts'
+import { selectTarget, type Target } from './targets.ts'
 import { loadTargets } from './target-store.ts'
 import { parseLaunchArgs } from './launch-args.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
@@ -212,8 +212,16 @@ const MAX_PIPELINE_INPUT_CHARS = 2_000_000
  * @param summary - the summary line, or null when no target ran.
  * @returns the body, with the summary first when there is one.
  */
-function withActionSummary(content: string, summary: string | null): string {
-  return summary === null ? content : `${summary}\n\n${content}`
+function withActionSummary(content: string, summary: string | null, kind: 'html' | 'text'): string {
+  if (summary === null) return content
+  // The same line, wrapped for the body it is going into: a blockquote element in
+  // HTML, a blockquote line in markdown. Plain text in front of raw HTML would
+  // render as literal "> actions:" inside the page.
+  if (kind === 'html') {
+    const escaped = summary.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    return `<blockquote>${escaped}</blockquote>\n${content}`
+  }
+  return `> ${summary}\n\n${content}`
 }
 
 /**
@@ -901,10 +909,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // Feature switch: 0 keeps the exact legacy (pre-0.2.5) behavior — the
     // first response decides, no waiting — an escape hatch and the A/B
     // baseline every test proves the bug against.
+    const targetsFile = config.targetsFile ?? ''
     // Response tracking is what lets the result describe the document the fetch
     // ends on; targets and consent can both move the browser after the first
     // response, so either of them needs it too.
-    const tracksResponses = challengeWaitMs > 0 || config.dismissConsent === true || (config.targetsFile ?? '') !== ''
+    const tracksResponses = challengeWaitMs > 0 || config.dismissConsent === true || targetsFile !== ''
     const tracker = tracksResponses ? trackMainFrameResponses(page) : undefined
     let response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
     tracker?.seed(response)
@@ -955,11 +964,44 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     if (kind === undefined) {
       throw new WebError(`unsupported content type "${finalResponse?.headers()['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
     }
+    // Which target applies is decided before the body is classified, because a
+    // target that matched a response this fetch cannot act on must say so rather
+    // than be skipped in silence: the early return for non-HTML bodies would
+    // otherwise swallow it, which is the "quietly did less" failure this plugin
+    // refuses. Choosing is pure, so doing it here costs nothing.
+    let selectedTarget: Target | null = null
+    if (targetsFile !== '') {
+      const loaded = await loadTargets(targetsFile)
+      if (!loaded.ok) throw new WebError(loaded.error, WEB_FETCH_TARGET_CODE)
+      const selection = selectTarget(loaded.targets, url.toString())
+      if (!selection.ok) throw new WebError(selection.error, WEB_FETCH_TARGET_CODE)
+      selectedTarget = selection.target
+      if (selectedTarget !== null && kind === 'text') {
+        throw new WebError(
+          `target "${selectedTarget.name}" matched this URL, but the response is ${finalResponse?.headers()['content-type'] ?? 'unknown'}, not a document to act on`,
+          WEB_FETCH_TARGET_CODE,
+        )
+      }
+    }
+
     let finalUrl = page.url()
     // An SPA-style clear swaps the document without navigating: no new
     // response exists to report, so the cleared document reads as served.
     const clearedWithoutNavigation = challengeEntryResponse !== null && finalResponse === challengeEntryResponse
     let statusCode = finalResponse !== null && !clearedWithoutNavigation ? finalResponse.status() : 200
+    /**
+     * Re-describe the result from the document the browser is actually on.
+     *
+     * Both a consent click and a target's actions can move the browser after the
+     * first response; the settled document is the one about to be read, so its URL
+     * and status are the honest ones to report.
+     */
+    const settledDocument = (): { url: string; statusCode: number } => {
+      const settled = tracker?.last() ?? null
+      return settled !== null && settled !== finalResponse
+        ? { url: page.url(), statusCode: settled.status() }
+        : { url: page.url(), statusCode }
+    }
 
     // Non-HTML decodes straight from the response body; no denoise applies.
     if (kind === 'text') {
@@ -991,9 +1033,9 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       // URL and status next to the accepted page's content.
       if (consent.clicked !== null) {
         await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
-        finalUrl = page.url()
-        const settled = tracker?.last() ?? null
-        if (settled !== null && settled !== finalResponse) statusCode = settled.status()
+        const settled = settledDocument()
+        finalUrl = settled.url
+        statusCode = settled.statusCode
         // "Clicked" is not "done": a gate can ignore the click (measured on
         // booking.com, whose 同意 button does nothing until its own
         // preconditions hold). Reading the gate back as the page would be the
@@ -1008,29 +1050,21 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       }
     }
 
-    // Targets: a named recipe for this URL, if the file names one. Selection is
-    // by URL alone — the fetch seam carries nothing else — and no match is the
-    // ordinary case, not an error. A step that does not hold stops the fetch;
-    // read on for the summary line that says what ran.
+    // Run the recipe this URL selected. A step that does not hold stops the
+    // fetch; the summary line below says what did run.
     let actionSummary: string | null = null
-    if ((config.targetsFile ?? '') !== '') {
-      const loaded = await loadTargets(config.targetsFile ?? '')
-      if (!loaded.ok) throw new WebError(loaded.error, WEB_FETCH_TARGET_CODE)
-      const selection = selectTarget(loaded.targets, url.toString())
-      if (!selection.ok) throw new WebError(selection.error, WEB_FETCH_TARGET_CODE)
-      if (selection.target !== null) {
-        const outcome = await runTargetActions(page, selection.target, { remainingMs: () => deadline.remainingMs() })
-        if (!outcome.ok) {
-          throw new WebError(
-            `target "${selection.target.name}" step ${String(outcome.failure.index + 1)} (${outcome.failure.verb}) did not hold: ${outcome.failure.detail} — at ${outcome.failure.url}`,
-            WEB_FETCH_ACTION_CODE,
-          )
-        }
-        finalUrl = page.url()
-        const settled = tracker?.last() ?? null
-        if (settled !== null && settled !== finalResponse) statusCode = settled.status()
-        actionSummary = renderActionSummary({ ...outcome.run, finalUrl }, statusCode)
+    if (selectedTarget !== null) {
+      const outcome = await runTargetActions(page, selectedTarget, { remainingMs: () => deadline.remainingMs() })
+      if (!outcome.ok) {
+        throw new WebError(
+          `target "${selectedTarget.name}" step ${String(outcome.failure.index + 1)} (${outcome.failure.verb}) did not hold: ${outcome.failure.detail} — at ${outcome.failure.url}`,
+          WEB_FETCH_ACTION_CODE,
+        )
       }
+      const settled = settledDocument()
+      finalUrl = settled.url
+      statusCode = settled.statusCode
+      actionSummary = renderActionSummary({ ...outcome.run, finalUrl }, statusCode)
     }
 
     // Observe mode *is* the fetch: the caller asked for the page's actionable
@@ -1045,18 +1079,18 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           'WEB_PROVIDER_ERROR',
         )
       }
-      return capResult(finalUrl, statusCode, { kind: 'text', content: withActionSummary(renderObservation(observation), actionSummary) })
+      return capResult(finalUrl, statusCode, { kind: 'text', content: withActionSummary(renderObservation(observation), actionSummary, 'text') })
     }
 
     const html = await page.content()
     if (!config.denoise) {
       // The tool layer's own turndown renders raw HTML; the checkbox only
       // governs the Readability/DOMPurify stage this provider owns.
-      return capResult(finalUrl, statusCode, { kind: 'html', content: withActionSummary(html, actionSummary) })
+      return capResult(finalUrl, statusCode, { kind: 'html', content: withActionSummary(html, actionSummary, 'html') })
     }
     const bounded = boundPipelineInput(html)
     const { markdown } = htmlToMarkdown(bounded.input, finalUrl)
-    const result = capResult(finalUrl, statusCode, { kind: 'text', content: withActionSummary(markdown, actionSummary) })
+    const result = capResult(finalUrl, statusCode, { kind: 'text', content: withActionSummary(markdown, actionSummary, 'text') })
     return bounded.cut
       ? { ...result, truncated: true }
       : result

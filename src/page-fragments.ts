@@ -47,8 +47,8 @@ export const FRAGMENT_LABEL_HOST = `const labelHostOf = (el) => {
  * The element's accessible-ish name, collapsed and unsliced.
  *
  * Order: `aria-label`, then `value` for the input types where the value *is* the
- * label (submit / button / reset), then `placeholder` for fields, then the
- * controlling label's text for form controls, then the element's own text. An
+ * label (submit / button / reset), then the controlling label's text for form
+ * controls, then a field's `placeholder`, then the element's own text. An
  * untagged checkbox deliberately falls through to its label rather than
  * answering `on`.
  */
@@ -58,9 +58,11 @@ export const FRAGMENT_ACCESSIBLE_NAME = `const accessibleNameOf = (el) => {
     const candidates = [el.getAttribute('aria-label')];
     if (tag === 'INPUT' && (type === 'submit' || type === 'button' || type === 'reset')) candidates.push(el.value);
     if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') {
-      candidates.push(el.getAttribute('placeholder'));
+      // A label is what the field is called; a placeholder is only a hint, so the
+      // label goes first even though the placeholder is nearer to hand.
       const host = labelHostOf(el);
       if (host !== null) candidates.push(host.textContent);
+      candidates.push(el.getAttribute('placeholder'));
     }
     candidates.push(el.textContent);
     for (const candidate of candidates) {
@@ -103,6 +105,22 @@ export const FRAGMENT_HOST = `const hostOf = (el) => {
 /** The words that mark consent UI, shared so no two scripts can disagree. */
 export const CONSENT_CONTEXT = /cookie|consent|privacy|gdpr|同意|隐私/i
 
+/**
+ * The page's visible text.
+ *
+ * `innerText` is what a person sees; it does not exist everywhere (jsdom, where
+ * the tests run, has no layout), so the fallback is `textContent` — a superset,
+ * which makes a "is this page short" test harder to pass, i.e. erring towards
+ * doing nothing. Shared because two scripts ask this question for different
+ * reasons: one to size the document, one to look for text.
+ */
+export const FRAGMENT_VISIBLE_TEXT = `const visibleTextOf = () => {
+    const body = document.body;
+    if (body === null) return '';
+    const inner = body.innerText;
+    return typeof inner === 'string' && inner !== '' ? inner : (body.textContent || '');
+  };`
+
 /** Declares the consent vocabulary inside a script. */
 export const FRAGMENT_CONSENT_WORDS = `const consentWords = ${String(CONSENT_CONTEXT)};`
 
@@ -116,20 +134,13 @@ export const FRAGMENT_CONSENT_WORDS = `const consentWords = ${String(CONSENT_CON
  * mentions consent in its URL or title cannot license a click.
  */
 export const FRAGMENT_CONSENT_DOCUMENT = `const isConsentDocument = () => {
-    const body = document.body;
-    if (body === null) return false;
-    // innerText is the visible text and is what we want; jsdom (where the tests
-    // run) has no layout and no innerText, so fall back to textContent, a
-    // superset - which makes the "short page" test harder to pass, i.e. erring
-    // towards not clicking.
-    const inner = body.innerText;
-    const text = typeof inner === 'string' && inner !== '' ? inner : (body.textContent || '');
-    if (text.length >= 2000) return false;
+    if (visibleTextOf().length >= 2000) return false;
     return consentWords.test(location.href + ' ' + document.title);
   };`
 
 /** The page-reading fragments, in the order they must be declared. */
 export const PAGE_FRAGMENTS: readonly string[] = [
+  FRAGMENT_VISIBLE_TEXT,
   FRAGMENT_LAID_OUT,
   FRAGMENT_LABEL_HOST,
   FRAGMENT_HOST,
@@ -138,7 +149,7 @@ export const PAGE_FRAGMENTS: readonly string[] = [
 ]
 
 /** The consent fragments, in the order they must be declared. */
-export const CONSENT_FRAGMENTS: readonly string[] = [FRAGMENT_CONSENT_WORDS, FRAGMENT_CONSENT_DOCUMENT]
+export const CONSENT_FRAGMENTS: readonly string[] = [FRAGMENT_CONSENT_WORDS, FRAGMENT_VISIBLE_TEXT, FRAGMENT_CONSENT_DOCUMENT]
 
 /**
  * What the consent dismissal needs: the vocabulary plus the control fragments it
@@ -158,5 +169,16 @@ export const DISMISS_FRAGMENTS: readonly string[] = [...CONSENT_FRAGMENTS, ...PA
  * @returns the fragment source, indented to sit inside a script.
  */
 export function spliceFragments(fragments: readonly string[]): string {
-  return fragments.join('\n  ')
+  // Bundles overlap on purpose (the consent bundle carries the text helper its
+  // document test needs, and the dismissal bundle also takes the whole page set),
+  // so identical fragments are emitted once. A repeated declaration would be a
+  // syntax error in the browser, which is a poor way to find out.
+  const seen = new Set<string>()
+  const unique: string[] = []
+  for (const fragment of fragments) {
+    if (seen.has(fragment)) continue
+    seen.add(fragment)
+    unique.push(fragment)
+  }
+  return unique.join('\n  ')
 }

@@ -76,6 +76,14 @@ describe('page fragments', () => {
     })
   })
 
+  describe('visibleTextOf', () => {
+    it('reads the page text, falling back where innerText does not exist', () => {
+      // jsdom has no innerText, so this exercises the fallback the browser never
+      // needs — and proves the fallback is not the empty string.
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'visibleTextOf()', '<p>hello</p>')).toContain('hello')
+    })
+  })
+
   describe('isConsentDocument', () => {
     it('recognises a short page whose URL or title names consent', () => {
       expect(withFragments<boolean>(DISMISS_FRAGMENTS, 'isConsentDocument()', '<p>需您同意</p>', undefined, 'https://example.com/pipl_consent.zh-cn.html')).toBe(true)

@@ -2,14 +2,14 @@
  * Reading the targets file.
  *
  * The behaviour that matters is the iteration loop: edit the file, fetch again,
- * and see the change — so the cache must notice an edit and must not invent a
- * result for a file it cannot read.
+ * and see the change. It is read fresh every time, and a file it cannot read is
+ * reported rather than guessed at.
  */
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { clearTargetCache, loadTargets } from '../src/target-store.ts'
+import { loadTargets } from '../src/target-store.ts'
 
 const dirs: string[] = []
 
@@ -25,7 +25,6 @@ const valid = (name: string): string =>
   `{ "targets": [ { "name": "${name}", "match": { "kind": "prefix", "url": "https://a.example/x" }, "actions": [ { "verb": "waitFor", "condition": { "kind": "time", "ms": 1 } } ] } ] }`
 
 afterEach(() => {
-  clearTargetCache()
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
@@ -39,9 +38,7 @@ describe('loadTargets', () => {
   it('picks up an edit', async () => {
     const file = scratch(valid('first'))
     expect((await loadTargets(file)).ok).toBe(true)
-    // Appending changes the size as well as the mtime, so the cache misses
-    // regardless of how coarse the filesystem's timestamps are.
-    writeFileSync(file, `${valid('second')}\n`, 'utf8')
+    writeFileSync(file, valid('second'), 'utf8')
     const again = await loadTargets(file)
     expect(again.ok && again.targets[0]?.name).toBe('second')
   })

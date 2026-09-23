@@ -17,7 +17,8 @@
  */
 
 import type { PlaywrightPage } from './types.ts'
-import { matchesTarget, type Target, type WaitCondition } from './targets.ts'
+import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
+import { urlIsUnder, type Target, type WaitCondition } from './targets.ts'
 
 /** Longest one step may take, before the fetch's own remaining budget caps it. */
 export const STEP_CEILING_MS = 10_000
@@ -64,7 +65,7 @@ export interface ActionOptions {
 /** A short description of a condition, for the summary and for failures. */
 export function describeCondition(condition: WaitCondition): string {
   if (condition.kind === 'text') return `text "${condition.text}"${condition.absent === true ? ' to disappear' : ''}`
-  if (condition.kind === 'url') return `url ${condition.url}`
+  if (condition.kind === 'url') return condition.absent === true ? `to have left ${condition.url}` : `url ${condition.url}`
   return `wait ${String(condition.ms)}ms`
 }
 
@@ -80,11 +81,8 @@ export function describeCondition(condition: WaitCondition): string {
  */
 export function textProbeScript(text: string): string {
   return `(() => {
-    const body = document.body;
-    if (body === null) return false;
-    const inner = body.innerText;
-    const value = typeof inner === 'string' && inner !== '' ? inner : (body.textContent || '');
-    return value.indexOf(${JSON.stringify(text)}) >= 0;
+    ${spliceFragments([FRAGMENT_VISIBLE_TEXT])}
+    return visibleTextOf().indexOf(${JSON.stringify(text)}) >= 0;
   })()`
 }
 
@@ -96,21 +94,31 @@ function sleep(ms: number): Promise<void> {
 /**
  * Is the condition true right now?
  *
- * @param page - the page being driven.
+ * @param currentUrl - where the browser is right now.
  * @param condition - the condition to evaluate.
  * @param evaluate - the page's scripting seam, when it has one.
  * @returns true/false, or null when the condition cannot be evaluated at all.
  */
 async function conditionHolds(
-  page: PlaywrightPage,
+  currentUrl: string,
   condition: WaitCondition,
   evaluate: ((script: string) => Promise<unknown>) | undefined,
 ): Promise<boolean | null> {
   if (condition.kind === 'time') return true
-  if (condition.kind === 'url') return matchesTarget({ kind: 'prefix', url: condition.url }, page.url())
+  if (condition.kind === 'url') {
+    const under = urlIsUnder(currentUrl, condition.url)
+    return condition.absent === true ? !under : under
+  }
   if (evaluate === undefined) return null
-  const answer = await evaluate(textProbeScript(condition.text))
-  const found = answer === true
+  let found: boolean
+  try {
+    found = (await evaluate(textProbeScript(condition.text))) === true
+  } catch {
+    // A poll can fail for a transient reason — the navigation a click causes
+    // destroys the execution context — and that is "not yet", not "unreadable".
+    // Only a page with no scripting seam at all can never answer.
+    return false
+  }
   return condition.absent === true ? !found : found
 }
 
@@ -139,12 +147,18 @@ export async function runTargetActions(
     let held = false
     let unanswerable = false
 
-    if (step.condition.kind === 'time') {
-      await sleep(Math.max(0, Math.min(step.condition.ms, budget)))
+    // A fixed wait that does not fit in what is left has not happened. Sleeping
+    // the shortened time and calling it met is the "claims something untrue"
+    // failure this runner exists to avoid.
+    const exceedsBudget = step.condition.kind === 'time' && step.condition.ms > budget
+    if (exceedsBudget) {
+      // fall through to the failure (or skip) below
+    } else if (step.condition.kind === 'time') {
+      await sleep(step.condition.ms)
       held = true
     } else {
       for (;;) {
-        const state = await conditionHolds(page, step.condition, evaluate).catch(() => null)
+        const state = await conditionHolds(page.url(), step.condition, evaluate).catch(() => null)
         if (state === null) {
           unanswerable = true
           break
@@ -171,7 +185,11 @@ export async function runTargetActions(
       failure: {
         index,
         verb: step.verb,
-        detail: unanswerable ? `${detail} (the page could not be read)` : `${detail} (not met within ${String(budget)}ms)`,
+        detail: unanswerable
+          ? `${detail} (the page could not be read)`
+          : exceedsBudget
+            ? `${detail} (only ${String(budget)}ms of the step budget is left)`
+            : `${detail} (not met within ${String(budget)}ms)`,
         url: page.url(),
       },
     }
@@ -184,16 +202,19 @@ export async function runTargetActions(
  * Render the run as the one line the caller sees at the top of the body.
  *
  * The result shape is closed (ADR-0003), so the body is the only channel that
- * can say which document this is and what was done to reach it.
+ * can say which document this is and what was done to reach it. The line itself
+ * carries no markup: the caller wraps it as a blockquote in markdown bodies and
+ * as a blockquote *element* in HTML ones, so it reads as the same thing either
+ * way instead of appearing as literal "> actions:" text inside raw HTML.
  *
  * @param run - the completed run.
  * @param statusCode - the status of the document the run ended on.
- * @returns a single blockquote line.
+ * @returns one line.
  */
 export function renderActionSummary(run: ActionRun, statusCode: number): string {
   const parts = run.steps.map((step) => {
     const mark = step.outcome === 'skipped' ? 'skipped' : 'met'
     return `${String(step.index + 1)}. ${step.verb} ${step.detail} — ${mark}`
   })
-  return `> actions: ${parts.join(' · ')} → final document ${run.finalUrl} (HTTP ${String(statusCode)})`
+  return `actions: ${parts.join(' · ')} → final document ${run.finalUrl} (HTTP ${String(statusCode)})`
 }

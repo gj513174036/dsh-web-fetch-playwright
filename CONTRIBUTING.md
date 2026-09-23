@@ -9,6 +9,12 @@ src/
 ├── index.ts               # host entry: registers provider + settings section
 ├── config.ts              # schemastery schema, CDP endpoint normalizer
 ├── provider.ts            # WebFetchProvider: navigation, deadline, semaphore, caps
+├── page-fragments.ts      # in-page helpers every injected script shares
+├── consent.ts             # consent-banner dismissal (one intent, ordered candidates)
+├── observe.ts             # observe mode: the page's actionable state
+├── targets.ts             # targets file: parsing and URL matching (pure)
+├── target-store.ts        # reading the targets file, cached by mtime and size
+├── actions.ts             # running a target's steps and rendering the summary
 ├── markdown.ts            # denoise pipeline (Readability + DOMPurify + Turndown/GFM)
 ├── playwright-resolve.ts  # local backend discovery (path / $PATH / bundled core)
 ├── types.ts               # structural Playwright types (runtime module discovered dynamically)

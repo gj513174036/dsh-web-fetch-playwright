@@ -42,8 +42,6 @@
 import type { PlaywrightPage } from './types.ts'
 import { CONSENT_FRAGMENTS, DISMISS_FRAGMENTS, spliceFragments } from './page-fragments.ts'
 
-/** The consent vocabulary, owned by `page-fragments` so scripts cannot drift. */
-export { CONSENT_CONTEXT } from './page-fragments.ts'
 
 /**
  * The accept-all controls of the consent managers this plugin knows by name,
@@ -124,7 +122,7 @@ export type ConsentCandidate =
   | { readonly kind: 'selector'; readonly selector: string }
   /**
    * A control that says "accept all", reached by its own label — but only
-   * inside consent-looking UI (see {@link CONSENT_CONTEXT}).
+   * inside consent-looking UI (the shared consent vocabulary decides what that is).
    */
   | { readonly kind: 'text' }
 
