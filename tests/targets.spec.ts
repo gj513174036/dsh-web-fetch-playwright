@@ -4,6 +4,7 @@
  * Both are pure, so everything here is a direct assertion on behaviour rather
  * than on a browser: what a bad file says, and which target a URL gets.
  */
+import { readdirSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { describeCandidate, matchesTarget, normalizedUrl, parseTargets, selectTarget } from '../src/targets.ts'
 import type { Target } from '../src/targets.ts'
@@ -88,6 +89,23 @@ describe('selectTarget', () => {
     const chosen = selectTarget(targets, 'https://a.example/pr/1')
     expect(chosen.ok).toBe(false)
     expect(chosen.ok ? '' : chosen.error).toContain('equally specifically')
+  })
+})
+
+describe('the recipes committed under targets/', () => {
+  it('all parse, so a file that cannot be loaded can never be committed', () => {
+    // A recipe is read on every fetch, and one bad key makes *every* fetch fail
+    // (the file is parsed before any URL is matched) — so the files that ship as
+    // verification assets are held to the same strictness as the parser.
+    const dir = new URL('../targets/', import.meta.url)
+    const files = readdirSync(dir).filter((name) => name.endsWith('.json'))
+    expect(files.length).toBeGreaterThan(0)
+    for (const name of files) {
+      const parsed = parseTargets(readFileSync(new URL(name, dir), 'utf8'))
+      if (!parsed.ok) throw new Error(`${name}: ${parsed.error}`)
+      expect(parsed.targets.length).toBeGreaterThan(0)
+      for (const target of parsed.targets) expect(target.actions.length).toBeGreaterThan(0)
+    }
   })
 })
 
