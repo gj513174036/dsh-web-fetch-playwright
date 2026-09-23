@@ -139,6 +139,9 @@ export const FRAGMENT_ROLE = `const roleOf = (el) => {
     if (tag === 'textarea') return 'textbox';
     if (tag === 'summary') return 'button';
     if (tag === 'option') return 'option';
+    // What HTML-AAM says a contenteditable element is: the field a type step can
+    // write into, so a role candidate can name it.
+    if (el.getAttribute('contenteditable') === 'true') return 'textbox';
     return '';
   };`
 
@@ -274,11 +277,14 @@ export const FRAGMENT_RESOLVE = `const resolveCandidates = (candidates, accept) 
       }
       // The one wording for what a step landed on, so a summary, a failure
       // message and a test cannot describe the same act three ways.
-      const landed = candidate.label + ' -> ' + (roleOf(chosen.hit) || chosen.hit.tagName.toLowerCase());
+      const landed = candidate.label + ' -> ' + kindOfElement(chosen.hit);
       return { candidate: candidate.label, landed: landed, control: chosen.control, hit: chosen.hit, tried: tried };
     }
     return { candidate: null, landed: null, control: null, hit: null, tried: tried };
   };
+
+  /** How an element reads in a summary when it has no role of its own. */
+  const kindOfElement = (el) => roleOf(el) || el.tagName.toLowerCase();
 
   /** Click the resolved element, answering the throw as a message instead of raising it. */
   const clickFailureOf = (hit) => {

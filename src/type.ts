@@ -55,7 +55,14 @@ export type TypeOutcome =
    * the page did not take what the recipe asked for.
    */
   | { readonly kind: 'mismatch'; readonly candidate: string; readonly was: string; readonly value: string; readonly wanted: string }
-  /** The write went out and the field could not be read back (the page moved, or it is gone). */
+  /**
+   * The write went out and the page navigated before the field could be read
+   * back. Not a failure: the navigation is the page's reaction to the write, and
+   * the `waitFor` after this step is what judges whether it was the right one —
+   * the same reading as a click that navigated.
+   */
+  | { readonly kind: 'typed-unreported'; readonly candidate: string }
+  /** The write went out and the field could not be read back (the field is gone). */
   | { readonly kind: 'unverified'; readonly problem: string }
   /** No candidate named a field that takes text; `reasons` holds one entry per candidate tried. */
   | { readonly kind: 'not-typed'; readonly reasons: readonly string[] }
@@ -84,6 +91,9 @@ export function typeScript(candidates: readonly Candidate[], value: string): str
   const found = resolveCandidates(candidates, accept);
   if (found.control === null) return { ok: false, attempted: null, why: null, tried: found.tried };
   const field = found.control;
+  // The write goes into the *control*, so the summary names the control: the hit
+  // is only where a click would have landed.
+  const landed = found.candidate + ' -> ' + kindOfElement(field);
   const before = valueOfField(field);
   try { field.focus(); } catch (error) { /* a backend without focus still gets the write */ }
   try {
@@ -101,19 +111,19 @@ export function typeScript(candidates: readonly Candidate[], value: string): str
     field.dispatchEvent(new Event('input', { bubbles: true }));
     field.dispatchEvent(new Event('change', { bubbles: true }));
   } catch (error) {
-    return { ok: false, attempted: null, why: null, tried: found.tried.concat(found.landed + ': writing into it threw (' + String(error) + ')') };
+    return { ok: false, attempted: null, why: null, tried: found.tried.concat(landed + ': writing into it threw (' + String(error) + ')') };
   }
   // Let the page react first, then read the field it is showing now, the same way
   // check judges its own act.
   await settleFrame();
   const live = currentControlOf(field, candidates, accept);
-  if (live === null) return { ok: false, attempted: found.landed, why: 'the field could not be read back after typing (it is gone)', tried: found.tried };
-  return { ok: true, candidate: found.landed, was: before, value: valueOfField(live), wanted: value };
+  if (live === null) return { ok: false, attempted: landed, why: 'the field could not be read back after typing (it is gone)', tried: found.tried };
+  return { ok: true, candidate: landed, was: before, value: valueOfField(live), wanted: value };
 })()`
 }
 
 /** A type attempt whose value is not in the field. */
-export type TypeFailure = Exclude<TypeOutcome, { readonly kind: 'typed' }>
+export type TypeFailure = Exclude<TypeOutcome, { readonly kind: 'typed' } | { readonly kind: 'typed-unreported' }>
 
 /**
  * How a failed write reads to the person holding the error.
@@ -159,11 +169,12 @@ export async function typeInto(
   }
   const answer = await askPage(evaluate, typeScript(candidates, value), timeoutMs)
   if (answer.kind !== 'answer') {
-    // A submit that navigates can tear the context down mid-write; the field then
-    // cannot be read back, and an unproven write is not a written field.
+    // A submit that navigates tears the context down mid-write: the write went
+    // out and the page moved because of it, which is the page taking the input —
+    // the following step is what says whether it took it where the recipe wanted.
     const verdict = seamFailure(answer, 'type', timeoutMs)
     return verdict?.kind === 'navigated'
-      ? { kind: 'unverified', problem: 'the page navigated before the field could be read back' }
+      ? { kind: 'typed-unreported', candidate: 'the field (the page navigated before it could be read back)' }
       : { kind: 'unreadable', problem: verdict?.problem ?? 'the page did not answer' }
   }
   const shape = answer.value as TypeAnswer

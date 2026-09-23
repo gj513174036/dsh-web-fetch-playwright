@@ -149,5 +149,8 @@ export async function clickCandidate(
     }
   }
   const failure = actFailure(shape, 'the click could not be read back')
+  // The click script has nothing to read back, so it never reports `attempted`;
+  // if a future one does, "the click went out and its outcome was lost" is the
+  // same verdict as a click the page navigated away from.
   return failure.kind === 'unverified' ? { kind: 'clicked-unreported' } : { kind: 'not-clicked', reasons: failure.reasons }
 }

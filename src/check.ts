@@ -84,17 +84,11 @@ export function checkScript(candidates: readonly Candidate[], state: ControlStat
   if (before === want) return { ok: true, candidate: found.landed, was: before, state: before, acted: false };
   const threw = clickFailureOf(found.hit);
   if (threw !== '') return { ok: false, attempted: null, why: null, tried: found.tried.concat(found.landed + ': the click threw (' + threw + ')') };
-  // Let the page react before believing anything. A control the page owns can be
-  // re-rendered from its own state, and "changed, then reverted" is exactly what
-  // reading too early would hide.
-  await new Promise((resolve) => {
-    try { requestAnimationFrame(() => { setTimeout(resolve, 0) }) } catch (error) { setTimeout(resolve, 0) }
-  });
-  // Read the control the page is showing now: the same one when the page kept the
-  // node (a revert keeps it), the freshly resolved one when it replaced it.
-  // The same walk, filter included: a page that replaced the control must not be
-  // read through whatever else happens to carry the same name.
-  const live = control.isConnected === true ? control : resolveCandidates(candidates, accept).control;
+  // Let the page react first, then read the control it is showing now — the same
+  // walk and the same filter, so a page that replaced the control cannot be read
+  // through whatever else happens to carry the same name.
+  await settleFrame();
+  const live = currentControlOf(control, candidates, accept);
   const after = live === null ? '' : checkedStateOf(live);
   if (after === '') return { ok: false, attempted: found.landed, why: 'the control could not be read back after ticking it (it is gone, or no longer reports a checked state)', tried: found.tried };
   return { ok: true, candidate: found.landed, was: before, state: after, acted: true };

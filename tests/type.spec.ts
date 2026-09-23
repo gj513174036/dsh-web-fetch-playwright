@@ -186,12 +186,14 @@ describe('typeInto', () => {
     expect(gone.kind).toBe('unverified')
     expect(gone.kind === 'unverified' ? gone.problem : '').toContain('could not be read back')
 
+    // A write that navigated is the page taking the input, not a failure: the
+    // navigation is its reaction to the write, and the step after this judges it.
     const navigated = await typeInto(
       pageWith(async () => { throw new Error('Execution context was destroyed, most likely because of a navigation') }),
       [{ kind: 'selector', selector: '#kw' }],
       'x',
     )
-    expect(navigated).toEqual({ kind: 'unverified', problem: 'the page navigated before the field could be read back' })
+    expect(navigated.kind).toBe('typed-unreported')
   })
 
   it('reports the candidates it passed over', async () => {

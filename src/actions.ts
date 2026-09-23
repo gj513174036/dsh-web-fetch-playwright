@@ -306,6 +306,12 @@ export async function runTargetActions(
         reports.push({ index, verb: step.verb, detail: `${outcome.candidate} (${how})`, outcome: 'met' })
         continue
       }
+      if (outcome.kind === 'typed-unreported') {
+        // The write went out and the page moved because of it; whether it took the
+        // value where the recipe wanted is the next step's business.
+        reports.push({ index, verb: step.verb, detail: outcome.candidate, outcome: 'met' })
+        continue
+      }
       const stopped = endStep(describeTypeFailure(detail, candidates, outcome))
       if (stopped !== null) return stopped
       continue

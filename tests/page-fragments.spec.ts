@@ -9,6 +9,8 @@
 import { JSDOM } from 'jsdom'
 import { describe, expect, it } from 'vitest'
 import { checkScript } from '../src/check.ts'
+import { stateProbeScript } from '../src/state.ts'
+import { typeScript } from '../src/type.ts'
 import { clickScript } from '../src/click.ts'
 import { CONSENT_GATE_PROBE, DISMISS_SCRIPT } from '../src/consent.ts'
 import { OBSERVE_SCRIPT } from '../src/observe.ts'
@@ -55,6 +57,8 @@ describe('page fragments', () => {
       CONSENT_GATE_PROBE,
       clickScript([{ kind: 'text', text: 'x' }]),
       checkScript([{ kind: 'text', text: 'x' }], 'checked'),
+      typeScript([{ kind: 'text', text: 'x' }], 'v'),
+      stateProbeScript([{ kind: 'text', text: 'x' }], 'checked'),
     ]
     for (const script of scripts) expect(script).not.toContain('`')
   })

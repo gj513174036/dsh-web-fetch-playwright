@@ -246,6 +246,20 @@ describe('runTargetActions, the type verb', () => {
     expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['skipped', 'met'])
   })
 
+  it('reports a write whose page navigated as done, not as a failure', async () => {
+    // The navigation is the page's reaction to the write; whether it was the
+    // right reaction is what the following step is for.
+    const outcome = await runTargetActions(
+      pageWith({ evaluate: async () => { throw new Error('Execution context was destroyed, most likely because of a navigation') } }),
+      target(type([{ kind: 'selector', selector: '#kw' }], '维生素D'), { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }),
+      options,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['met', 'met'])
+    expect(outcome.run.steps[0]?.detail).toContain('the page navigated')
+  })
+
   it('does not send a write to a page it has no budget left for', async () => {
     let asked = 0
     const page = pageWith({ evaluate: async () => { asked += 1; return { ok: true } } })
