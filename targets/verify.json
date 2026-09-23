@@ -1,0 +1,25 @@
+{
+  "targets": [
+    {
+      "name": "verify-wait-text",
+      "match": { "kind": "prefix", "url": "https://example.com/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "Example Domain" } }
+      ]
+    },
+    {
+      "name": "verify-over-budget-wait",
+      "match": { "kind": "prefix", "url": "https://example.com/slow" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "time", "ms": 60000 } }
+      ]
+    },
+    {
+      "name": "verify-non-document",
+      "match": { "kind": "prefix", "url": "https://api.github.com/repos/chendefine/dsh-web-fetch-playwright" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "full_name" } }
+      ]
+    }
+  ]
+}
