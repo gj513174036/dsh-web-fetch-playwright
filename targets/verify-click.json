@@ -1,0 +1,43 @@
+{
+  "targets": [
+    {
+      "name": "verify-click-en",
+      "match": { "kind": "prefix", "url": "https://example.com/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "Example Domain" } },
+        {
+          "verb": "click",
+          "candidates": [
+            { "role": "link", "name": "Learn more" },
+            { "text": "Learn more" }
+          ]
+        },
+        { "verb": "waitFor", "condition": { "kind": "url", "url": "https://www.iana.org/" } }
+      ]
+    },
+    {
+      "name": "verify-click-zh",
+      "match": { "kind": "prefix", "url": "https://www.baidu.com/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "百度一下" } },
+        { "verb": "click", "candidates": [{ "text": "百度一下" }] },
+        { "verb": "waitFor", "condition": { "kind": "url", "url": "https://www.baidu.com/s" } }
+      ]
+    },
+    {
+      "name": "verify-click-unreachable",
+      "match": { "kind": "prefix", "url": "https://www.iana.org/help/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "Example Domains" } },
+        {
+          "verb": "click",
+          "candidates": [
+            { "selector": "#does-not-exist" },
+            { "text": "绝不存在的按钮" },
+            { "role": "button", "name": "Nope" }
+          ]
+        }
+      ]
+    }
+  ]
+}
