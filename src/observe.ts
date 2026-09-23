@@ -26,6 +26,7 @@
  */
 
 import type { PlaywrightPage } from './types.ts'
+import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
 
 /** How long the page gets to answer the observation probe. */
 export const OBSERVE_TIMEOUT_MS = 5_000
@@ -70,41 +71,7 @@ export interface Observation {
  * markup rather than assert against a copy of it.
  */
 export const OBSERVE_SCRIPT = `(() => {
-  const laidOut = (el) => { const box = el.getBoundingClientRect(); return box.width > 0 && box.height > 0 };
-  const labelHostOf = (el) => {
-    if (el.closest === undefined) return null;
-    const id = el.getAttribute('id');
-    try { return el.closest('label') || (id ? document.querySelector('label[for="' + id.replace(/["\\\\]/g, '') + '"]') : null) } catch (error) { return null }
-  };
-  // A hidden checkbox has no text of its own - the words that say what it is
-  // agreeing to live in the label around it, which is also the thing a person
-  // clicks. Reading only the element's own text is what makes a page look like
-  // it says nothing; reading its own value attribute is worse, because an untagged
-  // checkbox carries the literal string "on".
-  const nameOf = (el) => {
-    const tag = el.tagName;
-    const type = (el.getAttribute('type') || '').toLowerCase();
-    const candidates = [el.getAttribute('aria-label')];
-    if (tag === 'INPUT' && (type === 'submit' || type === 'button' || type === 'reset')) candidates.push(el.value);
-    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') {
-      candidates.push(el.getAttribute('placeholder'));
-      const host = labelHostOf(el);
-      if (host !== null) candidates.push(host.textContent);
-    }
-    candidates.push(el.textContent);
-    for (const candidate of candidates) {
-      const text = String(candidate || '').trim();
-      if (text !== '') return text.replace(/\\s+/g, ' ').slice(0, 60);
-    }
-    return '';
-  };
-  // Only a real label forwards a click to its control; an arbitrary parent
-  // does not, so an unlaid-out input outside a label is simply not reachable.
-  const hostOf = (el) => {
-    if (laidOut(el)) return 'self';
-    const host = labelHostOf(el);
-    return host !== null && laidOut(host) ? 'label' : 'hidden';
-  };
+  ${spliceFragments(PAGE_FRAGMENTS)}
   const kindOf = (el) => {
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute('type') || '').toLowerCase();
@@ -125,24 +92,12 @@ export const OBSERVE_SCRIPT = `(() => {
     if (expanded !== null) out.push('expanded=' + expanded);
     return out.join(', ');
   };
-  // Laid out is not the same as clickable: a styled overlay swallows the click
-  // while the element still measures fine (measured on the same gate, whose
-  // checkbox inputs report a box yet time out under an actionability-checked
-  // click). Asking the document what is actually at the centre says so.
-  const coverageOf = (el) => {
-    if (!laidOut(el)) return '';
-    const box = el.getBoundingClientRect();
-    let at = null;
-    try { at = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) } catch (error) { at = null }
-    if (at === null) return '';
-    return at === el || el.contains(at) ? '' : 'covered';
-  };
   const SELECTOR = 'input, select, textarea, button, [role="button"], [role="checkbox"], [role="radio"], [role="tab"], a[href]';
   let nodes = [];
   try { nodes = Array.prototype.slice.call(document.querySelectorAll(SELECTOR)) } catch (error) { nodes = [] }
   const seen = nodes.map((el) => {
     const state = [stateOf(el), coverageOf(el)].filter((part) => part !== '').join(', ');
-    return { kind: kindOf(el), label: nameOf(el), host: hostOf(el), state: state };
+    return { kind: kindOf(el), label: accessibleNameOf(el).slice(0, 60), host: hostOf(el), state: state };
   });
   const named = seen.filter((entry) => entry.label !== '');
   const reachable = named.filter((entry) => entry.host !== 'hidden');

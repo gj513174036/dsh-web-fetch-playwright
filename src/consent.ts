@@ -40,6 +40,10 @@
  */
 
 import type { PlaywrightPage } from './types.ts'
+import { CONSENT_FRAGMENTS, DISMISS_FRAGMENTS, spliceFragments } from './page-fragments.ts'
+
+/** The consent vocabulary, owned by `page-fragments` so scripts cannot drift. */
+export { CONSENT_CONTEXT } from './page-fragments.ts'
 
 /**
  * The accept-all controls of the consent managers this plugin knows by name,
@@ -124,12 +128,6 @@ export type ConsentCandidate =
    */
   | { readonly kind: 'text' }
 
-/**
- * Ancestor text that marks consent UI: the id, class, or aria-label of the
- * control itself, or of up to five ancestors.
- */
-export const CONSENT_CONTEXT = /cookie|consent|privacy|gdpr|同意|隐私/i
-
 /** The controls the text candidate is allowed to consider. */
 const CONTROLS = 'button, [role="button"], input[type="button" i], input[type="submit" i], a[href]'
 
@@ -182,31 +180,11 @@ const TIMED_OUT = Symbol('consent-timeout')
  * read — so a page with thousands of controls pays for a layout read only on
  * the few that could be a consent button.
  */
-/**
- * The "this document IS the consent UI" test, shared by the dismissal script and
- * the post-click probe so the two can never disagree about what a gate is.
- */
-const GATE_TEST_SOURCE = `const consentWords = ${String(CONSENT_CONTEXT)};
-  const isConsentDocument = () => {
-    const body = document.body;
-    if (body === null) return false;
-    // innerText is the visible text and is what we want; jsdom (where the tests
-    // run) has no layout and no innerText, so fall back to textContent, a
-    // superset - which makes the "short page" test harder to pass, i.e. erring
-    // towards not clicking.
-    const inner = body.innerText;
-    const text = typeof inner === 'string' && inner !== '' ? inner : (body.textContent || '');
-    if (text.length >= 2000) return false;
-    return consentWords.test(location.href + ' ' + document.title);
-  };`
-
 export const DISMISS_SCRIPT = `(() => {
   const candidates = ${JSON.stringify(CONSENT_CANDIDATES)};
   const labels = ${JSON.stringify(ACCEPT_ALL_LABELS.map((label) => label.toLowerCase()))};
   const controls = ${JSON.stringify(CONTROLS)};
-  ${GATE_TEST_SOURCE}
-  const isVisible = (el) => { const box = el.getBoundingClientRect(); return box.width > 0 && box.height > 0 };
-  const labelOf = (el) => String((el.getAttribute('aria-label') || el.value || el.textContent) || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+  ${spliceFragments(DISMISS_FRAGMENTS)}
   const namesConsent = (el) => consentWords.test([el.id || '', typeof el.className === 'string' ? el.className : '', el.getAttribute('aria-label') || ''].join(' '));
   const styleOf = (el) => { try { return el.ownerDocument.defaultView.getComputedStyle(el) } catch (error) { return null } };
   const inConsentContext = (el) => {
@@ -220,16 +198,12 @@ export const DISMISS_SCRIPT = `(() => {
     }
     return false;
   };
-  // The fourth signal (isConsentDocument, above) covers a full-page consent
-  // interstitial: measured on booking.com, whose gate is
-  // /pipl_consent.zh-cn.html titled 需您同意 with a bare <button>同意</button>
-  // that has no consent-named ancestor at all.
   const gate = isConsentDocument();
   for (const candidate of candidates) {
     if (candidate.kind === 'selector') {
       let target = null;
       try { target = document.querySelector(candidate.selector) } catch (error) { continue }
-      if (target === null || !isVisible(target)) continue;
+      if (target === null || !laidOut(target)) continue;
       try { target.click() } catch (error) { return { clicked: null, problem: candidate.selector + ': ' + String(error), gate: false } }
       return { clicked: candidate.selector, problem: null, gate: false };
     }
@@ -237,10 +211,10 @@ export const DISMISS_SCRIPT = `(() => {
       let found = [];
       try { found = document.querySelectorAll(controls) } catch (error) { continue }
       for (const control of found) {
-        const label = labelOf(control);
+        const label = accessibleNameOf(control).toLowerCase();
         if (label === '' || label.length > 40 || labels.indexOf(label) === -1) continue;
         if (!gate && !inConsentContext(control)) continue;
-        if (!isVisible(control)) continue;
+        if (!laidOut(control)) continue;
         try { control.click() } catch (error) { return { clicked: null, problem: 'text "' + label + '": ' + String(error), gate: gate } }
         return { clicked: 'text:"' + label + '"', problem: null, gate: gate };
       }
@@ -280,7 +254,7 @@ function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_
  * instead of a plausible-looking page.
  */
 export const CONSENT_GATE_PROBE = `(() => {
-  ${GATE_TEST_SOURCE}
+  ${spliceFragments(CONSENT_FRAGMENTS)}
   return isConsentDocument();
 })()`
 
