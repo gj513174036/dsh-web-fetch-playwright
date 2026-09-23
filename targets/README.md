@@ -8,6 +8,7 @@ prose.
 | File | What it proves | Which plugin version it needs |
 | --- | --- | --- |
 | `verify.json` | URL selection, the action summary, a step that does not hold failing loudly, a non-document body being refused, and the per-fetch re-read of the file (edit it between two fetches and the second one sees the change) | 0.2.18 |
+| `verify-state.json` | the `state` condition: the gate's opening state (`all unchecked` over its five boxes), then `check` and `all checked`; and a w3schools recipe whose optional condition is *not* met, so a run of it shows the condition failing without failing the fetch | 0.2.21 |
 | `verify-check.json` | the `check` verb: reaching the gate's 1×1 consent checkboxes through the 897×20 `<label>` beside them, reading the state back, leaving a control that is already ticked alone, and naming every candidate when none can be checked | 0.2.20 |
 | `verify-click.json` | the `click` verb: an ordered candidate list (role / text / selector), reachability checked before the act, a Chinese and an English candidate each resolving on a real page, the wait after a click confirming it, `clicked (unverified)` when nothing follows, and every candidate being named when none can be clicked | 0.2.19 |
 
@@ -18,6 +19,8 @@ harmless: `example.com`, `baidu.com`'s own search button, and the IANA page that
 `example.com` links to. `verify-click-unreachable` is *meant* to fail — fetching
 `https://www.iana.org/help/example-domains` with that file loaded reports every
 candidate and why it was passed over.
+
+`verify-state-booking-gate` needs a profile that has **not** consented to booking.com yet (a fresh browser context is enough) — the same fresh-profile caveat as the gate recipe in `verify-check.json`. `verify-state-w3schools` is the awkward one on purpose: the page's checkboxes are normally unticked, so its optional condition reports *not met* and is recorded as skipped, which is how you see the failure wording without failing a fetch.
 
 `verify-check-w3schools` is the plain one: two `check` steps on a page with three ordinary checkboxes, so it proves the pass *and* the second step's `already checked` without touching a real gate.
 

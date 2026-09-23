@@ -143,6 +143,17 @@ export const FRAGMENT_ROLE = `const roleOf = (el) => {
   };`
 
 /**
+ * Is this control disabled, however it says so?
+ *
+ * One answer, asked by everything that needs it: a click or a check must not be
+ * aimed at a control that cannot react, and a state condition must be able to
+ * ask whether a control is disabled at all. Three carriers, because the DOM has
+ * three: the property, `aria-disabled` for custom controls, and a disabled
+ * `<fieldset>` around it (which the control itself says nothing about).
+ */
+export const FRAGMENT_DISABLED = `const isDisabled = (el) => el.disabled === true || el.getAttribute('aria-disabled') === 'true' || (el.closest !== undefined && el.closest('fieldset[disabled]') !== null);`
+
+/**
  * Where a click on this control has to land, or why it cannot land at all.
  *
  * The single answer to "how would a person do this", asked *before* anything is
@@ -151,7 +162,8 @@ export const FRAGMENT_ROLE = `const roleOf = (el) => {
  * disabled `<fieldset>`, which carries no `disabled` of its own — the HTML
  * exception for a fieldset's first `<legend>` is deliberately not modelled,
  * because refusing a control that would have worked is the cheap direction).
- * Anything else is asked the same question twice: is the control itself
+ * Whether it is disabled is {@link FRAGMENT_DISABLED}'s answer, not a second
+ * one. Anything else is asked the same question twice: is the control itself
  * hit-able, and if not, is the `<label>` that forwards a click to it?
  *
  * That second question is not a fallback for a hidden input only. Measured on
@@ -165,8 +177,7 @@ export const FRAGMENT_ROLE = `const roleOf = (el) => {
  *   `label`), and the reason when there is none.
  */
 export const FRAGMENT_HIT_TARGET = `const hitTargetOf = (el) => {
-    if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') return { hit: null, host: null, reason: 'disabled' };
-    if (el.closest !== undefined && el.closest('fieldset[disabled]') !== null) return { hit: null, host: null, reason: 'disabled' };
+    if (isDisabled(el)) return { hit: null, host: null, reason: 'disabled' };
     if (laidOut(el) && coverageOf(el) === '') return { hit: el, host: 'self', reason: '' };
     const label = labelHostOf(el);
     if (label !== null && laidOut(label) && coverageOf(label) === '') return { hit: label, host: 'label', reason: '' };
@@ -323,6 +334,26 @@ export const FRAGMENT_CONSENT_DOCUMENT = `const isConsentDocument = () => {
     return consentWords.test(location.href + ' ' + document.title);
   };`
 
+/**
+ * Is this control in that state — the question a condition waits on.
+ *
+ * `null` is the important answer: this control *cannot be asked*. A text field
+ * has a `checked` property that is `false`, and a `<label>` has no state at all,
+ * so answering `false` to "is it checked" would let a scope full of things that
+ * are not checkboxes decide the condition. The caller drops those instead.
+ *
+ * Enabled and disabled are asked of any control, because `isDisabled` has an
+ * answer for every element; checked and unchecked are asked of the controls that
+ * hold a state, which is the same read `check` verifies with.
+ */
+export const FRAGMENT_STATE_MATCH = `const matchesState = (el, wanted) => {
+    if (wanted === 'enabled') return !isDisabled(el);
+    if (wanted === 'disabled') return isDisabled(el);
+    const state = checkedStateOf(el);
+    if (state === '') return null;
+    return state === wanted;
+  };`
+
 /** The page-reading fragments, in the order they must be declared. */
 export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_VISIBLE_TEXT,
@@ -332,10 +363,12 @@ export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_ACCESSIBLE_NAME,
   FRAGMENT_ROLE,
   FRAGMENT_COVERAGE,
+  FRAGMENT_DISABLED,
   FRAGMENT_HIT_TARGET,
   FRAGMENT_CANDIDATE_MATCH,
   FRAGMENT_RESOLVE,
   FRAGMENT_CHECKED_STATE,
+  FRAGMENT_STATE_MATCH,
 ]
 
 /** The consent fragments, in the order they must be declared. */

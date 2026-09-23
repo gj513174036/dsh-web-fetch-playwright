@@ -814,6 +814,26 @@ describe('PlaywrightFetchProvider', () => {
     expect(content).toContain('2. waitFor text "World" — met')
   })
 
+  it('waits on a state condition and says what it was about', async () => {
+    const stateWait = '{ "verb": "waitFor", "condition": { "kind": "state", "state": "checked", "candidates": [ { "selector": "input[type=checkbox]" } ] } }'
+    const targetsFile = targetFor('https://example.com/docs', stateWait)
+    const result = await new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, scope: 'selector "input[type=checkbox]"', total: 5, off: 0, holds: true, sample: '' }],
+    }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('> actions: 1. waitFor all checked over selector "input[type=checkbox]" — met')).toBe(true)
+  })
+
+  it('fails a state condition the page cannot answer', async () => {
+    // The timing half — a condition that is simply never true waits out the step
+    // ceiling before this same failure — belongs to the runner's suite, which can
+    // shrink the ceiling. What the provider owes is the mapping and the words.
+    const stateWait = '{ "verb": "waitFor", "condition": { "kind": "state", "state": "checked", "candidates": [ { "selector": "input[type=checkbox]" } ] } }'
+    const targetsFile = targetFor('https://example.com/docs', stateWait)
+    const code = await codeOf(new FakeProvider({ targetsFile }, { noEvaluate: true }).fetch({ url: 'https://example.com/docs' }))
+    expect(code).toBe('WEB_FETCH_ACTION')
+  })
+
   it('fails a check the page did not keep, naming the step and the candidate', async () => {
     const targetsFile = targetFor('https://example.com/docs', checkText('全选'))
     const message = await messageOf(new FakeProvider({ targetsFile }, {

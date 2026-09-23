@@ -23,6 +23,8 @@ import type { PlaywrightPage } from './types.ts'
 import { checkControl } from './check.ts'
 import { clickCandidate } from './click.ts'
 import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
+import { raceTimeout } from './race.ts'
+import { readState } from './state.ts'
 import { describeCandidate, urlIsUnder, type ActionStep, type Candidate, type Target, type WaitCondition, type WaitStep } from './targets.ts'
 
 /** Longest one step may take, before the fetch's own remaining budget caps it. */
@@ -88,6 +90,9 @@ export interface ActionOptions {
 export function describeCondition(condition: WaitCondition): string {
   if (condition.kind === 'text') return `text "${condition.text}"${condition.absent === true ? ' to disappear' : ''}`
   if (condition.kind === 'url') return condition.absent === true ? `to have left ${condition.url}` : `url ${condition.url}`
+  if (condition.kind === 'state') {
+    return `all ${condition.state} over ${condition.candidates.map(describeCandidate).join(' or ')}`
+  }
   return `wait ${String(condition.ms)}ms`
 }
 
@@ -114,34 +119,46 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Is the condition true right now?
+ * Is the condition true right now, and if not, what did the page say?
+ *
+ * The answer carries a short `why` so a step that times out can say what it saw
+ * (three of five not checked) instead of only that it waited.
  *
  * @param currentUrl - where the browser is right now.
  * @param condition - the condition to evaluate.
  * @param evaluate - the page's scripting seam, when it has one.
- * @returns true/false, or null when the condition cannot be evaluated at all.
+ * @param remainingMs - what is left of the step's budget; one read never outlives it.
+ * @returns the verdict, or null when the condition cannot be evaluated at all.
  */
 async function conditionHolds(
   currentUrl: string,
   condition: WaitCondition,
   evaluate: ((script: string) => Promise<unknown>) | undefined,
-): Promise<boolean | null> {
-  if (condition.kind === 'time') return true
+  remainingMs: number,
+): Promise<{ held: boolean; why: string } | null> {
+  if (condition.kind === 'time') return { held: true, why: '' }
   if (condition.kind === 'url') {
     const under = urlIsUnder(currentUrl, condition.url)
-    return condition.absent === true ? !under : under
+    return { held: condition.absent === true ? !under : under, why: '' }
   }
   if (evaluate === undefined) return null
+  if (condition.kind === 'state') {
+    // A read that does not answer is "not yet", the same as a text probe that
+    // throws: a navigation in flight destroys the execution context, and the next
+    // poll is the one that answers. Only a page with no seam at all is
+    // unanswerable, and that is the check above.
+    return (await readState(evaluate, condition.candidates, condition.state, Math.max(1, remainingMs))) ?? { held: false, why: '' }
+  }
   let found: boolean
   try {
-    found = (await evaluate(textProbeScript(condition.text))) === true
+    found = (await raceTimeout(evaluate(textProbeScript(condition.text)), Math.max(1, remainingMs))) === true
   } catch {
     // A poll can fail for a transient reason — the navigation a click causes
     // destroys the execution context — and that is "not yet", not "unreadable".
     // Only a page with no scripting seam at all can never answer.
-    return false
+    return { held: false, why: '' }
   }
-  return condition.absent === true ? !found : found
+  return { held: condition.absent === true ? !found : found, why: '' }
 }
 
 /** What a step's candidates look like before anything is tried. */
@@ -296,6 +313,8 @@ export async function runTargetActions(
     const startedAt = Date.now()
     let held = false
     let unanswerable = false
+    /** What the last read saw, when the condition's own reader can say. */
+    let why = ''
 
     // A fixed wait that does not fit in what is left has not happened. Sleeping
     // the shortened time and calling it met is the "claims something untrue"
@@ -308,15 +327,16 @@ export async function runTargetActions(
       held = true
     } else {
       for (;;) {
-        const state = await conditionHolds(page.url(), step.condition, evaluate).catch(() => null)
+        const state = await conditionHolds(page.url(), step.condition, evaluate, budget - (Date.now() - startedAt)).catch(() => null)
         if (state === null) {
           unanswerable = true
           break
         }
-        if (state) {
+        if (state.held) {
           held = true
           break
         }
+        why = state.why
         if (Date.now() - startedAt >= budget) break
         await sleep(poll)
       }
@@ -331,7 +351,7 @@ export async function runTargetActions(
         ? `${detail} (the page could not be read)`
         : exceedsBudget
           ? `${detail} (only ${String(budget)}ms of the step budget is left)`
-          : `${detail} (not met within ${String(budget)}ms)`,
+          : `${detail}${why === '' ? '' : `: ${why}`} (not met within ${String(budget)}ms)`,
     )
     if (stopped !== null) return stopped
   }

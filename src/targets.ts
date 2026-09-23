@@ -27,6 +27,9 @@ export interface TargetMatch {
   readonly url: string
 }
 
+/** The states a `waitFor` can ask a set of controls about. */
+export type WaitState = 'checked' | 'unchecked' | 'enabled' | 'disabled'
+
 /**
  * One condition a `waitFor` step waits on.
  *
@@ -36,11 +39,15 @@ export interface TargetMatch {
  *   with `absent`, no longer is). This is how a target waits to be back on the
  *   page a gate interrupted, or to have left the one it clicked through.
  * - `time` — a fixed wait, still bounded by the step's ceiling.
+ * - `state` — every control the candidates name is in that state. The condition
+ *   text cannot express: a gate that refuses to continue until all five consents
+ *   are ticked says so in no label, only in state.
  */
 export type WaitCondition =
   | { readonly kind: 'text'; readonly text: string; readonly absent?: boolean }
   | { readonly kind: 'url'; readonly url: string; readonly absent?: boolean }
   | { readonly kind: 'time'; readonly ms: number }
+  | { readonly kind: 'state'; readonly state: WaitState; readonly candidates: readonly Candidate[] }
 
 /**
  * One way to name a control: an intent's ordered candidates, tried until one is
@@ -293,7 +300,18 @@ function parseCondition(value: unknown, path: string): { condition: WaitConditio
     if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return { error: `${at(path)}.ms: expected a non-negative number` }
     return { condition: { kind: 'time', ms } }
   }
-  return { error: `${at(path)}.kind: expected "text", "url" or "time"` }
+  if (kind === 'state') {
+    const unknown = unknownKeys(value, ['kind', 'state', 'candidates'], path)
+    if (unknown !== null) return { error: unknown }
+    const state = value['state']
+    if (state !== 'checked' && state !== 'unchecked' && state !== 'enabled' && state !== 'disabled') {
+      return { error: `${at(path)}.state: expected "checked", "unchecked", "enabled" or "disabled"` }
+    }
+    const candidates = parseCandidates(value['candidates'], path, 'a state condition')
+    if ('error' in candidates) return { error: candidates.error }
+    return { condition: { kind: 'state', state, candidates: candidates.parsed } }
+  }
+  return { error: `${at(path)}.kind: expected "text", "url", "time" or "state"` }
 }
 
 /**
@@ -359,12 +377,12 @@ function parseCandidate(value: unknown, path: string): { candidate: Candidate } 
  * One place for the rules both `click` and `check` live by: at least one
  * candidate, and every one of them well formed.
  */
-function parseCandidates(value: unknown, path: string, verb: string): { parsed: Candidate[] } | { error: string } {
+function parseCandidates(value: unknown, path: string, what: string): { parsed: Candidate[] } | { error: string } {
   if (!Array.isArray(value)) {
     return { error: `${at(path)}.candidates: expected an array of candidates, most precise first` }
   }
   if (value.length === 0) {
-    return { error: `${at(path)}.candidates: a ${verb} with no candidates can never match anything; give it one or remove the step` }
+    return { error: `${at(path)}.candidates: ${what} with no candidates can never match anything; give it one or remove it` }
   }
   const parsed: Candidate[] = []
   for (const [index, raw] of value.entries()) {
@@ -390,7 +408,7 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
   if (verb === 'click') {
     const unknown = unknownKeys(value, ['verb', 'candidates', 'optional'], path)
     if (unknown !== null) return { error: unknown }
-    const candidates = parseCandidates(value['candidates'], path, verb)
+    const candidates = parseCandidates(value['candidates'], path, `a ${verb}`)
     if ('error' in candidates) return { error: candidates.error }
     const optional = parseOptional(value['optional'], path)
     if ('error' in optional) return { error: optional.error }
@@ -399,7 +417,7 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
   if (verb === 'check') {
     const unknown = unknownKeys(value, ['verb', 'candidates', 'state', 'optional'], path)
     if (unknown !== null) return { error: unknown }
-    const candidates = parseCandidates(value['candidates'], path, verb)
+    const candidates = parseCandidates(value['candidates'], path, `a ${verb}`)
     if ('error' in candidates) return { error: candidates.error }
     const state = value['state']
     if (state !== undefined && state !== 'checked' && state !== 'unchecked') {

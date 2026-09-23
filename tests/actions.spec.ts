@@ -47,6 +47,13 @@ function checkPage(answer: unknown): PlaywrightPage {
   return pageWith({ evaluate: async (script) => (script.includes('const want = ') ? answer : true) })
 }
 
+/** A page that answers the state probe (and the text probe, when asked). */
+function statePage(answer: unknown): PlaywrightPage {
+  return pageWith({ evaluate: async (script) => (script.includes('const told = []') ? answer : true) })
+}
+
+const allChecked = { ok: true, scope: 'selector "input[type=checkbox]"', total: 5, off: 0, holds: true, sample: '' }
+
 const options = { remainingMs: () => 5_000, stepCeilingMs: 20, pollMs: 1 }
 
 describe('runTargetActions', () => {
@@ -145,6 +152,62 @@ describe('runTargetActions', () => {
   it('reports the document it ended on', async () => {
     const outcome = await runTargetActions(pageWith({ url: 'https://a.example/after', evaluate: async () => true }), target(text('结果')), options)
     expect(outcome.ok && outcome.run.finalUrl).toBe('https://a.example/after')
+  })
+})
+
+describe('runTargetActions, the state condition', () => {
+  const condition = (state: 'checked' | 'unchecked' | 'enabled' | 'disabled'): WaitStep => ({
+    verb: 'waitFor',
+    condition: { kind: 'state', state, candidates: [{ kind: 'selector', selector: 'input[type=checkbox]' }] },
+  })
+
+  it('reports the condition that held, and what it was about', async () => {
+    const outcome = await runTargetActions(statePage(allChecked), target(condition('checked')), options)
+    expect(outcome.ok && outcome.run.steps).toEqual([
+      {
+        index: 0,
+        verb: 'waitFor',
+        detail: 'all checked over selector "input[type=checkbox]"',
+        outcome: 'met',
+      },
+    ])
+  })
+
+  it('fails with what the page said, not only that it waited', async () => {
+    const outcome = await runTargetActions(
+      statePage({ ok: true, scope: 'selector "input[type=checkbox]"', total: 5, off: 3, holds: false, sample: '全选' }),
+      target(condition('checked')),
+      options,
+    )
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.detail).toContain('all checked over selector "input[type=checkbox]"')
+    expect(failure.detail).toContain('3 of 5 controls in selector "input[type=checkbox]" are not checked (e.g. "全选")')
+    expect(failure.detail).toContain('not met within')
+    expect(failure.url).toBe('https://a.example/search')
+  })
+
+  it('says when nothing could be asked at all', async () => {
+    const outcome = await runTargetActions(statePage({ ok: false, told: ['text "全选": no match'] }), target(condition('checked')), options)
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('no candidate named a control that can be asked this (text "全选": no match)')
+  })
+
+  it('cannot be answered by a page with no scripting seam', async () => {
+    const outcome = await runTargetActions(pageWith({}), target(condition('checked')), options)
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('could not be read')
+  })
+
+  it('is skipped like any other optional step', async () => {
+    const outcome = await runTargetActions(
+      statePage({ ok: true, scope: 'x', total: 2, off: 1, holds: false, sample: '' }),
+      target({ ...condition('enabled'), optional: true }, { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }),
+      options,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['skipped', 'met'])
   })
 })
 
@@ -403,5 +466,11 @@ describe('describeCondition', () => {
     expect(describeCondition({ kind: 'text', text: 'x', absent: true })).toBe('text "x" to disappear')
     expect(describeCondition({ kind: 'url', url: 'https://a.example/x' })).toBe('url https://a.example/x')
     expect(describeCondition({ kind: 'time', ms: 250 })).toBe('wait 250ms')
+    expect(describeCondition({ kind: 'state', state: 'checked', candidates: [{ kind: 'selector', selector: '#a' }] })).toBe('all checked over selector "#a"')
+    expect(describeCondition({
+      kind: 'state',
+      state: 'enabled',
+      candidates: [{ kind: 'selector', selector: '#a' }, { kind: 'text', text: '同意' }],
+    })).toBe('all enabled over selector "#a" or text "同意"')
   })
 })

@@ -1,0 +1,45 @@
+{
+  "targets": [
+    {
+      "name": "verify-state-booking-gate",
+      "match": { "kind": "prefix", "url": "https://www.booking.com/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "需您同意" } },
+        {
+          "verb": "waitFor",
+          "condition": {
+            "kind": "state",
+            "state": "unchecked",
+            "candidates": [{ "selector": "input[type=checkbox]" }]
+          }
+        },
+        { "verb": "check", "candidates": [{ "text": "全选" }], "state": "checked" },
+        {
+          "verb": "waitFor",
+          "condition": {
+            "kind": "state",
+            "state": "checked",
+            "candidates": [{ "selector": "input[type=checkbox]" }]
+          }
+        },
+        { "verb": "click", "candidates": [{ "text": "同意" }] },
+        { "verb": "waitFor", "condition": { "kind": "url", "url": "https://www.booking.com/pipl_consent.zh-cn.html", "absent": true } }
+      ]
+    },
+    {
+      "name": "verify-state-w3schools",
+      "match": { "kind": "prefix", "url": "https://www.w3schools.com/html/html_forms.asp" },
+      "actions": [
+        {
+          "verb": "waitFor",
+          "condition": {
+            "kind": "state",
+            "state": "checked",
+            "candidates": [{ "selector": "input[type=checkbox]" }]
+          },
+          "optional": true
+        }
+      ]
+    }
+  ]
+}

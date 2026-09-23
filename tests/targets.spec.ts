@@ -134,6 +134,30 @@ describe('parseTargets', () => {
     expect(step?.[4]).toEqual({ verb: 'waitFor', condition: { kind: 'time', ms: 250 }, optional: true })
   })
 
+  it('reads a state condition over a candidate list, in all four states', () => {
+    const cond = (state: string, candidates = '[ { "selector": "input[type=checkbox]" } ]'): string =>
+      `{ "verb": "waitFor", "condition": { "kind": "state", "state": "${state}", "candidates": ${candidates} } }`
+    for (const state of ['checked', 'unchecked', 'enabled', 'disabled']) {
+      const parsed = targetsOf(file(cond(state)))[0]?.actions[0]
+      expect(parsed).toEqual({
+        verb: 'waitFor',
+        condition: { kind: 'state', state, candidates: [{ kind: 'selector', selector: 'input[type=checkbox]' }] },
+      })
+    }
+    const mixed = targetsOf(file(cond('checked', '[ { "text": "全选" }, { "role": "checkbox", "name": "全选" } ]')))[0]?.actions[0]
+    const condition = mixed?.verb === 'waitFor' ? mixed.condition : undefined
+    expect(condition).toMatchObject({ candidates: [{ kind: 'text', text: '全选' }, { kind: 'role', role: 'checkbox', name: '全选' }] })
+  })
+
+  it('refuses a state condition that names no state, no control, or a state that is not one', () => {
+    const cond = (body: string): string => file(`{ "verb": "waitFor", "condition": ${body} }`)
+    expect(errorOf(cond('{ "kind": "state", "state": "hidden", "candidates": [ { "text": "x" } ] }'))).toContain('.condition.state: expected "checked", "unchecked", "enabled" or "disabled"')
+    expect(errorOf(cond('{ "kind": "state", "state": "checked" }'))).toContain('.condition.candidates')
+    expect(errorOf(cond('{ "kind": "state", "state": "checked", "candidates": [] }'))).toContain('a state condition with no candidates')
+    expect(errorOf(cond('{ "kind": "state", "state": "checked", "candidates": [ { "text": "x" } ], "absent": true }'))).toContain('unknown key "absent"')
+    expect(errorOf(cond('{ "kind": "regex" }'))).toContain('expected "text", "url", "time" or "state"')
+  })
+
   it('names the place in the file that is wrong', () => {
     expect(errorOf('{ nope }')).toContain('not valid JSON')
     expect(errorOf('[]')).toContain('targets file')

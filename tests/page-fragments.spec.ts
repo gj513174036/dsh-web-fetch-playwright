@@ -40,7 +40,7 @@ describe('page fragments', () => {
   it('ships bundles that are self-contained', () => {
     // The failure this catches is the one that bit the extraction: a consumer
     // picked the fragments it thought it needed and named one it had left out.
-    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof matchesOf === "function" && typeof resolveCandidates === "function" && typeof checkedStateOf === "function"', '')).toBe(true)
+    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof matchesOf === "function" && typeof resolveCandidates === "function" && typeof checkedStateOf === "function" && typeof isDisabled === "function" && typeof matchesState === "function"', '')).toBe(true)
     expect(withFragments<boolean>(DISMISS_FRAGMENTS, 'typeof isConsentDocument === "function" && typeof accessibleNameOf === "function"', '')).toBe(true)
   })
 
@@ -180,6 +180,30 @@ describe('page fragments', () => {
       expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("div"))', '<div role="checkbox" aria-checked="false">x</div>')).toBe('unchecked')
       // A toggle button says it with aria-pressed.
       expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("button"))', '<button aria-pressed="true">x</button>')).toBe('checked')
+    })
+  })
+
+  describe('isDisabled and matchesState', () => {
+    it('answers disabled however the page says it, for any control', () => {
+      const of = (expression: string, html: string): unknown => withFragments<unknown>(PAGE_FRAGMENTS, expression, html)
+      expect(of('isDisabled(document.querySelector("button"))', '<button disabled>go</button>')).toBe(true)
+      expect(of('isDisabled(document.querySelector("div"))', '<div role="button" aria-disabled="true">go</div>')).toBe(true)
+      expect(of('isDisabled(document.querySelector("button"))', '<fieldset disabled><button>go</button></fieldset>')).toBe(true)
+      expect(of('isDisabled(document.querySelector("button"))', '<button>go</button>')).toBe(false)
+    })
+
+    it('answers the four states, and refuses to answer for a control that has none', () => {
+      const of = (expression: string, html: string): unknown => withFragments<unknown>(PAGE_FRAGMENTS, expression, html)
+      expect(of('matchesState(document.querySelector("input"), "checked")', '<input type="checkbox" checked>')).toBe(true)
+      expect(of('matchesState(document.querySelector("input"), "unchecked")', '<input type="checkbox">')).toBe(true)
+      expect(of('matchesState(document.querySelector("div"), "checked")', '<div role="checkbox" aria-checked="true">x</div>')).toBe(true)
+      expect(of('matchesState(document.querySelector("button"), "unchecked")', '<button aria-pressed="false">x</button>')).toBe(true)
+      expect(of('matchesState(document.querySelector("button"), "enabled")', '<button>x</button>')).toBe(true)
+      expect(of('matchesState(document.querySelector("button"), "disabled")', '<button disabled>x</button>')).toBe(true)
+      expect(of('matchesState(document.querySelector("button"), "disabled")', '<button>x</button>')).toBe(false)
+      // Not "unchecked": a text field has no such state, and the caller must know.
+      expect(of('matchesState(document.querySelector("input"), "unchecked")', '<input type="text">')).toBe(null)
+      expect(of('matchesState(document.querySelector("label"), "checked")', '<label><input type="checkbox"> 全选</label>')).toBe(null)
     })
   })
 
