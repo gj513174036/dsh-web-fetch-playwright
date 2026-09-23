@@ -1,13 +1,21 @@
 # Targets
 
-Recipes that a fetch can be pointed at with the `targetsFile` setting. Both files
-here are **verification assets**, not production recipes: they exist so that a
-release's behaviour can be replayed against real pages instead of asserted in
-prose.
+Recipes that a fetch can be pointed at with the `targetsFile` setting, in two kinds:
+
+- **`verify-*.json` — verification assets.** They exist so a release's behaviour can be
+  replayed against real pages instead of asserted in prose. Meant to be replaced, not kept.
+- **A plain name — a production recipe**, for a site that needs actions before its data
+  means anything. It is meant for real use, and its number (a count, a name) is part of
+  the recipe because the fetch seam carries a URL and nothing else.
+
+Each production recipe may carry its discovery beside it as `<name>.observation.md`: the
+observe-mode report it was written from, what the recipe is and why each step looks the way
+it does. A recipe whose reasoning is not written down cannot be reviewed.
 
 | File | What it proves | Which plugin version it needs |
 | --- | --- | --- |
 | `verify.json` | URL selection, the action summary, a step that does not hold failing loudly, a non-document body being refused, and the per-fetch re-read of the file (edit it between two fetches and the second one sees the change) | 0.2.18 |
+| `tga-artg.json` | the first recipe produced by *freezing a discovery* (ticket #9): the keyword `vitamin d` typed into the TGA's ARTG search and submitted, with `tga-artg.observation.md` committed next to it | 0.2.23 |
 | `verify-type.json` | the `type` verb: writing into bing's own search box and letting its own submit carry the value (the results URL proves the page held it), plus a recipe whose candidates are all untypable, so the failure names each one | 0.2.23 |
 | `verify-state.json` | the `state` condition: the gate's opening state (`all unchecked` over its five boxes), then `check` and `all checked`; and a w3schools recipe whose optional condition is *not* met, so a run of it shows the condition failing without failing the fetch | 0.2.21 |
 | `verify-check.json` | the `check` verb: reaching the gate's 1×1 consent checkboxes through the 897×20 `<label>` beside them, reading the state back, leaving a control that is already ticked alone, and naming every candidate when none can be checked | 0.2.20 |
@@ -15,11 +23,13 @@ prose.
 
 Every `*.json` in this directory is parsed by the test suite (`tests/targets.spec.ts`), because a file the parser refuses makes **every** fetch fail, not just the URLs inside it — so a recipe that cannot be loaded cannot be committed.
 
-Point `targetsFile` at one file at a time. Both are deliberately chosen to be
-harmless: `example.com`, `baidu.com`'s own search button, and the IANA page that
-`example.com` links to. `verify-click-unreachable` is *meant* to fail — fetching
-`https://www.iana.org/help/example-domains` with that file loaded reports every
-candidate and why it was passed over.
+Point `targetsFile` at one file at a time. The verification files are deliberately
+chosen to be harmless: `example.com`, `baidu.com`'s own search button, `cn.bing.com`'s
+own search box, w3schools' plain checkboxes, and the IANA page `example.com` links to.
+Some of them are *meant* to fail — `verify-click-unreachable` and `verify-type-unreachable`
+report every candidate and why it was passed over, and `verify-state-w3schools` records a
+condition that does not hold. `tga-artg.json` is a real query against the TGA's public
+register: it types a keyword and submits the register's own form, which is what it is for.
 
 Measured for `verify-state-booking-gate` (0.2.21, a throwaway browser context against the real interstitial):
 
@@ -51,7 +61,8 @@ Notes worth keeping next to the recipes:
   click lands, the tab it opens is closed by the popup guard, and the page the
   fetch is reading does not move — which is why a target ending on such a click
   reads `clicked (unverified)` rather than pretending the page changed.
-- Nothing here carries credentials. `verify-check.json` is the one file that
-  *does* write something to a site: ticking the gate's consents and clicking 同意
-  records consent for booking.com, exactly as `dismissConsent` does. The other
-  two files submit no form and record no consent.
+- Nothing here carries credentials. Two files write to a site: `verify-check.json`
+  ticks booking.com's consents and clicks 同意 (which records consent, exactly as
+  `dismissConsent` does), and `tga-artg.json` submits a keyword to the TGA's public
+  register — the same query a person typing in that box would run. The rest only read,
+  click links the sites themselves offer, or fill a search box and submit it.

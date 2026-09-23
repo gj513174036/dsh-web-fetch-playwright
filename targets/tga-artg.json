@@ -1,0 +1,27 @@
+{
+  "targets": [
+    {
+      "name": "tga-artg-vitamin-d",
+      "match": { "kind": "prefix", "url": "https://www.tga.gov.au/resources/artg" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "Search medicines, medical devices and biologicals" } },
+        {
+          "verb": "type",
+          "candidates": [
+            { "role": "textbox", "name": "Search the ARTG keywords" },
+            { "selector": "input[aria-label=\"Search the ARTG keywords\"]" }
+          ],
+          "value": "vitamin d"
+        },
+        {
+          "verb": "click",
+          "candidates": [
+            { "selector": "input[data-drupal-selector=\"edit-submit-search-2\"]" },
+            { "role": "button", "name": "Search" }
+          ]
+        },
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "889 result(s) found" } }
+      ]
+    }
+  ]
+}
