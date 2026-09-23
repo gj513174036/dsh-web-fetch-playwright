@@ -252,6 +252,18 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onReset={() => { props.resetField('denoise') }}
       />
       <CheckboxField
+        id="plugin-config-playwright-observe"
+        label={t('observe')}
+        hint={t('observeHint')}
+        checked={state.observe.text === 'true'}
+        overridden={state.observe.overridden}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        disabled={disabled}
+        onEdit={(text) => { props.edit('observe', text) }}
+        onReset={() => { props.resetField('observe') }}
+      />
+      <CheckboxField
         id="plugin-config-playwright-dismiss-consent"
         label={t('dismissConsent')}
         hint={t('dismissConsentHint')}

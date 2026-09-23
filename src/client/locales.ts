@@ -25,6 +25,7 @@ export type PlaywrightCardLocaleKey =
   | 'recordWarning'
   | 'denoise' | 'denoiseHint'
   | 'dismissConsent' | 'dismissConsentHint'
+  | 'observe' | 'observeHint'
   | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
   | 'challengeWaitMs' | 'challengeWaitMsHint' | 'challengeWaitMsPlaceholder'
   | 'proxyServer' | 'proxyServerHint' | 'proxyServerPlaceholder'
@@ -85,6 +86,8 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   denoise: 'Enable the denoise algorithm',
   denoiseHint: 'Readability + DOMPurify strip nav bars, sidebars, footers, and ads before converting to markdown.',
   dismissConsent: 'Dismiss consent banners before reading the page',
+  observe: 'Observe mode: return the page\u2019s actionable state',
+  observeHint: 'Returns the reachable controls with their labels and states (checked / disabled / visible as its label), the counts, and the head of the visible text — instead of the denoised article. Use it on an unfamiliar page to see what it is asking for before acting on it. A mode rather than a per-fetch option because the fetch seam carries only a URL.',
   dismissConsentHint: 'Clicks the "accept all" control of the consent managers this plugin knows (OneTrust, TrustArc, Cookiebot, Didomi, Osano, Usercentrics, CookieYes, Complianz, Iubenda, Klaro, Google, Quantcast), and otherwise any control labelled "accept all" / 全部接受 that sits in consent-looking UI (a dialog, a consent-named container, a fixed overlay, or a full-page consent interstitial). Off by default: the click records YOUR consent in whichever profile the fetch uses — the real one on the CDP and DSH-managed backends — and consent cookies then persist there. Best effort; it can never fail a fetch.',
   maxConcurrency: 'Max concurrent fetches',
   maxConcurrencyHint: 'How many pages may render at once (1–200). Blank = auto: 4 local browsers, 50 tabs for the CDP and DSH-managed backends (one browser is already alive; a slot is a tab in it).',
@@ -159,6 +162,8 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   denoise: '启用降噪算法',
   denoiseHint: '使用 Readability + DOMPurify 清洗导航栏、侧边栏、页脚与贴片广告后再转为 Markdown。',
   dismissConsent: '读页面前自动关掉 Cookie 同意横幅',
+  observe: '观察模式：返回页面的可操作状态',
+  observeHint: '返回页面里可触及的控件及其标签与状态（已勾选 / 已禁用 / 以它的标签形式可见）、各类计数、以及可见文本的开头——而不是降噪后的正文。用于面对陌生页面时先看清"它到底在要求什么"，再决定怎么操作。做成模式而非每次调用的选项，是因为抓取入口只带一个 URL。',
   dismissConsentHint: '点击本插件已知同意管理器的"全部接受"控件（OneTrust、TrustArc、Cookiebot、Didomi、Osano、Usercentrics、CookieYes、Complianz、Iubenda、Klaro、Google、Quantcast）；若不是这些，则点击任何位于同意类界面里的"全部接受 / accept all"控件——判据是它处于对话框、同意命名的容器、固定浮层之中，或整页就是一个同意插页。默认关闭：这次点击会在抓取所用的 profile 里记录**你的**同意（CDP 与托管后端下就是你的真实 profile），同意 cookie 会留在那里。尽力而为，绝不会让抓取失败。',
   maxConcurrency: '最大并发抓取数',
   maxConcurrencyHint: '同时渲染的页面上限（1–200）；留空自动：本地 4 个浏览器，CDP 与 DSH 托管后端 50 个标签页（浏览器已在运行，一个并发名额就是一个标签页）。',

@@ -202,6 +202,7 @@ function resolvedConfig(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
     shareBrowserContext: true,
     denoise: true,
     dismissConsent: false,
+    observe: false,
     maxConcurrency: 4,
     challengeWaitMs: 0,
     challengeRetries: 0,
@@ -420,6 +421,7 @@ class FakeProvider extends PlaywrightFetchProvider {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       maxConcurrency: 4,
       // Legacy default: the challenge path stays off unless a test opts in.
       challengeWaitMs: 0,
@@ -451,6 +453,7 @@ class GatedProvider extends PlaywrightFetchProvider {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -672,6 +675,33 @@ describe('PlaywrightFetchProvider', () => {
     expect(result.statusCode).toBe(200)
   })
 
+  it('observe mode returns the page state instead of the article', async () => {
+    const observation = {
+      url: 'https://final.example.com/docs',
+      title: '需您同意',
+      textHead: '需您同意 请阅读《隐私声明》',
+      counts: { controls: 6, reachable: 6, buttons: 1, links: 0, checkboxes: 5, uncheckedCheckboxes: 5, selects: 0, forms: 1, iframes: 0 },
+      controlsTotal: 2,
+      controls: [
+        { kind: 'button', label: '同意', host: 'self', state: '' },
+        { kind: 'checkbox', label: '全选', host: 'label', state: 'unchecked' },
+      ],
+    }
+    const result = await new FakeProvider({ observe: true }, { evaluateResult: observation })
+      .fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content).toContain('# Page state: 需您同意')
+    expect(content).toMatch(/checkboxes 5 \(unchecked 5\)/)
+    expect(content).toContain('[checkbox] "全选" - unchecked (visible as its label)')
+  })
+
+  it('observe mode fails loudly when the page cannot be read', async () => {
+    // Observe mode *is* the fetch, so an unreadable page is a failure, not an
+    // empty observation.
+    const code = await codeOf(new FakeProvider({ observe: true }, { noEvaluate: true }).fetch({ url: 'https://example.com/docs' }))
+    expect(code).toBe('WEB_PROVIDER_ERROR')
+  })
+
   it('decodes non-html text bodies verbatim', async () => {
     const result = await new FakeProvider({}, { contentType: 'application/json', textBody: '{"ok":true}' })
       .fetch({ url: 'https://example.com/api' })
@@ -843,6 +873,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       shareBrowserContext: false,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -874,6 +905,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       shareBrowserContext: false,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -897,6 +929,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -930,6 +963,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -952,6 +986,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -980,6 +1015,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1010,6 +1046,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))

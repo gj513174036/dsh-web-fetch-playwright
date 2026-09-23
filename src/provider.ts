@@ -83,6 +83,7 @@ import type { BrowserPoolOptions } from './browser-pool.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown, stripNonContentHtml } from './markdown.ts'
 import { CONSENT_TIMEOUT_MS, dismissConsentBanner, isConsentGate } from './consent.ts'
+import { OBSERVE_TIMEOUT_MS, observePage, renderObservation } from './observe.ts'
 import { parseLaunchArgs } from './launch-args.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightProxyOption, PlaywrightResponse, PlaywrightRoute } from './types.ts'
@@ -969,6 +970,21 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           )
         }
       }
+    }
+
+    // Observe mode *is* the fetch: the caller asked for the page's actionable
+    // state, so denoised prose would be the wrong answer even though producing
+    // it would succeed. Failing loudly when the state cannot be read is the same
+    // rule the rest of this file follows.
+    if (config.observe === true) {
+      const observation = await observePage(page, Math.min(OBSERVE_TIMEOUT_MS, deadline.remainingMs()))
+      if (observation === null) {
+        throw new WebError(
+          'observe mode could not read the page state (the page handle offers no scripting, or the page did not answer)',
+          'WEB_PROVIDER_ERROR',
+        )
+      }
+      return capResult(finalUrl, statusCode, { kind: 'text', content: renderObservation(observation) })
     }
 
     const html = await page.content()

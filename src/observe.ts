@@ -1,0 +1,267 @@
+/**
+ * Observe mode: hand the caller the page's *actionable state* instead of its
+ * prose.
+ *
+ * Why this exists as its own mode rather than a step: the fetch seam takes a
+ * URL and nothing else, so a per-call "show me the controls" argument cannot
+ * reach the provider. What this mode buys is the thing a fixed recipe cannot
+ * have — the ability to look at an unfamiliar page and work out what it wants.
+ *
+ * The shape is deliberately about *acting*, not about markup, and it encodes the
+ * lessons of a real gate (booking.com's /pipl_consent.zh-cn.html):
+ *
+ * - **State, not just labels.** That gate listed five consents, had a select-all,
+ *   and refused to continue until every one was ticked. Nothing in the button
+ *   labels says so; `uncheckedCheckboxes: 5` does.
+ * - **Where the visible control is.** Its five `<input type="checkbox">` are
+ *   hidden and `locator.check()` times out on all of them — a person clicks the
+ *   `<label>` around them. So each control reports whether it is visible itself,
+ *   visible through its label, or hidden.
+ * - **A bounded amount of it.** Counts are complete; the control list is capped,
+ *   ordered so that everything reachable (itself or through its label) comes
+ *   first in page order, with the unreachable tail last — a long page has
+ *   hundreds of links and the planner needs the actionable ones.
+ *
+ * @module dsh-web-fetch-playwright/observe
+ */
+
+import type { PlaywrightPage } from './types.ts'
+
+/** How long the page gets to answer the observation probe. */
+export const OBSERVE_TIMEOUT_MS = 5_000
+
+/** Most controls the report will list; the counts always stay complete. */
+export const OBSERVE_CONTROL_LIMIT = 150
+
+/**
+ * One control the planner could act on.
+ *
+ * @property kind - `button`, `link`, `checkbox`, `radio`, `select`, `textarea`,
+ *   `submit`, or the element's own role.
+ * @property label - its accessible-ish name: aria-label, value, associated
+ *   label text, or its own text.
+ * @property host - `self` (the control is laid out), `label` (it is not, but the
+ *   `<label>` that controls it is — this is how a hidden checkbox is really
+ *   clicked), or `hidden` (neither, so a plain click cannot reach it).
+ * @property state - comma-separated flags: `checked`, `unchecked`, `disabled`,
+ *   `aria-disabled`, `required`, `expanded=true|false`, and `covered` when the
+ *   control is laid out but something else is on top of it (so a click aimed at
+ *   it would land elsewhere).
+ */
+export interface ObservedControl {
+  kind: string
+  label: string
+  host: string
+  state: string
+}
+
+/** What one observation found. */
+export interface Observation {
+  url: string
+  title: string
+  textHead: string
+  counts: Record<string, number>
+  controlsTotal: number
+  controls: ObservedControl[]
+}
+
+/**
+ * The in-page collector. Exported so tests can run the real script against real
+ * markup rather than assert against a copy of it.
+ */
+export const OBSERVE_SCRIPT = `(() => {
+  const laidOut = (el) => { const box = el.getBoundingClientRect(); return box.width > 0 && box.height > 0 };
+  const labelHostOf = (el) => {
+    if (el.closest === undefined) return null;
+    const id = el.getAttribute('id');
+    try { return el.closest('label') || (id ? document.querySelector('label[for="' + id.replace(/["\\\\]/g, '') + '"]') : null) } catch (error) { return null }
+  };
+  // A hidden checkbox has no text of its own - the words that say what it is
+  // agreeing to live in the label around it, which is also the thing a person
+  // clicks. Reading only the element's own text is what makes a page look like
+  // it says nothing; reading its own value attribute is worse, because an untagged
+  // checkbox carries the literal string "on".
+  const nameOf = (el) => {
+    const tag = el.tagName;
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const candidates = [el.getAttribute('aria-label')];
+    if (tag === 'INPUT' && (type === 'submit' || type === 'button' || type === 'reset')) candidates.push(el.value);
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') {
+      candidates.push(el.getAttribute('placeholder'));
+      const host = labelHostOf(el);
+      if (host !== null) candidates.push(host.textContent);
+    }
+    candidates.push(el.textContent);
+    for (const candidate of candidates) {
+      const text = String(candidate || '').trim();
+      if (text !== '') return text.replace(/\\s+/g, ' ').slice(0, 60);
+    }
+    return '';
+  };
+  // Only a real label forwards a click to its control; an arbitrary parent
+  // does not, so an unlaid-out input outside a label is simply not reachable.
+  const hostOf = (el) => {
+    if (laidOut(el)) return 'self';
+    const host = labelHostOf(el);
+    return host !== null && laidOut(host) ? 'label' : 'hidden';
+  };
+  const kindOf = (el) => {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    if (tag === 'input') return type === '' ? 'input' : type;
+    if (tag === 'a') return 'link';
+    if (role !== '') return role;
+    return tag;
+  };
+  const stateOf = (el) => {
+    const out = [];
+    if (el.disabled === true) out.push('disabled');
+    if (el.getAttribute('aria-disabled') === 'true') out.push('aria-disabled');
+    if (el.required === true) out.push('required');
+    const kind = kindOf(el);
+    if (kind === 'checkbox' || kind === 'radio') out.push(el.checked === true ? 'checked' : 'unchecked');
+    const expanded = el.getAttribute('aria-expanded');
+    if (expanded !== null) out.push('expanded=' + expanded);
+    return out.join(', ');
+  };
+  // Laid out is not the same as clickable: a styled overlay swallows the click
+  // while the element still measures fine (measured on the same gate, whose
+  // checkbox inputs report a box yet time out under an actionability-checked
+  // click). Asking the document what is actually at the centre says so.
+  const coverageOf = (el) => {
+    if (!laidOut(el)) return '';
+    const box = el.getBoundingClientRect();
+    let at = null;
+    try { at = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2) } catch (error) { at = null }
+    if (at === null) return '';
+    return at === el || el.contains(at) ? '' : 'covered';
+  };
+  const SELECTOR = 'input, select, textarea, button, [role="button"], [role="checkbox"], [role="radio"], [role="tab"], a[href]';
+  let nodes = [];
+  try { nodes = Array.prototype.slice.call(document.querySelectorAll(SELECTOR)) } catch (error) { nodes = [] }
+  const seen = nodes.map((el) => {
+    const state = [stateOf(el), coverageOf(el)].filter((part) => part !== '').join(', ');
+    return { kind: kindOf(el), label: nameOf(el), host: hostOf(el), state: state };
+  });
+  const named = seen.filter((entry) => entry.label !== '');
+  const reachable = named.filter((entry) => entry.host !== 'hidden');
+  const ordered = reachable.concat(named.filter((entry) => entry.host === 'hidden'));
+  const body = document.body;
+  const inner = body === null ? '' : body.innerText;
+  const text = typeof inner === 'string' && inner !== '' ? inner : (body === null ? '' : (body.textContent || ''));
+  const count = (predicate) => seen.filter(predicate).length;
+  return {
+    url: location.href,
+    title: document.title,
+    textHead: text.replace(/\\s+/g, ' ').trim().slice(0, 600),
+    counts: {
+      controls: seen.length,
+      reachable: reachable.length,
+      buttons: count((entry) => entry.kind === 'button' || entry.kind === 'submit'),
+      links: count((entry) => entry.kind === 'link'),
+      checkboxes: count((entry) => entry.kind === 'checkbox'),
+      uncheckedCheckboxes: count((entry) => entry.kind === 'checkbox' && entry.state.indexOf('unchecked') >= 0),
+      selects: count((entry) => entry.kind === 'select'),
+      forms: document.querySelectorAll('form').length,
+      iframes: document.querySelectorAll('iframe').length,
+    },
+    controlsTotal: ordered.length,
+    controls: ordered.slice(0, ${String(OBSERVE_CONTROL_LIMIT)}),
+  };
+})()`
+
+/** Settle `work`, or give up after `ms`. Mirrors the consent probe's budget. */
+function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { resolve(TIMED_OUT) }, ms)
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
+}
+
+/** Sentinel for {@link raceTimeout}. */
+const TIMED_OUT = Symbol('observe-timeout')
+
+/**
+ * Read the page's actionable state.
+ *
+ * @param page - the page the fetch just settled.
+ * @param timeoutMs - budget for the probe.
+ * @returns the observation, or null when the page cannot be asked or did not
+ *   answer (observe mode is the whole point of the fetch, so the caller treats
+ *   null as a failure rather than as an empty page).
+ */
+export async function observePage(
+  page: PlaywrightPage,
+  timeoutMs: number = OBSERVE_TIMEOUT_MS,
+): Promise<Observation | null> {
+  const evaluate = page.evaluate?.bind(page)
+  if (evaluate === undefined) return null
+  let answer: unknown
+  try {
+    answer = await raceTimeout(evaluate(OBSERVE_SCRIPT), Math.max(0, timeoutMs))
+  } catch {
+    return null
+  }
+  if (answer === TIMED_OUT || typeof answer !== 'object' || answer === null) return null
+  const shape = answer as Partial<Observation>
+  if (typeof shape.url !== 'string' || !Array.isArray(shape.controls)) return null
+  return {
+    url: shape.url,
+    title: typeof shape.title === 'string' ? shape.title : '',
+    textHead: typeof shape.textHead === 'string' ? shape.textHead : '',
+    counts: typeof shape.counts === 'object' && shape.counts !== null ? shape.counts : {},
+    controlsTotal: typeof shape.controlsTotal === 'number' ? shape.controlsTotal : shape.controls.length,
+    controls: shape.controls as ObservedControl[],
+  }
+}
+
+/** One `key value` pair, skipped when the count is missing. */
+function countOf(counts: Record<string, number>, key: string): number {
+  const value = counts[key]
+  return typeof value === 'number' ? value : 0
+}
+
+/**
+ * Render an observation as the text the caller receives.
+ *
+ * Plain lines rather than a table: the control list runs to a hundred entries on
+ * a busy page, and column alignment would cost more than it explains.
+ *
+ * @param observation - what {@link observePage} read.
+ * @returns the report, counts first because they are what a precondition hides in.
+ */
+export function renderObservation(observation: Observation): string {
+  const lines: string[] = []
+  lines.push(`# Page state: ${observation.title === '' ? '(untitled)' : observation.title}`)
+  lines.push('')
+  lines.push(`URL: ${observation.url}`)
+  const counts = observation.counts
+  const unchecked = countOf(counts, 'uncheckedCheckboxes')
+  lines.push(
+    `Counts: controls ${String(countOf(counts, 'controls'))} (reachable ${String(countOf(counts, 'reachable'))})` +
+      `, buttons ${String(countOf(counts, 'buttons'))}, links ${String(countOf(counts, 'links'))}` +
+      `, checkboxes ${String(countOf(counts, 'checkboxes'))} (unchecked ${String(unchecked)})` +
+      `, selects ${String(countOf(counts, 'selects'))}, forms ${String(countOf(counts, 'forms'))}` +
+      `, iframes ${String(countOf(counts, 'iframes'))}`,
+  )
+  if (observation.textHead !== '') {
+    lines.push('')
+    lines.push('Visible text (head):')
+    lines.push(`> ${observation.textHead}`)
+  }
+  lines.push('')
+  lines.push(`## Controls (${String(observation.controls.length)} of ${String(observation.controlsTotal)}; reachable first)`)
+  observation.controls.forEach((control, index) => {
+    const where = control.host === 'label' ? ' (visible as its label)' : control.host === 'hidden' ? ' (not visible)' : ''
+    const state = control.state === '' ? '' : ` - ${control.state}`
+    lines.push(`${String(index + 1)}. [${control.kind}] "${control.label}"${state}${where}`)
+  })
+  return lines.join('\n')
+}

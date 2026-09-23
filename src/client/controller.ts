@@ -35,6 +35,8 @@ export interface PlaywrightSettings {
   denoise?: boolean
   /** Whether a known consent banner is clicked away before reading. */
   dismissConsent?: boolean
+  /** Whether the fetch returns the page's actionable state instead of its text. */
+  observe?: boolean
   /** How many fetches may render at once (1–200); blank = backend default. */
   maxConcurrency?: number
   /**
@@ -97,6 +99,8 @@ export interface PlaywrightCardState extends CardShell {
   denoise: CardFieldState
   /** Consent-banner checkbox (draft 'true'/'false'). */
   dismissConsent: CardFieldState
+  /** Observe-mode checkbox (draft 'true'/'false'). */
+  observe: CardFieldState
   /** Concurrency input (draft decimal integer). */
   maxConcurrency: CardFieldState
   /** Challenge wait input (draft decimal integer of milliseconds). */
@@ -158,6 +162,7 @@ export class PlaywrightCardController {
         checkboxField('shareBrowserContext'),
         checkboxField('denoise'),
         checkboxField('dismissConsent'),
+        checkboxField('observe'),
         numberField('maxConcurrency', 1, 200),
         numberField('challengeWaitMs', 0, 60_000),
         textField('proxyServer'),
@@ -186,6 +191,7 @@ export class PlaywrightCardController {
       shareBrowserContext: this.form.field('shareBrowserContext'),
       denoise: this.form.field('denoise'),
       dismissConsent: this.form.field('dismissConsent'),
+      observe: this.form.field('observe'),
       maxConcurrency: this.form.field('maxConcurrency'),
       challengeWaitMs: this.form.field('challengeWaitMs'),
       proxyServer: this.form.field('proxyServer'),

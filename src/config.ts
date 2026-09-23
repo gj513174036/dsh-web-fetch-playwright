@@ -132,6 +132,17 @@ export interface Config {
    */
   dismissConsent?: boolean
   /**
+   * Whether the fetch returns the page's *actionable state* (reachable controls
+   * with their labels and states, counts, the head of the visible text) instead
+   * of denoised prose.
+   *
+   * A mode rather than a per-call argument because the fetch seam carries only a
+   * URL. Its purpose is meeting an unfamiliar page: it is how a precondition
+   * that no label mentions (five unchecked consents, a disabled submit) becomes
+   * visible before anything is clicked.
+   */
+  observe?: boolean
+  /**
    * Bounded wait (ms) for a Cloudflare challenge to clear naturally inside
    * the same page/context. `0` (or any config leaving this at 0) restores the
    * legacy behavior: the first response is final, no waiting — the A/B
@@ -234,6 +245,7 @@ export const Config: z<Config> = z.object({
   shareBrowserContext: z.boolean().default(true),
   denoise: z.boolean().default(true),
   dismissConsent: z.boolean().default(false),
+  observe: z.boolean().default(false),
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
   maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING),

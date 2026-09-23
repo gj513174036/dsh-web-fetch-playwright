@@ -186,6 +186,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -213,6 +214,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: false,
       dismissConsent: false,
+      observe: false,
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -234,6 +236,7 @@ describe('PlaywrightFetchProvider integration', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -302,6 +305,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -326,6 +330,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       shareBrowserContext: false, // isolated: preserves this suite's original stance
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -351,6 +356,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -378,6 +384,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       shareBrowserContext: false,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -404,6 +411,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 12_000,
       challengeRetries: 1,
     }))
@@ -434,6 +442,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       shareBrowserContext: false,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       challengeWaitMs: 12_000,
       challengeRetries: 1,
     }))
@@ -463,6 +472,7 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
       shareBrowserContext: true,
       denoise: true,
       dismissConsent: false,
+      observe: false,
       maxConcurrency: 4,
       ...over,
     })
