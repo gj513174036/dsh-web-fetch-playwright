@@ -154,10 +154,15 @@ export const CONSENT_CANDIDATES: readonly ConsentCandidate[] = [
  *   (also the outcome for a page that cannot be probed). A selector candidate
  *   reports its selector; the text candidate reports `text:"<label>"`.
  * @property problem - what went wrong, or null. Never fails the fetch.
+ * @property gate - whether the click came from the page-level signal, i.e. the
+ *   whole document was the gate rather than a box inside a page. Only a gate
+ *   click needs its outcome verified: a gate that ignores the click leaves the
+ *   caller reading the gate as if it were the page.
  */
 export interface ConsentOutcome {
   clicked: string | null
   problem: string | null
+  gate: boolean
 }
 
 /** Sentinel for {@link raceTimeout}, distinct from any page answer. */
@@ -177,14 +182,32 @@ const TIMED_OUT = Symbol('consent-timeout')
  * read — so a page with thousands of controls pays for a layout read only on
  * the few that could be a consent button.
  */
+/**
+ * The "this document IS the consent UI" test, shared by the dismissal script and
+ * the post-click probe so the two can never disagree about what a gate is.
+ */
+const GATE_TEST_SOURCE = `const consentWords = ${String(CONSENT_CONTEXT)};
+  const isConsentDocument = () => {
+    const body = document.body;
+    if (body === null) return false;
+    // innerText is the visible text and is what we want; jsdom (where the tests
+    // run) has no layout and no innerText, so fall back to textContent, a
+    // superset - which makes the "short page" test harder to pass, i.e. erring
+    // towards not clicking.
+    const inner = body.innerText;
+    const text = typeof inner === 'string' && inner !== '' ? inner : (body.textContent || '');
+    if (text.length >= 2000) return false;
+    return consentWords.test(location.href + ' ' + document.title);
+  };`
+
 export const DISMISS_SCRIPT = `(() => {
   const candidates = ${JSON.stringify(CONSENT_CANDIDATES)};
   const labels = ${JSON.stringify(ACCEPT_ALL_LABELS.map((label) => label.toLowerCase()))};
-  const context = ${String(CONSENT_CONTEXT)};
   const controls = ${JSON.stringify(CONTROLS)};
+  ${GATE_TEST_SOURCE}
   const isVisible = (el) => { const box = el.getBoundingClientRect(); return box.width > 0 && box.height > 0 };
   const labelOf = (el) => String((el.getAttribute('aria-label') || el.value || el.textContent) || '').trim().replace(/\\s+/g, ' ').toLowerCase();
-  const namesConsent = (el) => context.test([el.id || '', typeof el.className === 'string' ? el.className : '', el.getAttribute('aria-label') || ''].join(' '));
+  const namesConsent = (el) => consentWords.test([el.id || '', typeof el.className === 'string' ? el.className : '', el.getAttribute('aria-label') || ''].join(' '));
   const styleOf = (el) => { try { return el.ownerDocument.defaultView.getComputedStyle(el) } catch (error) { return null } };
   const inConsentContext = (el) => {
     let node = el;
@@ -197,47 +220,33 @@ export const DISMISS_SCRIPT = `(() => {
     }
     return false;
   };
-  // The fourth signal, for a full-page consent interstitial (measured on
-  // booking.com, whose gate is /pipl_consent.zh-cn.html titled 需您同意 with a
-  // bare <button>同意</button> that has no consent-named ancestor at all): the
-  // DOCUMENT is the consent UI, not a box inside a page. It only counts while
-  // the document is small, so a long content page that merely mentions consent
-  // in its URL or title cannot license a click.
-  const pageIsConsentUi = () => {
-    const body = document.body;
-    if (body === null) return false;
-    // innerText is the visible text and is what we want; jsdom (where the
-    // tests run) has no layout and no innerText, so fall back to textContent,
-    // a superset - which makes the "short page" test harder to pass, i.e.
-    // erring towards not clicking.
-    const inner = body.innerText;
-    const text = typeof inner === 'string' && inner !== '' ? inner : (body.textContent || '');
-    if (text.length >= 2000) return false;
-    return context.test(location.href + ' ' + document.title);
-  };
+  // The fourth signal (isConsentDocument, above) covers a full-page consent
+  // interstitial: measured on booking.com, whose gate is
+  // /pipl_consent.zh-cn.html titled 需您同意 with a bare <button>同意</button>
+  // that has no consent-named ancestor at all.
+  const gate = isConsentDocument();
   for (const candidate of candidates) {
     if (candidate.kind === 'selector') {
       let target = null;
       try { target = document.querySelector(candidate.selector) } catch (error) { continue }
       if (target === null || !isVisible(target)) continue;
-      try { target.click() } catch (error) { return { clicked: null, problem: candidate.selector + ': ' + String(error) } }
-      return { clicked: candidate.selector, problem: null };
+      try { target.click() } catch (error) { return { clicked: null, problem: candidate.selector + ': ' + String(error), gate: false } }
+      return { clicked: candidate.selector, problem: null, gate: false };
     }
     if (candidate.kind === 'text') {
       let found = [];
       try { found = document.querySelectorAll(controls) } catch (error) { continue }
-      const interstitial = pageIsConsentUi();
       for (const control of found) {
         const label = labelOf(control);
         if (label === '' || label.length > 40 || labels.indexOf(label) === -1) continue;
-        if (!interstitial && !inConsentContext(control)) continue;
+        if (!gate && !inConsentContext(control)) continue;
         if (!isVisible(control)) continue;
-        try { control.click() } catch (error) { return { clicked: null, problem: 'text "' + label + '": ' + String(error) } }
-        return { clicked: 'text:"' + label + '"', problem: null };
+        try { control.click() } catch (error) { return { clicked: null, problem: 'text "' + label + '": ' + String(error), gate: gate } }
+        return { clicked: 'text:"' + label + '"', problem: null, gate: gate };
       }
     }
   }
-  return { clicked: null, problem: null };
+  return { clicked: null, problem: null, gate: false };
 })()`
 
 /**
@@ -262,6 +271,40 @@ function raceTimeout<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_
 }
 
 /**
+ * Whether the document currently on screen is a consent gate.
+ *
+ * The dismissal used to treat "clicked" as "done": on a gate that ignores the
+ * click it went on to read the gate page as the result, which is the same
+ * silent-wrong-answer the action model forbids for its steps. The caller asks
+ * this after a gate click, so a gate that did not clear becomes a loud failure
+ * instead of a plausible-looking page.
+ */
+export const CONSENT_GATE_PROBE = `(() => {
+  ${GATE_TEST_SOURCE}
+  return isConsentDocument();
+})()`
+
+/**
+ * Ask the page whether it is still a consent gate.
+ *
+ * @param page - the page the fetch is reading.
+ * @param timeoutMs - budget for the probe.
+ * @returns true/false, or null when the page cannot be asked or did not answer
+ *   (an unanswerable page is never treated as a cleared gate).
+ */
+export async function isConsentGate(page: PlaywrightPage, timeoutMs: number = CONSENT_TIMEOUT_MS): Promise<boolean | null> {
+  const evaluate = page.evaluate?.bind(page)
+  if (evaluate === undefined) return null
+  try {
+    const answer = await raceTimeout(evaluate(CONSENT_GATE_PROBE), Math.max(0, timeoutMs))
+    if (answer === TIMED_OUT) return null
+    return answer === true
+  } catch {
+    return null
+  }
+}
+
+/**
  * Dismiss a consent banner on `page`, if one is showing.
  *
  * @param page - the page the fetch just loaded.
@@ -276,22 +319,23 @@ export async function dismissConsentBanner(
   // Bound first: the optional member is read once, and calling it through the
   // bind keeps the receiver real Playwright's implementation expects.
   const evaluate = page.evaluate?.bind(page)
-  if (evaluate === undefined) return { clicked: null, problem: null }
+  if (evaluate === undefined) return { clicked: null, problem: null, gate: false }
 
   let answer: unknown
   try {
     answer = await raceTimeout(evaluate(DISMISS_SCRIPT), Math.max(0, timeoutMs))
   } catch (error: unknown) {
-    return { clicked: null, problem: error instanceof Error ? error.message : String(error) }
+    return { clicked: null, problem: error instanceof Error ? error.message : String(error), gate: false }
   }
-  if (answer === TIMED_OUT) return { clicked: null, problem: `the page did not answer within ${String(timeoutMs)}ms` }
+  if (answer === TIMED_OUT) return { clicked: null, problem: `the page did not answer within ${String(timeoutMs)}ms`, gate: false }
   // A page handle that answers with something else (a fake, an exotic
   // backend) is read as "no banner" rather than as a failure.
-  if (typeof answer !== 'object' || answer === null) return { clicked: null, problem: null }
+  if (typeof answer !== 'object' || answer === null) return { clicked: null, problem: null, gate: false }
 
-  const { clicked, problem } = answer as { clicked?: unknown; problem?: unknown }
+  const { clicked, problem, gate } = answer as { clicked?: unknown; problem?: unknown; gate?: unknown }
   return {
     clicked: typeof clicked === 'string' ? clicked : null,
     problem: typeof problem === 'string' ? problem : null,
+    gate: gate === true,
   }
 }

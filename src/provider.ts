@@ -82,7 +82,7 @@ import { BrowserPool } from './browser-pool.ts'
 import type { BrowserPoolOptions } from './browser-pool.ts'
 import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown, stripNonContentHtml } from './markdown.ts'
-import { CONSENT_TIMEOUT_MS, dismissConsentBanner } from './consent.ts'
+import { CONSENT_TIMEOUT_MS, dismissConsentBanner, isConsentGate } from './consent.ts'
 import { parseLaunchArgs } from './launch-args.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightProxyOption, PlaywrightResponse, PlaywrightRoute } from './types.ts'
@@ -108,6 +108,17 @@ export const WEB_FETCH_CHALLENGE_CODE = 'WEB_FETCH_CHALLENGE'
  * and where it was resolved from, and never the password.
  */
 export const WEB_FETCH_PROXY_CODE = 'WEB_FETCH_PROXY'
+
+/**
+ * Error code for a consent gate that survived its own dismissal: a full-page
+ * consent interstitial was recognised and its accept control was clicked, and
+ * the document is *still* the gate — so the requested page was never reached.
+ *
+ * It exists because the alternative is worse: without it the fetch reads the
+ * gate and returns it as if it were the page. Opt-in by construction — the
+ * check only runs when `dismissConsent` is on and a gate click happened.
+ */
+export const WEB_FETCH_CONSENT_CODE = 'WEB_FETCH_CONSENT'
 
 /**
  * The one fact a user needs when a proxy meets the CDP backend: the proxy is
@@ -946,6 +957,17 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         finalUrl = page.url()
         const settled = tracker?.last() ?? null
         if (settled !== null && settled !== finalResponse) statusCode = settled.status()
+        // "Clicked" is not "done": a gate can ignore the click (measured on
+        // booking.com, whose 同意 button does nothing until its own
+        // preconditions hold). Reading the gate back as the page would be the
+        // silent-wrong-answer this project keeps paying for, so a gate that is
+        // still standing ends the fetch loudly instead.
+        if (consent.gate && (await isConsentGate(page, Math.min(CONSENT_TIMEOUT_MS, deadline.remainingMs()))) === true) {
+          throw new WebError(
+            `the consent gate did not clear after accepting it, so the requested page was not reached: ${finalUrl}`,
+            WEB_FETCH_CONSENT_CODE,
+          )
+        }
       }
     }
 

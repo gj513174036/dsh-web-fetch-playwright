@@ -9,7 +9,7 @@
  */
 import { JSDOM } from 'jsdom'
 import { describe, expect, it } from 'vitest'
-import { CONSENT_SELECTORS, CONSENT_TIMEOUT_MS, DISMISS_SCRIPT, dismissConsentBanner } from '../src/consent.ts'
+import { CONSENT_GATE_PROBE, CONSENT_SELECTORS, CONSENT_TIMEOUT_MS, DISMISS_SCRIPT, dismissConsentBanner } from '../src/consent.ts'
 import type { PlaywrightPage } from '../src/types.ts'
 
 /** A page whose only member is a scripted `evaluate`. */
@@ -24,7 +24,7 @@ describe('dismissConsentBanner', () => {
       sent = script
       return { clicked: null, problem: null }
     }))
-    expect(outcome).toEqual({ clicked: null, problem: null })
+    expect(outcome).toEqual({ clicked: null, problem: null, gate: false })
     // The script carries the whole ordered list, JSON-encoded.
     for (const selector of CONSENT_SELECTORS) expect(sent).toContain(JSON.stringify(selector))
     expect(sent.indexOf(JSON.stringify(CONSENT_SELECTORS[0]))).toBeLessThan(
@@ -34,12 +34,12 @@ describe('dismissConsentBanner', () => {
 
   it('reports the selector the page clicked', async () => {
     const outcome = await dismissConsentBanner(pageWith(async () => ({ clicked: '#truste-consent-button', problem: null })))
-    expect(outcome).toEqual({ clicked: '#truste-consent-button', problem: null })
+    expect(outcome).toEqual({ clicked: '#truste-consent-button', problem: null, gate: false })
   })
 
   it('reads a page that offered no banner as a no-op, not a problem', async () => {
     expect(await dismissConsentBanner(pageWith(async () => ({ clicked: null, problem: null }))))
-      .toEqual({ clicked: null, problem: null })
+      .toEqual({ clicked: null, problem: null, gate: false })
   })
 
   it('never throws when the page cannot run the probe', async () => {
@@ -53,15 +53,15 @@ describe('dismissConsentBanner', () => {
   it('never throws when the answer is not the shape it expects', async () => {
     // The challenge probe's fake evaluate answers a boolean; so does a handle
     // this module knows nothing about. Neither may be read as "clicked".
-    expect(await dismissConsentBanner(pageWith(async () => false))).toEqual({ clicked: null, problem: null })
-    expect(await dismissConsentBanner(pageWith(async () => null))).toEqual({ clicked: null, problem: null })
+    expect(await dismissConsentBanner(pageWith(async () => false))).toEqual({ clicked: null, problem: null, gate: false })
+    expect(await dismissConsentBanner(pageWith(async () => null))).toEqual({ clicked: null, problem: null, gate: false })
     expect(await dismissConsentBanner(pageWith(async () => ({ clicked: 42, problem: 7 }))))
-      .toEqual({ clicked: null, problem: null })
+      .toEqual({ clicked: null, problem: null, gate: false })
   })
 
   it('is a silent no-op on a page handle without `evaluate`', async () => {
     const outcome = await dismissConsentBanner({} as unknown as PlaywrightPage)
-    expect(outcome).toEqual({ clicked: null, problem: null })
+    expect(outcome).toEqual({ clicked: null, problem: null, gate: false })
   })
 
   it('gives up on a stalled probe instead of spending the fetch budget', async () => {
@@ -117,27 +117,27 @@ describe('DISMISS_SCRIPT', () => {
       '<div class="cookie-banner"><button id="onetrust-accept-btn-handler">Accept All</button>' +
         '<button>Accept All</button></div>',
     )
-    expect(answer).toEqual({ clicked: '#onetrust-accept-btn-handler', problem: null })
+    expect(answer).toEqual({ clicked: '#onetrust-accept-btn-handler', problem: null, gate: false })
   })
 
   it('clicks an unknown manager by its label inside consent UI', () => {
     const answer = run('<div class="cc-window cookie-notice"><button>Accept All</button></div>')
-    expect(answer).toEqual({ clicked: 'text:"accept all"', problem: null })
+    expect(answer).toEqual({ clicked: 'text:"accept all"', problem: null, gate: false })
   })
 
   it('accepts a Chinese label', () => {
     const answer = run('<div id="consent-dialog">同意我们使用 Cookie<button>全部接受</button></div>')
-    expect(answer).toEqual({ clicked: 'text:"全部接受"', problem: null })
+    expect(answer).toEqual({ clicked: 'text:"全部接受"', problem: null, gate: false })
   })
 
   it('reads the accessible name off a submit input', () => {
     const answer = run('<div role="dialog"><input type="submit" value="Allow all"></div>')
-    expect(answer).toEqual({ clicked: 'text:"allow all"', problem: null })
+    expect(answer).toEqual({ clicked: 'text:"allow all"', problem: null, gate: false })
   })
 
   it('takes a dialog as consent context on its own', () => {
     const answer = run('<div role="dialog"><button>I agree</button></div>')
-    expect(answer).toEqual({ clicked: 'text:"i agree"', problem: null })
+    expect(answer).toEqual({ clicked: 'text:"i agree"', problem: null, gate: false })
   })
 
   it('takes a fixed overlay as consent context on its own', () => {
@@ -145,7 +145,7 @@ describe('DISMISS_SCRIPT', () => {
       dom.window.getComputedStyle = ((el: Element) =>
         ({ position: el.hasAttribute('data-overlay') ? 'fixed' : 'static' })) as unknown as typeof dom.window.getComputedStyle
     })
-    expect(answer).toEqual({ clicked: 'text:"accept all"', problem: null })
+    expect(answer).toEqual({ clicked: 'text:"accept all"', problem: null, gate: false })
   })
 
   it('refuses a label that only looks like consent', () => {
@@ -170,7 +170,7 @@ describe('DISMISS_SCRIPT', () => {
   })
 
   it('is a no-op on a page with no banner', () => {
-    expect(run('<main><p>Just an article.</p></main>')).toEqual({ clicked: null, problem: null })
+    expect(run('<main><p>Just an article.</p></main>')).toEqual({ clicked: null, problem: null, gate: false })
   })
 
   it('clicks the accept control of a full-page consent interstitial', () => {
@@ -184,7 +184,7 @@ describe('DISMISS_SCRIPT', () => {
       'https://www.example.com/pipl_consent.zh-cn.html?target_page=%2F',
       '需您同意',
     )
-    expect(answer).toEqual({ clicked: 'text:"同意"', problem: null })
+    expect(answer).toEqual({ clicked: 'text:"同意"', problem: null, gate: true })
   })
 
   it('clicks a bare Accept/Agree on a consent page', () => {
@@ -215,5 +215,26 @@ describe('DISMISS_SCRIPT', () => {
     })
     expect(answer.clicked).toBeNull()
     expect(answer.problem).toContain('detached')
+  })
+})
+
+describe('CONSENT_GATE_PROBE', () => {
+  const probe = (html: string, url = 'https://example.com/', title = ''): boolean => {
+    const head = title === '' ? '' : `<title>${title}</title>`
+    const dom = new JSDOM(`<!doctype html><html><head>${head}</head><body>${html}</body></html>`, {
+      runScripts: 'outside-only',
+      url,
+    })
+    return dom.window.eval(CONSENT_GATE_PROBE) as boolean
+  }
+
+  it('recognises the document that the dismissal clicked through', () => {
+    expect(probe('<p>需您同意</p>', 'https://example.com/pipl_consent.zh-cn.html', '需您同意')).toBe(true)
+    expect(probe('<p>cookies</p>', 'https://example.com/', 'Consent')).toBe(true)
+  })
+
+  it('does not call a long page or an unrelated one a gate', () => {
+    expect(probe(`<p>${'内容。'.repeat(900)}</p>`, 'https://example.com/consent')).toBe(false)
+    expect(probe('<p>hello</p>')).toBe(false)
   })
 })

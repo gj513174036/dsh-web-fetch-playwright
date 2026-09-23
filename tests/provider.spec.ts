@@ -249,6 +249,8 @@ interface FakePageSpec {
   evaluateResult?: unknown
   /** Make the fake's `evaluate` reject with this error. */
   evaluateError?: Error
+  /** Answers shifted once per `evaluate` call, before `evaluateResult` is used. */
+  evaluateQueue?: unknown[]
 }
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
@@ -369,6 +371,7 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
       evaluate: async (): Promise<unknown> => {
         noteRead()
         if (spec.evaluateError !== undefined) throw spec.evaluateError
+        if (spec.evaluateQueue !== undefined && spec.evaluateQueue.length > 0) return spec.evaluateQueue.shift()
         if (spec.evaluateResult !== undefined) return spec.evaluateResult
         return onChallenge()
       },
@@ -633,6 +636,34 @@ describe('PlaywrightFetchProvider', () => {
     expect(result.statusCode).toBe(200)
     expect(result.url).toBe('https://final.example.com/docs')
     expect((result.body as { content: string }).content).toContain('World')
+  })
+
+  it('dismissConsent on: a gate that does not clear fails the fetch loudly', async () => {
+    // The click landed but the gate is still there, so the page the caller asked
+    // for was never reached. Returning the gate as if it were the page is the
+    // silent-wrong-answer this check exists to prevent.
+    const code = await codeOf(
+      new FakeProvider({ dismissConsent: true }, {
+        evaluateQueue: [{ clicked: 'text:"同意"', problem: null, gate: true }, true],
+      }).fetch({ url: 'https://example.com/docs' }),
+    )
+    expect(code).toBe('WEB_FETCH_CONSENT')
+  })
+
+  it('dismissConsent on: a gate that clears is not an error', async () => {
+    const result = await new FakeProvider({ dismissConsent: true }, {
+      evaluateQueue: [{ clicked: 'text:"同意"', problem: null, gate: true }, false],
+    }).fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+  })
+
+  it('dismissConsent on: a banner click is never verified as a gate', async () => {
+    // Only a page-level click needs the gate re-check, so a banner dismissal
+    // must not spend a second probe or fail on one.
+    const result = await new FakeProvider({ dismissConsent: true }, {
+      evaluateResult: { clicked: '#onetrust-accept-btn-handler', problem: null, gate: false },
+    }).fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
   })
 
   it('dismissConsent on: a page handle without evaluate still fetches', async () => {
