@@ -11,6 +11,8 @@ prose.
 | `verify-check.json` | the `check` verb: reaching the gate's 1×1 consent checkboxes through the 897×20 `<label>` beside them, reading the state back, leaving a control that is already ticked alone, and naming every candidate when none can be checked | 0.2.20 |
 | `verify-click.json` | the `click` verb: an ordered candidate list (role / text / selector), reachability checked before the act, a Chinese and an English candidate each resolving on a real page, the wait after a click confirming it, `clicked (unverified)` when nothing follows, and every candidate being named when none can be clicked | 0.2.19 |
 
+Every `*.json` in this directory is parsed by the test suite (`tests/targets.spec.ts`), because a file the parser refuses makes **every** fetch fail, not just the URLs inside it — so a recipe that cannot be loaded cannot be committed.
+
 Point `targetsFile` at one file at a time. Both are deliberately chosen to be
 harmless: `example.com`, `baidu.com`'s own search button, and the IANA page that
 `example.com` links to. `verify-click-unreachable` is *meant* to fail — fetching
