@@ -37,6 +37,8 @@ export interface PlaywrightSettings {
   dismissConsent?: boolean
   /** Whether the fetch returns the page's actionable state instead of its text. */
   observe?: boolean
+  /** Path to the JSON targets file (blank = no targets). */
+  targetsFile?: string
   /** How many fetches may render at once (1–200); blank = backend default. */
   maxConcurrency?: number
   /**
@@ -101,6 +103,8 @@ export interface PlaywrightCardState extends CardShell {
   dismissConsent: CardFieldState
   /** Observe-mode checkbox (draft 'true'/'false'). */
   observe: CardFieldState
+  /** Targets-file path input. */
+  targetsFile: CardFieldState
   /** Concurrency input (draft decimal integer). */
   maxConcurrency: CardFieldState
   /** Challenge wait input (draft decimal integer of milliseconds). */
@@ -163,6 +167,7 @@ export class PlaywrightCardController {
         checkboxField('denoise'),
         checkboxField('dismissConsent'),
         checkboxField('observe'),
+        textField('targetsFile'),
         numberField('maxConcurrency', 1, 200),
         numberField('challengeWaitMs', 0, 60_000),
         textField('proxyServer'),
@@ -192,6 +197,7 @@ export class PlaywrightCardController {
       denoise: this.form.field('denoise'),
       dismissConsent: this.form.field('dismissConsent'),
       observe: this.form.field('observe'),
+      targetsFile: this.form.field('targetsFile'),
       maxConcurrency: this.form.field('maxConcurrency'),
       challengeWaitMs: this.form.field('challengeWaitMs'),
       proxyServer: this.form.field('proxyServer'),

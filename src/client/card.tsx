@@ -251,6 +251,19 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onEdit={(text) => { props.edit('denoise', text) }}
         onReset={() => { props.resetField('denoise') }}
       />
+      <ValueField
+        id="plugin-config-playwright-targets-file"
+        label={t('targetsFile')}
+        hint={t('targetsFileHint')}
+        placeholder={t('targetsFilePlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.targetsFile}
+        onEdit={(text) => { props.edit('targetsFile', text) }}
+        onReset={() => { props.resetField('targetsFile') }}
+      />
       <CheckboxField
         id="plugin-config-playwright-observe"
         label={t('observe')}

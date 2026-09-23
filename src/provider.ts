@@ -84,6 +84,9 @@ import { CdpConnectionPool } from './cdp-pool.ts'
 import { htmlToMarkdown, stripNonContentHtml } from './markdown.ts'
 import { CONSENT_TIMEOUT_MS, dismissConsentBanner, isConsentGate } from './consent.ts'
 import { OBSERVE_TIMEOUT_MS, observePage, renderObservation } from './observe.ts'
+import { runTargetActions, renderActionSummary } from './actions.ts'
+import { selectTarget } from './targets.ts'
+import { loadTargets } from './target-store.ts'
 import { parseLaunchArgs } from './launch-args.ts'
 import { resolveCdpBackend, resolvePlaywrightBackend } from './playwright-resolve.ts'
 import type { PlaywrightBrowser, PlaywrightContext, PlaywrightPage, PlaywrightPersistentContext, PlaywrightProxyOption, PlaywrightResponse, PlaywrightRoute } from './types.ts'
@@ -120,6 +123,20 @@ export const WEB_FETCH_PROXY_CODE = 'WEB_FETCH_PROXY'
  * check only runs when `dismissConsent` is on and a gate click happened.
  */
 export const WEB_FETCH_CONSENT_CODE = 'WEB_FETCH_CONSENT'
+
+/**
+ * Error code for an unusable targets file: missing, unreadable, not JSON, or
+ * naming a target ambiguously. The message carries the JSON path of the problem,
+ * because the file is hand-edited.
+ */
+export const WEB_FETCH_TARGET_CODE = 'WEB_FETCH_TARGET'
+
+/**
+ * Error code for a target step that did not hold: the fetch stops rather than
+ * reading a document the target never reached, and the message names the step,
+ * the verb, what it was waiting for, and where the browser was.
+ */
+export const WEB_FETCH_ACTION_CODE = 'WEB_FETCH_ACTION'
 
 /**
  * The one fact a user needs when a proxy meets the CDP backend: the proxy is
@@ -183,6 +200,21 @@ const MAX_BODY_CHARS = 100_000
  * so the budget pays for markup that can actually become markdown.
  */
 const MAX_PIPELINE_INPUT_CHARS = 2_000_000
+
+/**
+ * Put the action summary at the top of the body.
+ *
+ * The result shape is closed (ADR-0003), so the body is the only place a caller
+ * can learn that a recipe ran and which document it ended on. When no target ran
+ * there is nothing to say and the body is untouched.
+ *
+ * @param content - the body the fetch produced.
+ * @param summary - the summary line, or null when no target ran.
+ * @returns the body, with the summary first when there is one.
+ */
+function withActionSummary(content: string, summary: string | null): string {
+  return summary === null ? content : `${summary}\n\n${content}`
+}
 
 /**
  * Shrink rendered HTML to the denoise pipeline's input budget.
@@ -869,7 +901,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // Feature switch: 0 keeps the exact legacy (pre-0.2.5) behavior — the
     // first response decides, no waiting — an escape hatch and the A/B
     // baseline every test proves the bug against.
-    const tracker = challengeWaitMs > 0 || config.dismissConsent === true ? trackMainFrameResponses(page) : undefined
+    // Response tracking is what lets the result describe the document the fetch
+    // ends on; targets and consent can both move the browser after the first
+    // response, so either of them needs it too.
+    const tracksResponses = challengeWaitMs > 0 || config.dismissConsent === true || (config.targetsFile ?? '') !== ''
+    const tracker = tracksResponses ? trackMainFrameResponses(page) : undefined
     let response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
     tracker?.seed(response)
 
@@ -972,6 +1008,31 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       }
     }
 
+    // Targets: a named recipe for this URL, if the file names one. Selection is
+    // by URL alone — the fetch seam carries nothing else — and no match is the
+    // ordinary case, not an error. A step that does not hold stops the fetch;
+    // read on for the summary line that says what ran.
+    let actionSummary: string | null = null
+    if ((config.targetsFile ?? '') !== '') {
+      const loaded = await loadTargets(config.targetsFile ?? '')
+      if (!loaded.ok) throw new WebError(loaded.error, WEB_FETCH_TARGET_CODE)
+      const selection = selectTarget(loaded.targets, url.toString())
+      if (!selection.ok) throw new WebError(selection.error, WEB_FETCH_TARGET_CODE)
+      if (selection.target !== null) {
+        const outcome = await runTargetActions(page, selection.target, { remainingMs: () => deadline.remainingMs() })
+        if (!outcome.ok) {
+          throw new WebError(
+            `target "${selection.target.name}" step ${String(outcome.failure.index + 1)} (${outcome.failure.verb}) did not hold: ${outcome.failure.detail} — at ${outcome.failure.url}`,
+            WEB_FETCH_ACTION_CODE,
+          )
+        }
+        finalUrl = page.url()
+        const settled = tracker?.last() ?? null
+        if (settled !== null && settled !== finalResponse) statusCode = settled.status()
+        actionSummary = renderActionSummary({ ...outcome.run, finalUrl }, statusCode)
+      }
+    }
+
     // Observe mode *is* the fetch: the caller asked for the page's actionable
     // state, so denoised prose would be the wrong answer even though producing
     // it would succeed. Failing loudly when the state cannot be read is the same
@@ -984,18 +1045,18 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
           'WEB_PROVIDER_ERROR',
         )
       }
-      return capResult(finalUrl, statusCode, { kind: 'text', content: renderObservation(observation) })
+      return capResult(finalUrl, statusCode, { kind: 'text', content: withActionSummary(renderObservation(observation), actionSummary) })
     }
 
     const html = await page.content()
     if (!config.denoise) {
       // The tool layer's own turndown renders raw HTML; the checkbox only
       // governs the Readability/DOMPurify stage this provider owns.
-      return capResult(finalUrl, statusCode, { kind: 'html', content: html })
+      return capResult(finalUrl, statusCode, { kind: 'html', content: withActionSummary(html, actionSummary) })
     }
     const bounded = boundPipelineInput(html)
     const { markdown } = htmlToMarkdown(bounded.input, finalUrl)
-    const result = capResult(finalUrl, statusCode, { kind: 'text', content: markdown })
+    const result = capResult(finalUrl, statusCode, { kind: 'text', content: withActionSummary(markdown, actionSummary) })
     return bounded.cut
       ? { ...result, truncated: true }
       : result

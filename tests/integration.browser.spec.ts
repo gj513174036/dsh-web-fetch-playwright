@@ -187,6 +187,7 @@ describe('PlaywrightFetchProvider integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -215,6 +216,7 @@ describe('PlaywrightFetchProvider integration', () => {
       denoise: false,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -237,6 +239,7 @@ describe('PlaywrightFetchProvider integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -306,6 +309,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -331,6 +335,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -357,6 +362,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -385,6 +391,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))
@@ -412,6 +419,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 12_000,
       challengeRetries: 1,
     }))
@@ -443,6 +451,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 12_000,
       challengeRetries: 1,
     }))
@@ -473,6 +482,7 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       maxConcurrency: 4,
       ...over,
     })

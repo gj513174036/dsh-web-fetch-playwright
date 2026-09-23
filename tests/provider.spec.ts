@@ -9,7 +9,7 @@
  * aborts) — and the outbound proxy: launch-option injection, the
  * WEB_FETCH_PROXY mapping, password redaction, and the CDP refusal.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -203,6 +203,7 @@ function resolvedConfig(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
     denoise: true,
     dismissConsent: false,
     observe: false,
+    targetsFile: '',
     maxConcurrency: 4,
     challengeWaitMs: 0,
     challengeRetries: 0,
@@ -422,6 +423,7 @@ class FakeProvider extends PlaywrightFetchProvider {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       maxConcurrency: 4,
       // Legacy default: the challenge path stays off unless a test opts in.
       challengeWaitMs: 0,
@@ -454,6 +456,7 @@ class GatedProvider extends PlaywrightFetchProvider {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
@@ -702,6 +705,74 @@ describe('PlaywrightFetchProvider', () => {
     expect(code).toBe('WEB_PROVIDER_ERROR')
   })
 
+  /** Write a targets file into a fresh temp directory and return its path. */
+  function writeTargets(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-targets-'))
+    const file = join(dir, 'targets.json')
+    writeFileSync(file, contents, 'utf8')
+    return file
+  }
+
+  const targetFor = (url: string, actions: string, name = 'docs'): string =>
+    writeTargets(`{ "targets": [ { "name": "${name}", "match": { "kind": "prefix", "url": "${url}" }, "actions": [${actions}] } ] }`)
+
+  const waitText = (text: string): string => `{ "verb": "waitFor", "condition": { "kind": "text", "text": "${text}" } }`
+
+  it('runs the target whose URL matches and says so at the top of the body', async () => {
+    const targetsFile = targetFor('https://example.com/docs', waitText('World'))
+    const result = await new FakeProvider({ targetsFile }, { evaluateResult: true }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('> actions: ')).toBe(true)
+    expect(content).toContain('1. waitFor text "World" — met')
+    expect(content).toContain('final document https://final.example.com/docs (HTTP 200)')
+    // The article still follows the summary.
+    expect(content).toContain('World')
+  })
+
+  it('selects on the URL that was asked for, not the one it redirected to', async () => {
+    // The caller's URL is the key; where the site sends the browser afterwards is
+    // not known until the fetch has already happened.
+    const targetsFile = targetFor('https://final.example.com/docs', waitText('World'))
+    const result = await new FakeProvider({ targetsFile }, { evaluateResult: true }).fetch({ url: 'https://example.com/docs' })
+    expect((result.body as { content: string }).content.startsWith('> actions: ')).toBe(false)
+  })
+
+  it('leaves a page that matches no target exactly as it was', async () => {
+    const targetsFile = targetFor('https://other.example.com/', waitText('World'))
+    const result = await new FakeProvider({ targetsFile }, { evaluateResult: true }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('> actions: ')).toBe(false)
+    expect(content).not.toContain('waitFor')
+  })
+
+  it('fails loudly when a step does not hold, instead of reading the page anyway', async () => {
+    // This is the mapping the provider owes: a step that did not hold stops the
+    // fetch. The timing half (a condition that is simply never true waits out the
+    // step ceiling before this same failure) belongs to the runner's suite, so
+    // this uses the path that fails at once: a page with no scripting seam.
+    const targetsFile = targetFor('https://example.com/docs', waitText('never there'))
+    const code = await codeOf(new FakeProvider({ targetsFile }, { noEvaluate: true }).fetch({ url: 'https://example.com/docs' }))
+    expect(code).toBe('WEB_FETCH_ACTION')
+  })
+
+  it('rejects an unusable targets file', async () => {
+    expect(await codeOf(new FakeProvider({ targetsFile: writeTargets('{ not json }') }, {}).fetch({ url: 'https://example.com/docs' }))).toBe('WEB_FETCH_TARGET')
+    expect(await codeOf(new FakeProvider({ targetsFile: writeTargets('{ "targets": [] }')[0] + 'x' }, {}).fetch({ url: 'https://example.com/docs' }))).toBe('WEB_FETCH_TARGET')
+  })
+
+  it('rejects a missing targets file', async () => {
+    const code = await codeOf(new FakeProvider({ targetsFile: join(tmpdir(), 'dsh-targets-missing', 'none.json') }, {}).fetch({ url: 'https://example.com/docs' }))
+    expect(code).toBe('WEB_FETCH_TARGET')
+  })
+
+  it('rejects a file that names two equally specific targets', async () => {
+    const contents = `{ "targets": [
+      { "name": "a", "match": { "kind": "prefix", "url": "https://example.com/docs" }, "actions": [${waitText('World')}] },
+      { "name": "b", "match": { "kind": "prefix", "url": "https://example.com/docs" }, "actions": [${waitText('World')}] } ] }`
+    const code = await codeOf(new FakeProvider({ targetsFile: writeTargets(contents) }, {}).fetch({ url: 'https://example.com/docs' }))
+    expect(code).toBe('WEB_FETCH_TARGET')
+  })
+
   it('decodes non-html text bodies verbatim', async () => {
     const result = await new FakeProvider({}, { contentType: 'application/json', textBody: '{"ok":true}' })
       .fetch({ url: 'https://example.com/api' })
@@ -874,6 +945,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -906,6 +978,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -930,6 +1003,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -964,6 +1038,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -987,6 +1062,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1016,6 +1092,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }), pool)
@@ -1047,6 +1124,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       denoise: true,
       dismissConsent: false,
       observe: false,
+      targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
     }))

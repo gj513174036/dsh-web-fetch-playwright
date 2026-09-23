@@ -143,6 +143,16 @@ export interface Config {
    */
   observe?: boolean
   /**
+   * Path to the JSON targets file: named recipes that tell a URL which actions to
+   * run before its document is read.
+   *
+   * An explicit path rather than something workspace-relative, because the
+   * provider only knows the process working directory — not the session's
+   * workspace — and a recipe that silently fails to load would be worse than one
+   * that names its file.
+   */
+  targetsFile?: string
+  /**
    * Bounded wait (ms) for a Cloudflare challenge to clear naturally inside
    * the same page/context. `0` (or any config leaving this at 0) restores the
    * legacy behavior: the first response is final, no waiting — the A/B
@@ -246,6 +256,7 @@ export const Config: z<Config> = z.object({
   denoise: z.boolean().default(true),
   dismissConsent: z.boolean().default(false),
   observe: z.boolean().default(false),
+  targetsFile: z.string().default(''),
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
   maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING),
