@@ -17,8 +17,14 @@
  *   *prototype's* setter moves the tracker's feet, which is what makes the
  *   `input` event that follows mean something.
  * - **Announce it.** `input` and `change`, bubbling, which is what listeners and
- *   form libraries act on. Nothing here presses keys: a page that needs real key
- *   events needs a `press` verb, and that is its own ticket.
+ *   form libraries act on. Plain `Event`s, not `InputEvent`s: frameworks listen
+ *   for the name, and an `InputEvent` would have to claim an `inputType` for a
+ *   keystroke that never happened. Nothing here presses keys at all — a page that
+ *   needs real key events needs a `press` verb, and that is its own ticket.
+ *
+ * A field that is not an `input` (a `contenteditable`, a custom `role="textbox"`)
+ * is written by replacing its text content, which is the closest thing to "the
+ * value" that element has.
  *
  * Then it reads the field back, after a frame, for the same reason `check` does:
  * a controlled component can take the change and then re-render the old value,
