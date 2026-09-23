@@ -253,7 +253,20 @@ interface FakePageSpec {
   evaluateError?: Error
   /** Answers shifted once per `evaluate` call, before `evaluateResult` is used. */
   evaluateQueue?: unknown[]
+  /**
+   * The page this fake's click opens: when the click script runs, the popup
+   * listeners fire with it, exactly as a `target="_blank"` link would.
+   */
+  popup?: PlaywrightPage
 }
+
+/** The page an `opensPage` step opens: enough prose for the extractor. */
+const RESULT_HTML = `<!doctype html><html><head><title>Results</title></head><body>
+<main><article><h1>The opened page</h1>
+<p>The result table only exists on the page this fetch adopted, which is the whole point of the capability under test.</p>
+<p>A second paragraph so the article extractor locks onto the main content region.</p>
+</article></main>
+</body></html>`
 
 const ARTICLE_HTML = `<!doctype html><html><head><title>Fake page</title></head><body>
 <nav>nav noise</nav>
@@ -373,8 +386,13 @@ function makeFakePage(spec: FakePageSpec, state: FakePageState, popupListeners: 
       else responseListeners.push(listener as (response: PlaywrightResponse) => void)
     },
     ...(spec.noEvaluate === true ? {} : {
-      evaluate: async (): Promise<unknown> => {
+      evaluate: async (script: string): Promise<unknown> => {
         noteRead()
+        // A click that opens a page: the listeners fire while the act runs, which
+        // is when a real popup arrives.
+        if (spec.popup !== undefined && script.includes('const watch = ')) {
+          for (const listener of [...popupListeners]) listener(spec.popup)
+        }
         if (spec.evaluateError !== undefined) throw spec.evaluateError
         if (spec.evaluateQueue !== undefined && spec.evaluateQueue.length > 0) return spec.evaluateQueue.shift()
         if (spec.evaluateResult !== undefined) return spec.evaluateResult
@@ -899,6 +917,28 @@ describe('PlaywrightFetchProvider', () => {
     expect(message).toContain('at https://final.example.com/docs')
   })
 
+  it('adopts the page an `opensPage` step opens, and closes it with the fetch', async () => {
+    const targetsFile = targetFor('https://example.com/docs', '{ "verb": "click", "candidates": [ { "selector": "#go" } ], "opensPage": true }, ' + waitText('Result'))
+    const popupState = { pageClosed: false, gotos: 0, waits: 0 }
+    const popup = makeFakePage(
+      // Its own scripting seam too: the steps after the click run *here*.
+      { finalUrl: 'https://results.example/list', html: RESULT_HTML, evaluateResult: true },
+      popupState,
+    )
+    const provider = new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, candidate: 'selector "#go" -> link' }, true],
+      popup,
+    })
+    const result = await provider.fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    // The document read, and the URL reported, are the opened page's.
+    expect(result.url).toBe('https://results.example/list')
+    expect(content).toContain('The opened page')
+    expect(content).toContain('it opened a page')
+    // And the tab it opened does not outlive the fetch.
+    expect(popupState.pageClosed).toBe(true)
+  })
+
   it('records an optional step that was skipped, and still reads the page', async () => {
     const targetsFile = targetFor('https://example.com/docs', `${clickText('关闭广告', true)}, ${waitText('World')}`)
     const result = await new FakeProvider({ targetsFile }, {
@@ -1270,6 +1310,9 @@ describe('PlaywrightFetchProvider CDP backend', () => {
     const popupState = { pageClosed: false, gotos: 0, waits: 0 }
     const popup = makeFakePage({}, popupState)
     for (const listener of state.popupListeners) listener(popup) // page spawned a popup
+    // The close waits one tick, so a target step that is adopting the page can
+    // claim it first; nobody did, so it is closed.
+    await new Promise((resolve) => setTimeout(resolve, 0))
     expect(popupState.pageClosed).toBe(true)
   })
 

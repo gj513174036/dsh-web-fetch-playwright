@@ -368,6 +368,61 @@ describe('runTargetActions, the state condition', () => {
   })
 })
 
+describe('runTargetActions, a step that opens a page', () => {
+  const openedPage = (url: string): PlaywrightPage =>
+    ({ url: () => url, evaluate: async () => true }) as unknown as PlaywrightPage
+
+  /** A page whose click opens `opened`, the way a `target="_blank"` link does. */
+  function openerPage(opened: PlaywrightPage | null): PlaywrightPage {
+    return {
+      url: () => 'https://a.example/search',
+      evaluate: async (script: string) => (script.includes('const watch = ') ? { ok: true, candidate: 'selector "#go" -> link' } : true),
+      on: (event: string, listener: (page: PlaywrightPage) => void) => {
+        if (event === 'popup' && opened !== null) queueMicrotask(() => listener(opened))
+      },
+    } as unknown as PlaywrightPage
+  }
+
+  const opener = { verb: 'click', candidates: [{ kind: 'selector', selector: '#go' }], opensPage: true } as const
+
+  it('continues on the page the click opened, and hands it back', async () => {
+    const opened = openedPage('https://b.example/results')
+    const claimed: PlaywrightPage[] = []
+    const outcome = await runTargetActions(
+      openerPage(opened),
+      target(opener, text('结果')),
+      { ...options, claimPage: (page) => claimed.push(page) },
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    // The run ended on the opened page, and said so.
+    expect(outcome.page).toBe(opened)
+    expect(outcome.run.finalUrl).toBe('https://b.example/results')
+    expect(outcome.run.steps[0]?.detail).toContain('it opened a page')
+    // Claimed before anything else could close it as a stray tab.
+    expect(claimed).toEqual([opened])
+    // A page appearing is the click's effect, so the step is not "unverified".
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['clicked', 'met'])
+  })
+
+  it('fails loudly when the step expects a page and none opens', async () => {
+    const outcome = await runTargetActions(openerPage(null), target(opener), options)
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.verb).toBe('click')
+    expect(failure.detail).toContain('the step expects a page to open, and none did')
+    expect(failure.url).toBe('https://a.example/search')
+  })
+
+  it('leaves a step that does not expect a page alone', async () => {
+    // The same page, the same popup — and a step that did not ask for one keeps
+    // reading where it stands (the guard's business, not the runner's).
+    const outcome = await runTargetActions(openerPage(openedPage('https://b.example/x')), target(click({ kind: 'selector', selector: '#go' }), text('结果')), options)
+    expect(outcome.ok && outcome.run.finalUrl).toBe('https://a.example/search')
+    expect(outcome.ok && outcome.page.url()).toBe('https://a.example/search')
+  })
+})
+
 describe('runTargetActions, the check verb', () => {
   it('reports the state the page ended in, and whether the step had to act for it', async () => {
     const acted = await runTargetActions(

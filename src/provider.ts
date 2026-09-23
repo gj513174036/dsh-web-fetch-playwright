@@ -290,6 +290,12 @@ export interface BrowserSession {
    * + HAR export) on every exit path.
    */
   recorder?: NetworkRecorder
+  /**
+   * Pages this fetch adopted because a target step opened them (`opensPage`).
+   * They are ordinary tabs of the same context; in profile mode nothing else
+   * would close them, so {@link closeSession} does.
+   */
+  adoptedPages?: PlaywrightPage[]
 }
 
 /**
@@ -801,7 +807,6 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         // context (profile mode), whose persistent logins then apply.
         const lease = await this.cdpPool.acquire(endpoint, timeout, effectiveContextMode(config))
         await installResourceFilter(lease.page)
-        guardPopups(lease.page)
         return {
           browser: lease.browser,
           context: lease.context,
@@ -827,7 +832,6 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       try {
         const lease = await this.managedPool.acquire(launch, timeout, 'shared')
         await installResourceFilter(lease.page)
-        guardPopups(lease.page)
         return {
           browser: lease.browser,
           context: lease.context,
@@ -871,7 +875,6 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       const context = await create()
       const page = await context.newPage()
       await installResourceFilter(page)
-      guardPopups(page)
       return { browser, context, page }
     } catch (error: unknown) {
       // A partial setup (browser launched, then newContext/newPage failed)
@@ -915,6 +918,20 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // response, so either of them needs it too.
     const tracksResponses = challengeWaitMs > 0 || config.dismissConsent === true || targetsFile !== ''
     const tracker = tracksResponses ? trackMainFrameResponses(page) : undefined
+    // Pages an act opens: the guard leaves the one a target adopts alone (and
+    // closes every other), the adopted page's own responses are tracked so the
+    // result can describe it, and teardown closes it with the fetch.
+    const adopted: PlaywrightPage[] = []
+    const adoptedSet = new Set<PlaywrightPage>()
+    const openedTrackers = new Map<PlaywrightPage, MainFrameTracker | undefined>()
+    const claimPage = (popup: PlaywrightPage): void => {
+      if (adoptedSet.has(popup)) return
+      adoptedSet.add(popup)
+      adopted.push(popup)
+      openedTrackers.set(popup, tracksResponses ? trackMainFrameResponses(popup) : undefined)
+    }
+    guardPopups(page, popup => adoptedSet.has(popup))
+    session.adoptedPages = adopted
     let response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
     tracker?.seed(response)
 
@@ -984,6 +1001,9 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       }
     }
 
+    // The page whose document this fetch will read and describe: the one it
+    // navigated to, unless a target step opened another and continued there.
+    let documentPage = page
     let finalUrl = page.url()
     // An SPA-style clear swaps the document without navigating: no new
     // response exists to report, so the cleared document reads as served.
@@ -997,10 +1017,10 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
      * and status are the honest ones to report.
      */
     const settledDocument = (): { url: string; statusCode: number } => {
-      const settled = tracker?.last() ?? null
+      const settled = (openedTrackers.get(documentPage) ?? tracker)?.last() ?? null
       return settled !== null && settled !== finalResponse
-        ? { url: page.url(), statusCode: settled.status() }
-        : { url: page.url(), statusCode }
+        ? { url: documentPage.url(), statusCode: settled.status() }
+        : { url: documentPage.url(), statusCode }
     }
 
     // Non-HTML decodes straight from the response body; no denoise applies.
@@ -1054,7 +1074,10 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // fetch; the summary line below says what did run.
     let actionSummary: string | null = null
     if (selectedTarget !== null) {
-      const outcome = await runTargetActions(page, selectedTarget, { remainingMs: () => deadline.remainingMs() })
+      const outcome = await runTargetActions(page, selectedTarget, {
+        remainingMs: () => deadline.remainingMs(),
+        claimPage,
+      })
       if (!outcome.ok) {
         throw new WebError(
           `target "${selectedTarget.name}" step ${String(outcome.failure.index + 1)} (${outcome.failure.verb}) did not hold: ${outcome.failure.detail} — at ${outcome.failure.url}`,
@@ -1065,8 +1088,9 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       // satisfied by the URL alone — so let the navigation land before
       // re-describing the result. Bounded, and only when a click actually went
       // out: a recipe of waits alone must behave exactly as it did before.
+      documentPage = outcome.page
       if (outcome.run.clicked) {
-        await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
+        await documentPage.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
       }
       const settled = settledDocument()
       finalUrl = settled.url
@@ -1079,7 +1103,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // it would succeed. Failing loudly when the state cannot be read is the same
     // rule the rest of this file follows.
     if (config.observe === true) {
-      const observation = await observePage(page, Math.min(OBSERVE_TIMEOUT_MS, deadline.remainingMs()))
+      const observation = await observePage(documentPage, Math.min(OBSERVE_TIMEOUT_MS, deadline.remainingMs()))
       if (observation === null) {
         throw new WebError(
           'observe mode could not read the page state (the page handle offers no scripting, or the page did not answer)',
@@ -1089,7 +1113,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
       return capResult(finalUrl, statusCode, { kind: 'text', content: withActionSummary(renderObservation(observation), actionSummary, 'text') })
     }
 
-    const html = await page.content()
+    const html = await documentPage.content()
     if (!config.denoise) {
       // The tool layer's own turndown renders raw HTML; the checkbox only
       // governs the Readability/DOMPurify stage this provider owns.
@@ -1264,6 +1288,9 @@ async function closeSession(session: BrowserSession | undefined): Promise<void> 
   // that is mid-flight. `finish()` is idempotent, so the abort listener and
   // the fetch's own finally may both call it safely.
   if (session.recorder !== undefined) await session.recorder.finish()
+  // The pages a target adopted are this fetch's tabs: in profile mode nothing
+  // else would close them.
+  for (const adopted of session.adoptedPages ?? []) await closeWithGrace(adopted)
   await closeWithGrace(session.page)
   if (session.persistent !== true) await closeWithGrace(session.context)
   if (session.sharedBrowser !== true) await closeWithGrace(session.browser)
@@ -1354,9 +1381,21 @@ async function installResourceFilter(owner: {
  * profile mode a stray tab would stay in the user's remote browser.
  * Best-effort: a page that refuses listeners just loses the guard.
  */
-function guardPopups(page: PlaywrightPage): void {
+function guardPopups(page: PlaywrightPage, isClaimed?: (popup: PlaywrightPage) => boolean): void {
   try {
-    page.on?.('popup', popup => { void popup.close().catch(() => {}) })
+    page.on?.('popup', popup => {
+      if (isClaimed === undefined) {
+        void popup.close().catch(() => {})
+        return
+      }
+      // A target may adopt this page: the step's waiter is a listener on the
+      // same event, registered after this one, so the close waits a tick for
+      // that claim. A page nobody claims is still closed, exactly as before.
+      setTimeout(() => {
+        if (isClaimed(popup)) return
+        void popup.close().catch(() => {})
+      }, 0)
+    })
   } catch {
     // keep going without the guard
   }

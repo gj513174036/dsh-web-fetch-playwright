@@ -15,6 +15,7 @@ it does. A recipe whose reasoning is not written down cannot be reviewed.
 | File | What it proves | Which plugin version it needs |
 | --- | --- | --- |
 | `verify.json` | URL selection, the action summary, a step that does not hold failing loudly, a non-document body being refused, and the per-fetch re-read of the file (edit it between two fetches and the second one sees the change) | 0.2.18 |
+| `nmpa-datasearch.json` | the NMPA 数据查询 register (ticket #10): a dataset tile, a keyword, a submit that answers **in a new tab** — the recipe marks it `"opensPage": true`, so the run adopts the tab and the fetch reads the result table from it. Observation: `nmpa-datasearch.observation.md` | 0.2.25 |
 | `tga-artg.json` | the first recipe produced by *freezing a discovery* (ticket #9): the keyword `vitamin d` typed into the TGA's ARTG search and submitted, with `tga-artg.observation.md` committed next to it | 0.2.23 |
 | `verify-type.json` | the `type` verb: writing into bing's own search box and letting its own submit carry the value (the results URL proves the page held it), plus a recipe whose candidates are all untypable, so the failure names each one | 0.2.23 |
 | `verify-state.json` | the `state` condition: the gate's opening state (`all unchecked` over its five boxes), then `check` and `all checked`; and a w3schools recipe whose optional condition is *not* met, so a run of it shows the condition failing without failing the fetch | 0.2.21 |

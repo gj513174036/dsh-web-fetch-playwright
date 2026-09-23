@@ -190,6 +190,17 @@ describe('parseTargets', () => {
     })
   })
 
+  it('reads a click that expects a page to open', () => {
+    const click = `{ "verb": "click", "candidates": [ { "text": "商品标题" } ], "opensPage": true }`
+    expect(targetsOf(file(click))[0]?.actions[0]).toEqual({
+      verb: 'click',
+      candidates: [{ kind: 'text', text: '商品标题' }],
+      opensPage: true,
+    })
+    expect(errorOf(file('{ "verb": "click", "candidates": [ { "text": "x" } ], "opensPage": "yes" }'))).toContain('.opensPage: expected a boolean')
+    expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "time", "ms": 1 }, "opensPage": true }'))).toContain('unknown key "opensPage"')
+  })
+
   it('keeps `optional` available on a click, since a popup may or may not be there', () => {
     const click = `{ "verb": "click", "candidates": [ { "text": "关闭" } ], "optional": true }`
     expect(targetsOf(file(click))[0]?.actions[0]).toEqual({ verb: 'click', candidates: [{ kind: 'text', text: '关闭' }], optional: true })

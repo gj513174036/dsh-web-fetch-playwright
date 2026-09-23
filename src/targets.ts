@@ -81,6 +81,15 @@ export interface ClickStep {
   readonly verb: 'click'
   /** Tried in order; the first reachable one is clicked, and the rest are not. */
   readonly candidates: readonly Candidate[]
+  /**
+   * The click is expected to open a page of its own — a `target="_blank"` link, a
+   * `window.open` — and the rest of the target (and the fetch) continue on it.
+   *
+   * A step that says this and opens nothing fails: staying on the page it was
+   * already on is the silent wrong answer, and reading that page as if it were
+   * the result is exactly what this plugin refuses to do.
+   */
+  readonly opensPage?: boolean
   /** When true, failing this step is skipped and recorded instead of fatal. */
   readonly optional?: boolean
 }
@@ -440,13 +449,24 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
     return { step: optional.optional ? { verb, condition: parsed.condition, optional: true } : { verb, condition: parsed.condition } }
   }
   if (verb === 'click') {
-    const unknown = unknownKeys(value, ['verb', 'candidates', 'optional'], path)
+    const unknown = unknownKeys(value, ['verb', 'candidates', 'optional', 'opensPage'], path)
     if (unknown !== null) return { error: unknown }
     const candidates = parseCandidates(value['candidates'], path, `a ${verb}`)
     if ('error' in candidates) return { error: candidates.error }
+    const opensPage = value['opensPage']
+    if (opensPage !== undefined && typeof opensPage !== 'boolean') {
+      return { error: `${at(path)}.opensPage: expected a boolean` }
+    }
     const optional = parseOptional(value['optional'], path)
     if ('error' in optional) return { error: optional.error }
-    return { step: optional.optional ? { verb, candidates: candidates.parsed, optional: true } : { verb, candidates: candidates.parsed } }
+    const step = { verb, candidates: candidates.parsed } as const
+    return {
+      step: {
+        ...step,
+        ...(opensPage === true ? { opensPage: true } : {}),
+        ...(optional.optional ? { optional: true } : {}),
+      },
+    }
   }
   if (verb === 'check') {
     const unknown = unknownKeys(value, ['verb', 'candidates', 'state', 'optional'], path)

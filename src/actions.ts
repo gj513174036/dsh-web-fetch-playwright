@@ -77,8 +77,19 @@ export interface ActionFailure {
   readonly url: string
 }
 
-/** A run's result: the reports, or the step that did not hold. */
-export type ActionOutcome = { readonly ok: true; readonly run: ActionRun } | { readonly ok: false; readonly failure: ActionFailure }
+/** A run's result: the reports and the page it ended on, or the step that did not hold. */
+export type ActionOutcome =
+  | {
+      readonly ok: true
+      readonly run: ActionRun
+      /**
+       * The page the run ended on — the one it started on, or the page an
+       * `opensPage` step opened and the rest of the target ran in. The caller
+       * reads *this* document, and reports its URL and status.
+       */
+      readonly page: PlaywrightPage
+    }
+  | { readonly ok: false; readonly failure: ActionFailure }
 
 /** Options a run needs from its caller. */
 export interface ActionOptions {
@@ -86,6 +97,12 @@ export interface ActionOptions {
   readonly remainingMs: () => number
   readonly stepCeilingMs?: number
   readonly pollMs?: number
+  /**
+   * Take responsibility for a page an act opened: the caller stops treating it as
+   * a stray tab and closes it with the fetch. Called at most once per step, and
+   * only while the step is waiting.
+   */
+  readonly claimPage?: (page: PlaywrightPage) => void
 }
 
 /** A short description of a condition, for the summary and for failures. */
@@ -194,6 +211,46 @@ function confirmingWaitAfter(actions: readonly ActionStep[], index: number): { i
 }
 
 /**
+ * Wait for the page an act is about to open.
+ *
+ * The listener goes on **before** the act, because the page can open while the
+ * click is still in flight; the first page to arrive is claimed, so the caller's
+ * popup guard leaves it alone instead of closing it as a stray tab. A page that
+ * refuses listeners answers `null` here, which the step reports as "no page
+ * opened" — it cannot be awaited, so it cannot be adopted.
+ *
+ * @param page - the page the act is about to run on.
+ * @param timeoutMs - how long to wait for the page to appear.
+ * @param pollMs - how often to look.
+ * @param claim - told about the page that arrived, before anything else touches it.
+ * @returns the page, or null when none opened in time.
+ */
+async function awaitOpenedPage(
+  page: PlaywrightPage,
+  timeoutMs: number,
+  pollMs: number,
+  claim?: (page: PlaywrightPage) => void,
+): Promise<PlaywrightPage | null> {
+  let opened: PlaywrightPage | null = null
+  let waiting = true
+  try {
+    page.on?.('popup', (popup) => {
+      // Only while this step is waiting: a stray tab later in the run is the
+      // guard's to close, not this step's to adopt.
+      if (!waiting || opened !== null) return
+      opened = popup
+      claim?.(popup)
+    })
+  } catch {
+    return null
+  }
+  const startedAt = Date.now()
+  while (opened === null && Date.now() - startedAt < timeoutMs) await sleep(pollMs)
+  waiting = false
+  return opened
+}
+
+/**
  * Does a URL condition already hold, read from the URL the page is on?
  *
  * The half of "did it already hold before the click" that needs no scripting: a
@@ -220,18 +277,24 @@ export async function runTargetActions(
 ): Promise<ActionOutcome> {
   const ceiling = options.stepCeilingMs ?? STEP_CEILING_MS
   const poll = options.pollMs ?? POLL_MS
-  const evaluate = page.evaluate?.bind(page)
+  // The page the run is working on. An `opensPage` step replaces it: everything
+  // after that step — the rest of the recipe, and the document the fetch reads —
+  // belongs to the page the act opened.
+  let current = page
   const reports: StepReport[] = []
   // What the confirming condition was at click time, per click step: a wait that
   // already held cannot be evidence that the click changed anything. `null`
   // means the state could not be read, which is not the same as "it held".
   const heldBeforeClick = new Map<number, boolean | null>()
+  // Clicks whose effect is visible without a later wait: a page appeared.
+  const openedPageAt = new Set<number>()
 
   for (const [index, step] of target.actions.entries()) {
     const budget = Math.max(0, Math.min(ceiling, options.remainingMs()))
+    const evaluate = current.evaluate?.bind(current)
     const failure = (detail: string): ActionOutcome => ({
       ok: false,
-      failure: { index, verb: step.verb, detail, url: page.url() },
+      failure: { index, verb: step.verb, detail, url: current.url() },
     })
     /**
      * A step that did not get there. An `optional` one is recorded as skipped and
@@ -250,13 +313,14 @@ export async function runTargetActions(
     if (step.verb === 'click') {
       const candidates = describeCandidates(step)
       const detail = `candidates: ${candidates}`
+      const startedAtClick = Date.now()
       if (budget === 0) {
         const stopped = endStep(`${detail} (only 0ms of the step budget is left)`)
         if (stopped !== null) return stopped
         continue
       }
       const confirming = confirmingWaitAfter(target.actions, index)
-      const urlBefore = page.url()
+      const urlBefore = current.url()
       if (confirming !== null && confirming.step.condition.kind === 'url') {
         heldBeforeClick.set(index, urlConditionHeld(urlBefore, confirming.step.condition))
       }
@@ -268,12 +332,30 @@ export async function runTargetActions(
         const read = await readState(evaluate, confirming.step.condition.candidates, confirming.step.condition.state, budget)
         heldBeforeClick.set(index, read?.held ?? null)
       }
-      const outcome = await clickCandidate(page, step.candidates, budget, confirming?.step.condition)
+      // Registered before the act: the page can open while the click is in
+      // flight, and a listener added afterwards would miss it.
+      const opened = step.opensPage === true
+        ? awaitOpenedPage(current, Math.max(1, budget - (Date.now() - startedAtClick)), poll, options.claimPage)
+        : null
+      const outcome = await clickCandidate(current, step.candidates, budget, confirming?.step.condition)
       if (outcome.kind === 'clicked') {
         // The script answers for a text watch; a URL watch was answered above,
         // and the script's `null` must not erase that answer.
         heldBeforeClick.set(index, outcome.before ?? heldBeforeClick.get(index) ?? null)
-        reports.push({ index, verb: step.verb, detail: outcome.candidate, outcome: 'clicked' })
+        const adopted = opened === null ? null : await opened
+        if (opened !== null && adopted === null) {
+          // It said a page would open and none did: staying put is the silent
+          // wrong answer, so the step fails instead of reading where it stands.
+          const stopped = endStep(`${outcome.candidate} (the step expects a page to open, and none did)`)
+          if (stopped !== null) return stopped
+          continue
+        }
+        if (adopted !== null) {
+          current = adopted
+          openedPageAt.add(index)
+        }
+        const landed = adopted === null ? outcome.candidate : `${outcome.candidate} (it opened a page; the rest of the target runs there)`
+        reports.push({ index, verb: step.verb, detail: landed, outcome: 'clicked' })
         continue
       }
       if (outcome.kind === 'clicked-unreported') {
@@ -282,10 +364,23 @@ export async function runTargetActions(
         // that moved is independent evidence the page changed, so a following
         // wait may judge the click; on the same URL nothing here can show a text
         // wait changed, so the click must not borrow its credit.
-        if (confirming !== null && confirming.step.condition.kind === 'text' && page.url() === urlBefore) {
+        if (confirming !== null && confirming.step.condition.kind === 'text' && current.url() === urlBefore) {
           heldBeforeClick.set(index, true)
         }
-        reports.push({ index, verb: step.verb, detail: 'a candidate (the page navigated before it could say which)', outcome: 'clicked' })
+        const adopted = opened === null ? null : await opened
+        if (opened !== null && adopted === null) {
+          const stopped = endStep('a candidate (the page navigated before it could say which) (the step expects a page to open, and none did)')
+          if (stopped !== null) return stopped
+          continue
+        }
+        if (adopted !== null) {
+          current = adopted
+          openedPageAt.add(index)
+        }
+        const landed = adopted === null
+          ? 'a candidate (the page navigated before it could say which)'
+          : 'a candidate (the page navigated before it could say which) (it opened a page; the rest of the target runs there)'
+        reports.push({ index, verb: step.verb, detail: landed, outcome: 'clicked' })
         continue
       }
       const stopped = endStep(describeClickFailure(detail, candidates, outcome))
@@ -301,7 +396,7 @@ export async function runTargetActions(
         if (stopped !== null) return stopped
         continue
       }
-      const outcome = await typeInto(page, step.candidates, step.value, budget)
+      const outcome = await typeInto(current, step.candidates, step.value, budget)
       if (outcome.kind === 'typed') {
         // The read-back is the verdict, and `was` says whether it replaced
         // something — a field the recipe filled from empty reads differently from
@@ -329,7 +424,7 @@ export async function runTargetActions(
         if (stopped !== null) return stopped
         continue
       }
-      const outcome = await checkControl(page, step.candidates, step.state, budget)
+      const outcome = await checkControl(current, step.candidates, step.state, budget)
       if (outcome.kind === 'checked') {
         // The verdict is the read-back, not the click: `acted` separates the
         // step that had to do something from the idempotent one, and both report
@@ -361,7 +456,7 @@ export async function runTargetActions(
       held = true
     } else {
       for (;;) {
-        const state = await conditionHolds(page.url(), step.condition, evaluate, budget - (Date.now() - startedAt)).catch(() => null)
+        const state = await conditionHolds(current.url(), step.condition, evaluate, budget - (Date.now() - startedAt)).catch(() => null)
         if (state === null) {
           unanswerable = true
           break
@@ -398,6 +493,8 @@ export async function runTargetActions(
   // click. Deciding it here, once, keeps the verdict out of the verb's own code.
   const marked = reports.map((report) => {
     if (report.outcome !== 'clicked') return report
+    // A page opened: the act's effect is visible without waiting for one.
+    if (openedPageAt.has(report.index)) return report
     const confirming = confirmingWaitAfter(target.actions, report.index)
     const confirmed =
       confirming !== null &&
@@ -406,7 +503,7 @@ export async function runTargetActions(
     return confirmed ? report : { ...report, outcome: 'unverified' as const }
   })
   const clicked = marked.some((report) => report.verb === 'click' && report.outcome !== 'skipped')
-  return { ok: true, run: { steps: marked, finalUrl: page.url(), clicked } }
+  return { ok: true, run: { steps: marked, finalUrl: current.url(), clicked }, page: current }
 }
 
 /**

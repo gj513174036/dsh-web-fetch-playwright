@@ -66,6 +66,11 @@ _Avoid_: compile, 编译
 Running a frozen target deterministically, with no planner in the loop.
 _Avoid_: B 方案
 
+**Adopted page(接管的页面)**:
+The page an action opened (a new tab) and the target continued on. It belongs to the fetch: the rest of the
+target runs there, the fetch reads and describes it, and it is closed with the fetch.
+_Avoid_: popup (that is the mechanism, not the thing), 新窗口
+
 **Observe(观察)**:
 Reading a page's state back so a planner can choose the next action. Replay does not need it.
 _Avoid_: inspect
