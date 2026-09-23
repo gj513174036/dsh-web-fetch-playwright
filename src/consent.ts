@@ -12,12 +12,18 @@
  * control.
  *
  * What makes a broad text rule safe is the context guard: the control must
- * already be part of something that looks like consent UI (a dialog, a
- * consent-named ancestor, or a fixed/sticky overlay). This is a deliberate
- * preference for missing a banner over clicking the wrong thing — an "Accept
- * all" button in the middle of a checkout form is not consent UI, and a wrong
- * click writes the user's *rejection* into their profile, which retrying
- * cannot undo.
+ * already be part of something that looks like consent UI. There are four ways
+ * to be, because consent UI comes in two shapes — a box inside a page (a
+ * dialog, a consent-named ancestor, a fixed/sticky overlay) and a whole page
+ * that IS the consent (a full-page interstitial, which has none of the first
+ * three). The fourth signal therefore reads the document itself — URL or title
+ * matching the consent vocabulary — and only while the document is short, so a
+ * long content page that merely mentions consent cannot license a click.
+ *
+ * This is a deliberate preference for missing a banner over clicking the wrong
+ * thing — an "Accept all" button in the middle of a checkout form is not
+ * consent UI, and a wrong click writes the user's *rejection* into their
+ * profile, which retrying cannot undo.
  *
  * Scope: the main frame only. Consent managers that render their banner inside
  * an iframe are not covered yet — this waits for a real site that does it,
@@ -94,6 +100,8 @@ export const ACCEPT_ALL_LABELS: readonly string[] = [
   '接受并继续',
   '同意并继续',
   '我同意',
+  '同意',
+  '接受',
   // English
   'accept all',
   'accept all cookies',
@@ -102,6 +110,8 @@ export const ACCEPT_ALL_LABELS: readonly string[] = [
   'allow all cookies',
   'agree to all',
   'i agree',
+  'accept',
+  'agree',
 ]
 
 /** One way to satisfy the consent intent. */
@@ -187,6 +197,24 @@ export const DISMISS_SCRIPT = `(() => {
     }
     return false;
   };
+  // The fourth signal, for a full-page consent interstitial (measured on
+  // booking.com, whose gate is /pipl_consent.zh-cn.html titled 需您同意 with a
+  // bare <button>同意</button> that has no consent-named ancestor at all): the
+  // DOCUMENT is the consent UI, not a box inside a page. It only counts while
+  // the document is small, so a long content page that merely mentions consent
+  // in its URL or title cannot license a click.
+  const pageIsConsentUi = () => {
+    const body = document.body;
+    if (body === null) return false;
+    // innerText is the visible text and is what we want; jsdom (where the
+    // tests run) has no layout and no innerText, so fall back to textContent,
+    // a superset - which makes the "short page" test harder to pass, i.e.
+    // erring towards not clicking.
+    const inner = body.innerText;
+    const text = typeof inner === 'string' && inner !== '' ? inner : (body.textContent || '');
+    if (text.length >= 2000) return false;
+    return context.test(location.href + ' ' + document.title);
+  };
   for (const candidate of candidates) {
     if (candidate.kind === 'selector') {
       let target = null;
@@ -198,10 +226,11 @@ export const DISMISS_SCRIPT = `(() => {
     if (candidate.kind === 'text') {
       let found = [];
       try { found = document.querySelectorAll(controls) } catch (error) { continue }
+      const interstitial = pageIsConsentUi();
       for (const control of found) {
         const label = labelOf(control);
         if (label === '' || label.length > 40 || labels.indexOf(label) === -1) continue;
-        if (!inConsentContext(control)) continue;
+        if (!interstitial && !inConsentContext(control)) continue;
         if (!isVisible(control)) continue;
         try { control.click() } catch (error) { return { clicked: null, problem: 'text "' + label + '": ' + String(error) } }
         return { clicked: 'text:"' + label + '"', problem: null };

@@ -624,6 +624,17 @@ describe('PlaywrightFetchProvider', () => {
     }
   })
 
+  it('dismissConsent on: a click that moves the document still reads it', async () => {
+    // A full-page consent interstitial is accepted and the browser is sent back
+    // to the page it interrupted: the fetch must read the settled document, not
+    // the gate it clicked through.
+    const result = await new FakeProvider({ dismissConsent: true }, { evaluateResult: { clicked: 'text:"同意"', problem: null } })
+      .fetch({ url: 'https://example.com/docs' })
+    expect(result.statusCode).toBe(200)
+    expect(result.url).toBe('https://final.example.com/docs')
+    expect((result.body as { content: string }).content).toContain('World')
+  })
+
   it('dismissConsent on: a page handle without evaluate still fetches', async () => {
     const result = await new FakeProvider({ dismissConsent: true }, { noEvaluate: true })
       .fetch({ url: 'https://example.com/docs' })

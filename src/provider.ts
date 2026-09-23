@@ -857,7 +857,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     // Feature switch: 0 keeps the exact legacy (pre-0.2.5) behavior — the
     // first response decides, no waiting — an escape hatch and the A/B
     // baseline every test proves the bug against.
-    const tracker = challengeWaitMs > 0 ? trackMainFrameResponses(page) : undefined
+    const tracker = challengeWaitMs > 0 || config.dismissConsent === true ? trackMainFrameResponses(page) : undefined
     let response = await page.goto(url.toString(), { waitUntil: 'domcontentloaded', timeout: deadline.remainingMs() })
     tracker?.seed(response)
 
@@ -907,11 +907,11 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     if (kind === undefined) {
       throw new WebError(`unsupported content type "${finalResponse?.headers()['content-type'] ?? 'unknown'}"`, 'WEB_UNSUPPORTED_CONTENT_TYPE')
     }
-    const finalUrl = page.url()
+    let finalUrl = page.url()
     // An SPA-style clear swaps the document without navigating: no new
     // response exists to report, so the cleared document reads as served.
     const clearedWithoutNavigation = challengeEntryResponse !== null && finalResponse === challengeEntryResponse
-    const statusCode = finalResponse !== null && !clearedWithoutNavigation ? finalResponse.status() : 200
+    let statusCode = finalResponse !== null && !clearedWithoutNavigation ? finalResponse.status() : 200
 
     // Non-HTML decodes straight from the response body; no denoise applies.
     if (kind === 'text') {
@@ -934,6 +934,18 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
         console.warn(
           `dsh-web-fetch-playwright: consent banner dismissal problem (the fetch is unaffected): ${consent.problem}`,
         )
+      }
+      // A full-page consent interstitial stands where the page should be: the
+      // click accepts it and the site sends the browser back to the page it
+      // interrupted — so the document about to be read is NOT the one this
+      // fetch arrived on. Let that navigation land and re-describe the result
+      // from the settled document, rather than reporting the interstitial's
+      // URL and status next to the accepted page's content.
+      if (consent.clicked !== null) {
+        await page.waitForLoadState('networkidle', { timeout: Math.min(SETTLE_MS, deadline.remainingMs()) }).catch(() => {})
+        finalUrl = page.url()
+        const settled = tracker?.last() ?? null
+        if (settled !== null && settled !== finalResponse) statusCode = settled.status()
       }
     }
 

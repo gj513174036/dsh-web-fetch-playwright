@@ -90,10 +90,11 @@ describe('DISMISS_SCRIPT', () => {
     problem: string | null
   }
 
-  function run(html: string, tweak?: (dom: JSDOM) => void): Answer {
-    const dom = new JSDOM(`<!doctype html><html><body>${html}</body></html>`, {
+  function run(html: string, tweak?: (dom: JSDOM) => void, url = 'https://example.com/', title = ''): Answer {
+    const head = title === '' ? '' : `<title>${title}</title>`
+    const dom = new JSDOM(`<!doctype html><html><head>${head}</head><body>${html}</body></html>`, {
       runScripts: 'outside-only',
-      url: 'https://example.com/',
+      url,
     })
     dom.window.Element.prototype.getBoundingClientRect = (() => ({
       ...LAID_OUT,
@@ -170,6 +171,37 @@ describe('DISMISS_SCRIPT', () => {
 
   it('is a no-op on a page with no banner', () => {
     expect(run('<main><p>Just an article.</p></main>')).toEqual({ clicked: null, problem: null })
+  })
+
+  it('clicks the accept control of a full-page consent interstitial', () => {
+    // Measured shape: booking.com's gate is /pipl_consent.zh-cn.html titled
+    // 需您同意 with a bare <button>同意</button> that has no consent-named
+    // ancestor — none of the three box signals hold, so the fourth (the
+    // document IS the consent UI) is what has to carry it.
+    const answer = run(
+      '<p>我们使用 Cookie 为您提供更个性化的体验。</p><button>同意</button>',
+      undefined,
+      'https://www.example.com/pipl_consent.zh-cn.html?target_page=%2F',
+      '需您同意',
+    )
+    expect(answer).toEqual({ clicked: 'text:"同意"', problem: null })
+  })
+
+  it('clicks a bare Accept/Agree on a consent page', () => {
+    expect(run('<button>Accept</button>', undefined, 'https://example.com/cookie-notice', 'Consent').clicked).toBe('text:"accept"')
+    expect(run('<button>Agree</button>', undefined, 'https://example.com/privacy-gate', 'Before you continue').clicked).toBe('text:"agree"')
+  })
+
+  it('refuses the same button when the page is not a consent page', () => {
+    expect(run('<p>我们使用 Cookie。</p><button>同意</button>').clicked).toBeNull()
+    expect(run('<button>Accept</button>').clicked).toBeNull()
+  })
+
+  it('refuses a consent-looking URL on a long page', () => {
+    // The short-page half of the fourth signal: a content page that merely
+    // mentions consent in its URL must not license a click on any button.
+    const long = `<p>${'内容。'.repeat(900)}</p><button>同意</button>`
+    expect(run(long, undefined, 'https://example.com/consent-policy-explained').clicked).toBeNull()
   })
 
   it('reports a throwing click instead of swallowing it', () => {
