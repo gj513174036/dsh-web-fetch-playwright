@@ -1,0 +1,37 @@
+{
+  "targets": [
+    {
+      "name": "verify-check-booking-gate",
+      "match": { "kind": "prefix", "url": "https://www.booking.com/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "需您同意" } },
+        { "verb": "check", "candidates": [{ "kind": "text", "text": "全选" }], "state": "checked" },
+        { "verb": "check", "candidates": [{ "kind": "text", "text": "全选" }], "state": "checked" },
+        { "verb": "click", "candidates": [{ "kind": "text", "text": "同意" }] },
+        { "verb": "waitFor", "condition": { "kind": "url", "url": "https://www.booking.com/pipl_consent.zh-cn.html", "absent": true } }
+      ]
+    },
+    {
+      "name": "verify-check-w3schools",
+      "match": { "kind": "prefix", "url": "https://www.w3schools.com/html/html_forms.asp" },
+      "actions": [
+        { "verb": "check", "candidates": [{ "kind": "text", "text": "I have a bike" }] },
+        { "verb": "check", "candidates": [{ "kind": "text", "text": "I have a bike" }] }
+      ]
+    },
+    {
+      "name": "verify-check-unreachable",
+      "match": { "kind": "prefix", "url": "https://www.booking.com/pipl_consent.zh-cn.html" },
+      "actions": [
+        {
+          "verb": "check",
+          "candidates": [
+            { "selector": "#does-not-exist" },
+            { "text": "绝不存在的复选框" },
+            { "text": "同意" }
+          ]
+        }
+      ]
+    }
+  ]
+}

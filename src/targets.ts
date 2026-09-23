@@ -78,8 +78,26 @@ export interface ClickStep {
   readonly optional?: boolean
 }
 
+/**
+ * A step that puts a control into a state, and reads it back.
+ *
+ * Unlike `click`, this verb asserts its own effect: a state is something the
+ * page can be asked about, so the step passes only when the control *reports*
+ * the wanted state afterwards. Acting twice is safe — a control already in the
+ * wanted state is left alone rather than toggled back off.
+ */
+export interface CheckStep {
+  readonly verb: 'check'
+  /** Tried in order; the first reachable one is the control that is read and set. */
+  readonly candidates: readonly Candidate[]
+  /** The state the control has to end in; omitted means `"checked"`. */
+  readonly state: 'checked' | 'unchecked'
+  /** When true, failing this step is skipped and recorded instead of fatal. */
+  readonly optional?: boolean
+}
+
 /** One step of a recipe. */
-export type ActionStep = WaitStep | ClickStep
+export type ActionStep = WaitStep | ClickStep | CheckStep
 
 /** A named recipe for one page. */
 export interface Target {
@@ -335,6 +353,28 @@ function parseCandidate(value: unknown, path: string): { candidate: Candidate } 
   }
 }
 
+/**
+ * The candidate list a control-naming step carries.
+ *
+ * One place for the rules both `click` and `check` live by: at least one
+ * candidate, and every one of them well formed.
+ */
+function parseCandidates(value: unknown, path: string, verb: string): { parsed: Candidate[] } | { error: string } {
+  if (!Array.isArray(value)) {
+    return { error: `${at(path)}.candidates: expected an array of candidates, most precise first` }
+  }
+  if (value.length === 0) {
+    return { error: `${at(path)}.candidates: a ${verb} with no candidates can never match anything; give it one or remove the step` }
+  }
+  const parsed: Candidate[] = []
+  for (const [index, raw] of value.entries()) {
+    const candidate = parseCandidate(raw, `${path}.candidates[${String(index)}]`)
+    if ('error' in candidate) return { error: candidate.error }
+    parsed.push(candidate.candidate)
+  }
+  return { parsed }
+}
+
 function parseStep(value: unknown, path: string): { step: ActionStep } | { error: string } {
   if (!isRecord(value)) return { error: `${at(path)}: expected an object` }
   const verb = value['verb']
@@ -347,27 +387,25 @@ function parseStep(value: unknown, path: string): { step: ActionStep } | { error
     if ('error' in optional) return { error: optional.error }
     return { step: optional.optional ? { verb, condition: parsed.condition, optional: true } : { verb, condition: parsed.condition } }
   }
-  if (verb === 'click') {
-    const unknown = unknownKeys(value, ['verb', 'candidates', 'optional'], path)
+  if (verb === 'click' || verb === 'check') {
+    const allowed = verb === 'click' ? ['verb', 'candidates', 'optional'] : ['verb', 'candidates', 'state', 'optional']
+    const unknown = unknownKeys(value, allowed, path)
     if (unknown !== null) return { error: unknown }
-    const candidates = value['candidates']
-    if (!Array.isArray(candidates)) {
-      return { error: `${at(path)}.candidates: expected an array of candidates, most precise first` }
-    }
-    if (candidates.length === 0) {
-      return { error: `${at(path)}.candidates: a click with no candidates can never match anything; give it one or remove the step` }
-    }
-    const parsed: Candidate[] = []
-    for (const [index, raw] of candidates.entries()) {
-      const candidate = parseCandidate(raw, `${path}.candidates[${String(index)}]`)
-      if ('error' in candidate) return { error: candidate.error }
-      parsed.push(candidate.candidate)
-    }
+    const candidates = parseCandidates(value['candidates'], path, verb)
+    if ('error' in candidates) return { error: candidates.error }
     const optional = parseOptional(value['optional'], path)
     if ('error' in optional) return { error: optional.error }
-    return { step: optional.optional ? { verb, candidates: parsed, optional: true } : { verb, candidates: parsed } }
+    if (verb === 'click') {
+      return { step: optional.optional ? { verb, candidates: candidates.parsed, optional: true } : { verb, candidates: candidates.parsed } }
+    }
+    const state = value['state']
+    if (state !== undefined && state !== 'checked' && state !== 'unchecked') {
+      return { error: `${at(path)}.state: expected "checked" or "unchecked"` }
+    }
+    const wanted = state === 'unchecked' ? 'unchecked' : 'checked'
+    return { step: optional.optional ? { verb, candidates: candidates.parsed, state: wanted, optional: true } : { verb, candidates: candidates.parsed, state: wanted } }
   }
-  return { error: `${at(path)}.verb: expected "waitFor" or "click" (the other verbs are not implemented yet)` }
+  return { error: `${at(path)}.verb: expected "waitFor", "click" or "check" (the other verbs are not implemented yet)` }
 }
 
 function parseTarget(value: unknown, path: string): { target: Target } | { error: string } {

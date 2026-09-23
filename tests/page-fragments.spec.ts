@@ -36,7 +36,7 @@ describe('page fragments', () => {
   it('ships bundles that are self-contained', () => {
     // The failure this catches is the one that bit the extraction: a consumer
     // picked the fragments it thought it needed and named one it had left out.
-    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof reachabilityOf === "function"', '')).toBe(true)
+    expect(withFragments<boolean>(PAGE_FRAGMENTS, 'typeof laidOut === "function" && typeof labelHostOf === "function" && typeof hostOf === "function" && typeof accessibleNameOf === "function" && typeof coverageOf === "function" && typeof roleOf === "function" && typeof reachabilityOf === "function" && typeof matchesOf === "function" && typeof resolveCandidates === "function" && typeof checkedStateOf === "function"', '')).toBe(true)
     expect(withFragments<boolean>(DISMISS_FRAGMENTS, 'typeof isConsentDocument === "function" && typeof accessibleNameOf === "function"', '')).toBe(true)
   })
 
@@ -93,6 +93,30 @@ describe('page fragments', () => {
     })
   })
 
+  describe('hitTargetOf', () => {
+    it('falls back to the label when the control is laid out but covered', () => {
+      // Measured on booking.com's consent gate: the checkbox is 1x1 with the
+      // label's styled box drawn over it, so the control is "laid out" and still
+      // not something a person can hit. The label is the way in.
+      const html = '<input id="cb" type="checkbox"><label id="lab" for="cb"> 全选</label>'
+      const answer = withFragments<{ hit: string; host: string; reason: string }>(
+        PAGE_FRAGMENTS,
+        '(() => { const t = hitTargetOf(document.querySelector("#cb")); return { hit: t.hit === null ? "" : t.hit.id, host: t.host, reason: t.reason } })()',
+        html,
+        (dom) => {
+          const input = dom.window.document.getElementById('cb')
+          const label = dom.window.document.getElementById('lab')
+          const rect = (width: number, height: number, top: number): DOMRect => ({ width, height, top, left: 0, right: width, bottom: top + height, x: 0, y: top, toJSON: () => ({}) }) as DOMRect
+          if (input !== null) input.getBoundingClientRect = () => rect(1, 1, 0)
+          if (label !== null) label.getBoundingClientRect = () => rect(100, 20, 10)
+          const overlay = dom.window.document.createElement('div')
+          dom.window.document.elementFromPoint = ((_x: number, y: number) => (y < 10 ? overlay : label)) as unknown as Document['elementFromPoint']
+        },
+      )
+      expect(answer).toEqual({ hit: 'lab', host: 'label', reason: '' })
+    })
+  })
+
   describe('reachabilityOf', () => {
     it('says nothing for a control a person can hit', () => {
       expect(withFragments<string>(PAGE_FRAGMENTS, 'reachabilityOf(document.querySelector("button"))', '<button>go</button>')).toBe('')
@@ -119,6 +143,56 @@ describe('page fragments', () => {
         dom.window.document.elementFromPoint = (() => overlay) as unknown as Document['elementFromPoint']
       })
       expect(covered).toBe('covered')
+    })
+  })
+
+  describe('checkedStateOf', () => {
+    it('reads a form control’s state, and says nothing about controls that have none', () => {
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("input"))', '<input type="checkbox" checked>')).toBe('checked')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("input"))', '<input type="radio">')).toBe('unchecked')
+      // A text field's `checked` is false in the DOM; reporting that as
+      // "unchecked" would be a lie about a control that holds no such state.
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("input"))', '<input type="text">')).toBe('')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("button"))', '<button>go</button>')).toBe('')
+    })
+
+    it('reads what a custom control announces', () => {
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("div"))', '<div role="checkbox" aria-checked="true">x</div>')).toBe('checked')
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("div"))', '<div role="checkbox" aria-checked="false">x</div>')).toBe('unchecked')
+      // A toggle button says it with aria-pressed.
+      expect(withFragments<string>(PAGE_FRAGMENTS, 'checkedStateOf(document.querySelector("button"))', '<button aria-pressed="true">x</button>')).toBe('checked')
+    })
+  })
+
+  describe('resolveCandidates', () => {
+    const candidate = (text: string): string => JSON.stringify({ kind: 'text', text, label: `text "${text}"` })
+
+    it('takes the first candidate a person can act on, and reports the ones it passed over', () => {
+      const html = '<button id="a">查询</button><div><input id="b" type="checkbox"></div>'
+      const answer = withFragments<{ candidate: string | null; tried: string[] }>(
+        PAGE_FRAGMENTS,
+        `(() => { const found = resolveCandidates([${candidate('没有')}, ${candidate('查询')}]); return { candidate: found.candidate, tried: found.tried } })()`,
+        html,
+      )
+      expect(answer.candidate).toBe('text "查询"')
+      // The first candidate missed; the walk stopped at the first one that did
+      // not, and says why it went past the other.
+      expect(answer.tried).toEqual(['text "没有": no match'])
+    })
+
+    it('keeps walking past a control a verb cannot act on', () => {
+      // The gate's shape: the <label> carries the words, the checkbox holds the
+      // state. A verb that needs the state must not stop on the label.
+      const html = '<label id="all"><input id="cb" type="checkbox"> 全选</label>'
+      const answer = withFragments<{ control: string; hit: string; tried: string[] }>(
+        PAGE_FRAGMENTS,
+        `(() => { const found = resolveCandidates([${candidate('全选')}], (el) => checkedStateOf(el) === '' ? 'no state' : ''); return { control: found.control.id, hit: found.hit.id, tried: found.tried } })()`,
+        html,
+      )
+      expect(answer.control).toBe('cb')
+      // …and the act lands on the label, which is the part a person can click.
+      expect(answer.hit).toBe('all')
+      expect(answer.tried).toEqual([])
     })
   })
 

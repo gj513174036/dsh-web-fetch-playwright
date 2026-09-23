@@ -1,10 +1,11 @@
 /**
  * Running a target's actions.
  *
- * The runner is deliberately dull: for each step it either evaluates the step's
- * condition until it holds, or clicks the first reachable candidate; a step that
- * does not get there either fails the whole fetch (loudly, naming the step) or,
- * if it was declared `optional`, is skipped and recorded. Nothing here guesses
+ * The runner is deliberately dull: for each step it evaluates the step's condition
+ * until it holds, clicks the first reachable candidate, or puts the first
+ * reachable control into a state and reads it back; a step that does not get
+ * there either fails the whole fetch (loudly, naming the step) or, if it was
+ * declared `optional`, is skipped and recorded. Nothing here guesses
  * and nothing degrades quietly — the failure modes this project keeps paying for
  * are "it looked like it worked" and "it quietly did less".
  *
@@ -19,9 +20,10 @@
  */
 
 import type { PlaywrightPage } from './types.ts'
+import { checkControl } from './check.ts'
 import { clickCandidate } from './click.ts'
 import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
-import { describeCandidate, urlIsUnder, type ActionStep, type ClickStep, type Target, type WaitCondition, type WaitStep } from './targets.ts'
+import { describeCandidate, urlIsUnder, type ActionStep, type Candidate, type Target, type WaitCondition, type WaitStep } from './targets.ts'
 
 /** Longest one step may take, before the fetch's own remaining budget caps it. */
 export const STEP_CEILING_MS = 10_000
@@ -142,8 +144,8 @@ async function conditionHolds(
   return condition.absent === true ? !found : found
 }
 
-/** What a click step's candidates look like before anything is tried. */
-function describeCandidates(step: ClickStep): string {
+/** What a step's candidates look like before anything is tried. */
+function describeCandidates(step: { readonly candidates: readonly Candidate[] }): string {
   return step.candidates.map(describeCandidate).join(', ')
 }
 
@@ -248,6 +250,39 @@ export async function runTargetActions(
       }
       // Every candidate was passed over: the page says so, with one reason each.
       const why = `no candidate could be clicked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
+      if (step.optional === true) {
+        reports.push({ index, verb: step.verb, detail: why, outcome: 'skipped' })
+        continue
+      }
+      return failure(why)
+    }
+
+    if (step.verb === 'check') {
+      const detail = `candidates: ${describeCandidates(step)}, state ${step.state}`
+      if (budget === 0) {
+        if (step.optional === true) {
+          reports.push({ index, verb: step.verb, detail: `${detail} (no budget left)`, outcome: 'skipped' })
+          continue
+        }
+        return failure(`${detail} (only 0ms of the step budget is left)`)
+      }
+      const outcome = await checkControl(page, step.candidates, step.state, budget)
+      if (outcome.kind === 'checked') {
+        // The verdict is the read-back, not the click: `changed` separates the
+        // step that had to act from the idempotent one, and both report the
+        // state the page actually shows.
+        const how = outcome.changed ? `was ${outcome.was}, now ${outcome.state}` : `already ${outcome.state}`
+        reports.push({ index, verb: step.verb, detail: `${outcome.candidate} (${how})`, outcome: 'met' })
+        continue
+      }
+      const why =
+        outcome.kind === 'reverted'
+          ? `${outcome.candidate}: it was ${outcome.was}, the click went out, and it reports ${outcome.now} — the page did not keep the change`
+          : outcome.kind === 'unverified'
+            ? `${detail} (${outcome.problem})`
+            : outcome.kind === 'unreadable'
+              ? `${detail} (the page could not be read: ${outcome.problem})`
+              : `no candidate could be checked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
       if (step.optional === true) {
         reports.push({ index, verb: step.verb, detail: why, outcome: 'skipped' })
         continue

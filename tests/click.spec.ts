@@ -10,7 +10,8 @@
  */
 import { JSDOM } from 'jsdom'
 import { describe, expect, it } from 'vitest'
-import { CANDIDATE_CONTROLS, CLICK_TIMEOUT_MS, clickCandidate, clickScript, looksLikeNavigation } from '../src/click.ts'
+import { CLICK_TIMEOUT_MS, clickCandidate, clickScript, looksLikeNavigation } from '../src/click.ts'
+import { CANDIDATE_CONTROLS } from '../src/page-fragments.ts'
 import type { Candidate, WaitCondition } from '../src/targets.ts'
 import type { PlaywrightPage } from '../src/types.ts'
 

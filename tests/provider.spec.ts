@@ -801,6 +801,29 @@ describe('PlaywrightFetchProvider', () => {
   const clickText = (text: string, optional = false): string =>
     `{ "verb": "click", "candidates": [ { "text": "${text}" } ]${optional ? ', "optional": true' : ''} }`
 
+  const checkText = (text: string): string =>
+    `{ "verb": "check", "candidates": [ { "text": "${text}" } ] }`
+
+  it('checks a control and says which state it ended in', async () => {
+    const targetsFile = targetFor('https://example.com/docs', `${checkText('全选')}, ${waitText('World')}`)
+    const result = await new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', changed: true }, true],
+    }).fetch({ url: 'https://example.com/docs' })
+    const content = (result.body as { content: string }).content
+    expect(content.startsWith('> actions: 1. check text "全选" -> label (was unchecked, now checked) — met')).toBe(true)
+    expect(content).toContain('2. waitFor text "World" — met')
+  })
+
+  it('fails a check the page did not keep, naming the step and the candidate', async () => {
+    const targetsFile = targetFor('https://example.com/docs', checkText('全选'))
+    const message = await messageOf(new FakeProvider({ targetsFile }, {
+      evaluateQueue: [{ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'unchecked', changed: true }],
+    }).fetch({ url: 'https://example.com/docs' }))
+    expect(message).toContain('target "docs" step 1 (check) did not hold')
+    expect(message).toContain('text "全选" -> label: it was unchecked, the click went out, and it reports unchecked')
+    expect(message).toContain('at https://final.example.com/docs')
+  })
+
   it('clicks a candidate, and counts the click as confirmed by the wait that follows', async () => {
     const targetsFile = targetFor('https://example.com/docs', `${clickText('查询')}, ${waitText('World')}`)
     const result = await new FakeProvider({ targetsFile }, {

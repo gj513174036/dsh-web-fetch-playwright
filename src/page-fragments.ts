@@ -143,26 +143,151 @@ export const FRAGMENT_ROLE = `const roleOf = (el) => {
   };`
 
 /**
+ * Where a click on this control has to land, or why it cannot land at all.
+ *
+ * The single answer to "how would a person do this", asked *before* anything is
+ * clicked, and the question turned out to have a longer answer than the first
+ * draft assumed. A disabled control does nothing (including one inside a
+ * disabled `<fieldset>`, which carries no `disabled` of its own — the HTML
+ * exception for a fieldset's first `<legend>` is deliberately not modelled,
+ * because refusing a control that would have worked is the cheap direction).
+ * Anything else is asked the same question twice: is the control itself
+ * hit-able, and if not, is the `<label>` that forwards a click to it?
+ *
+ * That second question is not a fallback for a hidden input only. Measured on
+ * booking.com's consent gate, whose five `<input type="checkbox">` are 1×1 px
+ * with a 897×20 `<label for=…>` beside them: the input *is* laid out, so a
+ * "laid out or not" test declares it hittable — and then `elementFromPoint` at
+ * its centre finds the styled span the label draws over it. A person ticks that
+ * box by clicking the label, and now so does the plugin.
+ *
+ * @returns the element to act on (`hit`), where it was found (`self` or
+ *   `label`), and the reason when there is none.
+ */
+export const FRAGMENT_HIT_TARGET = `const hitTargetOf = (el) => {
+    if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') return { hit: null, host: null, reason: 'disabled' };
+    if (el.closest !== undefined && el.closest('fieldset[disabled]') !== null) return { hit: null, host: null, reason: 'disabled' };
+    if (laidOut(el) && coverageOf(el) === '') return { hit: el, host: 'self', reason: '' };
+    const label = labelHostOf(el);
+    if (label !== null && laidOut(label) && coverageOf(label) === '') return { hit: label, host: 'label', reason: '' };
+    return { hit: null, host: null, reason: !laidOut(el) && (label === null || !laidOut(label)) ? 'not laid out' : 'covered' };
+  };`
+
+/**
  * Why this control cannot be acted on, or `''` when it can be.
  *
- * The single answer to "is this reachable", asked *before* anything is clicked:
- * a disabled control does nothing, a control with no box cannot be hit, and a
- * laid-out control can still be covered by the element that would really receive
- * the click. A control inside a disabled `<fieldset>` counts as disabled too: it
- * carries no `disabled` of its own, yet activating it does nothing. The HTML
- * exception for a fieldset's first `<legend>` is deliberately not modelled —
- * refusing a control that would in fact have worked is the cheap direction. The last one is measured on whatever a person would hit — the
- * element itself, or the `<label>` that forwards a click to it — because that is
- * the difference between "the click was dispatched" and "the page did what the
- * target claims".
+ * The same answer as {@link FRAGMENT_HIT_TARGET}, in the shape a caller wants
+ * when it only needs to report: one walk, two conveniences.
  */
-export const FRAGMENT_REACHABILITY = `const reachabilityOf = (el) => {
-    if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') return 'disabled';
-    if (el.closest !== undefined && el.closest('fieldset[disabled]') !== null) return 'disabled';
-    const host = hostOf(el);
-    if (host === 'hidden') return 'not laid out';
-    const visible = host === 'label' ? labelHostOf(el) : el;
-    if (visible !== null && coverageOf(visible) !== '') return 'covered';
+export const FRAGMENT_REACHABILITY = `const reachabilityOf = (el) => hitTargetOf(el).reason;`
+
+/**
+ * The controls a `text` or `role` candidate is allowed to consider.
+ *
+ * Deliberately one neighbourhood for both kinds: a text candidate names a
+ * control by the words a person reads (its label, its value, its placeholder),
+ * and a role candidate names one by what it is — a search box a `type` step will
+ * write into is found by text or by `role: "searchbox"` just as a button is.
+ * Order within the page decides between matches, which is why the winner is
+ * named in the summary rather than left implicit.
+ */
+export const CANDIDATE_CONTROLS = 'button, a[href], input, select, textarea, label, summary, [role], [contenteditable="true"]'
+
+/**
+ * Turning one candidate into the elements it names.
+ *
+ * Names are compared the way a person reads them — trimmed, whitespace
+ * collapsed, case-folded — and by equality, never by substring. A selector that
+ * the browser cannot parse answers `null` rather than throwing, because "this
+ * selector is unusable" is a reason to report, not a reason to stop.
+ */
+export const FRAGMENT_CANDIDATE_MATCH = `const CONTROLS = ${JSON.stringify(CANDIDATE_CONTROLS)};
+  const collapsed = (value) => String(value || '').trim().replace(/\\s+/g, ' ').toLowerCase();
+  const matchesOf = (candidate) => {
+    if (candidate.kind === 'selector') {
+      try { return Array.prototype.slice.call(document.querySelectorAll(candidate.selector)) }
+      catch (error) { return null }
+    }
+    let found = [];
+    try { found = Array.prototype.slice.call(document.querySelectorAll(CONTROLS)) } catch (error) { return [] }
+    const wantedName = collapsed(candidate.kind === 'text' ? candidate.text : candidate.name);
+    const wantedRole = candidate.kind === 'role' ? candidate.role : null;
+    return found.filter((el) => {
+      if (wantedRole !== null && roleOf(el) !== wantedRole) return false;
+      return collapsed(accessibleNameOf(el)) === wantedName;
+    });
+  };`
+
+/**
+ * Walking an ordered candidate list to the first control that can be acted on.
+ *
+ * The one implementation behind every verb that names a control, so `click`,
+ * `check` and whatever comes next cannot drift on the questions that matter:
+ * which candidate wins (the first usable one, in the recipe's order), where the
+ * act has to land (the control itself, or the `<label>` that forwards to it),
+ * and what to say about the candidates that were passed over.
+ *
+ * `accept` is how a verb states what it can act on at all — `check` refuses a
+ * control that holds no state, so `{ "text": "全选" }` on a gate whose `<label>`
+ * carries those words keeps walking until it reaches the checkbox the label is
+ * for, instead of stopping on the label and failing. Reachability is still asked
+ * first: an unusable control that is also unreachable is reported as unreachable.
+ *
+ * A usable candidate ends the walk — later ones are not tried behind the
+ * author's back, whether or not the act that follows works out.
+ *
+ * @returns `control`/`hit` (`null` when nothing was usable), the winning
+ *   candidate's description, where it was found, and one reason per candidate
+ *   that was passed over.
+ */
+export const FRAGMENT_RESOLVE = `const resolveCandidates = (candidates, accept) => {
+    const tried = [];
+    for (const candidate of candidates) {
+      const matches = matchesOf(candidate);
+      if (matches === null) { tried.push(candidate.label + ': not a usable selector'); continue }
+      if (matches.length === 0) { tried.push(candidate.label + ': no match'); continue }
+      let chosen = null;
+      const unreachable = [];
+      const unusable = [];
+      for (const el of matches) {
+        const target = hitTargetOf(el);
+        if (target.hit === null) { if (unreachable.indexOf(target.reason) < 0) unreachable.push(target.reason); continue }
+        const refusal = accept === undefined ? '' : accept(el);
+        if (refusal !== '') { if (unusable.indexOf(refusal) < 0) unusable.push(refusal); continue }
+        chosen = { control: el, hit: target.hit, host: target.host };
+        break;
+      }
+      if (chosen === null) {
+        const parts = [];
+        if (unreachable.length > 0) parts.push('none reachable (' + unreachable.join(', ') + ')');
+        if (unusable.length > 0) parts.push('not usable (' + unusable.join(', ') + ')');
+        tried.push(candidate.label + ': matched ' + matches.length + ', ' + parts.join(', '));
+        continue;
+      }
+      return { candidate: candidate.label, control: chosen.control, host: chosen.host, hit: chosen.hit, tried: tried };
+    }
+    return { candidate: null, control: null, host: null, hit: null, tried: tried };
+  };`
+
+/**
+ * What state a control is in, when it is a control that has one.
+ *
+ * The single answer to "is this ticked", read before acting and read again after
+ * — by `check` to verify its own step, and by the state conditions `waitFor`
+ * grows. Three carriers, in the order a person would trust them: a form
+ * checkbox or radio, then `aria-checked` (what a custom control announces), then
+ * `aria-pressed` (its toggle-button equivalent). Anything else answers `''`:
+ * "this control has no such state" is a fact the caller needs, and `false` would
+ * be a lie about a text field.
+ */
+export const FRAGMENT_CHECKED_STATE = `const checkedStateOf = (el) => {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'input' && (type === 'checkbox' || type === 'radio')) return el.checked === true ? 'checked' : 'unchecked';
+    const checked = el.getAttribute('aria-checked');
+    if (checked === 'true' || checked === 'false') return checked === 'true' ? 'checked' : 'unchecked';
+    const pressed = el.getAttribute('aria-pressed');
+    if (pressed === 'true' || pressed === 'false') return pressed === 'true' ? 'checked' : 'unchecked';
     return '';
   };`
 
@@ -208,7 +333,11 @@ export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_ACCESSIBLE_NAME,
   FRAGMENT_ROLE,
   FRAGMENT_COVERAGE,
+  FRAGMENT_HIT_TARGET,
   FRAGMENT_REACHABILITY,
+  FRAGMENT_CANDIDATE_MATCH,
+  FRAGMENT_RESOLVE,
+  FRAGMENT_CHECKED_STATE,
 ]
 
 /** The consent fragments, in the order they must be declared. */

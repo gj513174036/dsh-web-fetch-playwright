@@ -169,6 +169,33 @@ describe('parseTargets', () => {
     expect(errorOf(file('{ "verb": "waitFor", "candidates": [ { "text": "x" } ] }'))).toContain('unknown key "candidates"')
   })
 
+  it('reads a check step, with the state it has to end in', () => {
+    // Omitted state means "tick it": the verb's whole point is satisfying a
+    // precondition, and a checkbox is what it is usually asked for.
+    const defaulted = `{ "verb": "check", "candidates": [ { "text": "全选" } ] }`
+    expect(targetsOf(file(defaulted))[0]?.actions[0]).toEqual({
+      verb: 'check',
+      candidates: [{ kind: 'text', text: '全选' }],
+      state: 'checked',
+    })
+    const explicit = `{ "verb": "check", "candidates": [ { "selector": "#cb" } ], "state": "unchecked", "optional": true }`
+    expect(targetsOf(file(explicit))[0]?.actions[0]).toEqual({
+      verb: 'check',
+      candidates: [{ kind: 'selector', selector: '#cb' }],
+      state: 'unchecked',
+      optional: true,
+    })
+  })
+
+  it('refuses a check that names no control, no state, or a state that is not one', () => {
+    const check = (step: string): string => file(step)
+    expect(errorOf(check('{ "verb": "check" }'))).toContain('.candidates')
+    expect(errorOf(check('{ "verb": "check", "candidates": [] }'))).toContain('can never match')
+    expect(errorOf(check('{ "verb": "check", "candidates": [ { "text": "x" } ], "state": "enabled" }'))).toContain('.state: expected "checked" or "unchecked"')
+    // A condition belongs to waitFor, not to a step that names a control.
+    expect(errorOf(check('{ "verb": "check", "candidates": [ { "text": "x" } ], "condition": { "kind": "text", "text": "y" } }'))).toContain('unknown key "condition"')
+  })
+
   it('describes a candidate the same way everywhere it is named', () => {
     expect(describeCandidate({ kind: 'selector', selector: '#a' })).toBe('selector "#a"')
     expect(describeCandidate({ kind: 'text', text: '查询' })).toBe('text "查询"')

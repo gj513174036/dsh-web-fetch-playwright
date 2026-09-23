@@ -8,7 +8,7 @@
 import { describe, expect, it } from 'vitest'
 import { describeCondition, renderActionSummary, runTargetActions, textProbeScript } from '../src/actions.ts'
 import type { ActionFailure, ActionRun } from '../src/actions.ts'
-import type { ActionStep, Candidate, ClickStep, Target, WaitStep } from '../src/targets.ts'
+import type { ActionStep, Candidate, CheckStep, ClickStep, Target, WaitStep } from '../src/targets.ts'
 import type { PlaywrightPage } from '../src/types.ts'
 
 const target = (...steps: readonly ActionStep[]): Target => ({
@@ -21,6 +21,8 @@ const text = (value: string, absent?: boolean): WaitStep =>
   absent === true ? { verb: 'waitFor', condition: { kind: 'text', text: value, absent: true } } : { verb: 'waitFor', condition: { kind: 'text', text: value } }
 
 const click = (...candidates: readonly Candidate[]): ClickStep => ({ verb: 'click', candidates })
+
+const check = (candidates: readonly Candidate[], state: 'checked' | 'unchecked' = 'checked'): CheckStep => ({ verb: 'check', candidates, state })
 
 function pageWith(options: { url?: string; evaluate?: (script: string) => Promise<unknown> }): PlaywrightPage {
   const base = { url: () => options.url ?? 'https://a.example/search' }
@@ -38,6 +40,11 @@ function clickPage(answer: unknown | (() => unknown)): PlaywrightPage {
       return typeof answer === 'function' ? (answer as () => unknown)() : answer
     },
   })
+}
+
+/** A page that answers the check probe and nothing else. */
+function checkPage(answer: unknown): PlaywrightPage {
+  return pageWith({ evaluate: async (script) => (script.includes('const want = ') ? answer : true) })
 }
 
 const options = { remainingMs: () => 5_000, stepCeilingMs: 20, pollMs: 1 }
@@ -138,6 +145,85 @@ describe('runTargetActions', () => {
   it('reports the document it ended on', async () => {
     const outcome = await runTargetActions(pageWith({ url: 'https://a.example/after', evaluate: async () => true }), target(text('结果')), options)
     expect(outcome.ok && outcome.run.finalUrl).toBe('https://a.example/after')
+  })
+})
+
+describe('runTargetActions, the check verb', () => {
+  it('reports the state the page ended in, and whether the step had to act for it', async () => {
+    const acted = await runTargetActions(
+      checkPage({ ok: true, candidate: 'text "全选" -> label', was: 'unchecked', state: 'checked', changed: true }),
+      target(check([{ kind: 'text', text: '全选' }])),
+      options,
+    )
+    expect(acted.ok && acted.run.steps).toEqual([
+      { index: 0, verb: 'check', detail: 'text "全选" -> label (was unchecked, now checked)', outcome: 'met' },
+    ])
+
+    const already = await runTargetActions(
+      checkPage({ ok: true, candidate: 'text "全选" -> label', was: 'checked', state: 'checked', changed: false }),
+      target(check([{ kind: 'text', text: '全选' }])),
+      options,
+    )
+    expect(already.ok && already.run.steps[0]?.detail).toBe('text "全选" -> label (already checked)')
+  })
+
+  it('fails when the page did not keep the change', async () => {
+    // The measured failure: the click flips the state and the page reverts it.
+    // A check that cannot show the state holds is not a satisfied precondition.
+    const outcome = await runTargetActions(
+      checkPage({ ok: true, candidate: 'selector "#cb" -> label', was: 'unchecked', state: 'unchecked', changed: true }),
+      target(check([{ kind: 'selector', selector: '#cb' }])),
+      options,
+    )
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.index).toBe(0)
+    expect(failure.verb).toBe('check')
+    expect(failure.url).toBe('https://a.example/search')
+    expect(failure.detail).toBe('selector "#cb" -> label: it was unchecked, the click went out, and it reports unchecked — the page did not keep the change')
+  })
+
+  it('fails when no candidate can be checked, naming each one', async () => {
+    const outcome = await runTargetActions(
+      checkPage({ ok: false, acted: null, tried: ['text "全选": no match', 'selector "#cb": matched 1, none reachable (not laid out)'] }),
+      target(check([{ kind: 'text', text: '全选' }])),
+      options,
+    )
+    expect(outcome.ok).toBe(false)
+    const failure = (outcome as { failure: ActionFailure }).failure
+    expect(failure.detail).toContain('no candidate could be checked, out of text "全选"')
+    expect(failure.detail).toContain('selector "#cb": matched 1, none reachable (not laid out)')
+  })
+
+  it('fails when the state could not be read back at all', async () => {
+    const outcome = await runTargetActions(
+      checkPage({ ok: false, acted: 'selector "#cb" -> label', why: 'the control could not be read back after ticking it', tried: [] }),
+      target(check([{ kind: 'selector', selector: '#cb' }])),
+      options,
+    )
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('could not be read back')
+  })
+
+  it('skips an optional check that cannot be satisfied, and runs the rest', async () => {
+    const outcome = await runTargetActions(
+      checkPage({ ok: false, acted: null, tried: ['text "记住我": no match'] }),
+      target({ ...check([{ kind: 'text', text: '记住我' }]), optional: true }, { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }),
+      options,
+    )
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    expect(outcome.run.steps.map((step) => step.outcome)).toEqual(['skipped', 'met'])
+    expect(outcome.run.steps[0]?.detail).toContain('text "记住我": no match')
+  })
+
+  it('does not send a check to a page it has no budget left for', async () => {
+    let asked = 0
+    const page = pageWith({ evaluate: async () => { asked += 1; return { ok: true } } })
+    const outcome = await runTargetActions(page, target(check([{ kind: 'text', text: '全选' }])), { remainingMs: () => 0, stepCeilingMs: 20, pollMs: 1 })
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('only 0ms of the step budget is left')
+    expect(asked).toBe(0)
   })
 })
 

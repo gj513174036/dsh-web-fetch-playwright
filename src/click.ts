@@ -5,8 +5,8 @@
  * Reachability is checked before the click, never inferred from it: the control
  * must exist, occupy layout (itself or through the `<label>` that forwards a
  * click to it), be free of anything sitting on top of it, and not be disabled.
- * All four questions already have one answer each in `page-fragments`, so this
- * module asks them rather than answering them again.
+ * All of that — the walk, the four questions, the reasons a candidate was passed
+ * over — lives in `page-fragments`, shared with `check` so the two cannot drift.
  *
  * Two honesty rules shape the code:
  *
@@ -32,18 +32,6 @@ import { describeCandidate, type Candidate, type WaitCondition } from './targets
 
 /** How long the page gets to answer the click probe. */
 export const CLICK_TIMEOUT_MS = 5_000
-
-/**
- * The controls a `text` or `role` candidate is allowed to consider.
- *
- * Deliberately the same neighbourhood for both kinds: a text candidate names a
- * control by the words a person reads (its label, its value, its placeholder),
- * and a role candidate names one by what it is — a search box a `type` step will
- * write into is found by text or by `role: "searchbox"` just as a button is.
- * Order within the page decides between matches, which is why the winner is
- * named in the summary rather than left implicit.
- */
-export const CANDIDATE_CONTROLS = 'button, a[href], input, select, textarea, label, summary, [role], [contenteditable="true"]'
 
 /** What one click attempt came to. */
 export type ClickOutcome =
@@ -88,52 +76,17 @@ export function clickScript(candidates: readonly Candidate[], watch?: WaitCondit
   const watched = watch !== undefined && watch.kind === 'text' ? JSON.stringify({ text: watch.text, absent: watch.absent === true }) : 'null'
   return `(() => {
   const candidates = ${JSON.stringify(encoded)};
-  const CONTROLS = ${JSON.stringify(CANDIDATE_CONTROLS)};
   const watch = ${watched};
   ${spliceFragments(PAGE_FRAGMENTS)}
   const before = watch === null ? null : (visibleTextOf().indexOf(watch.text) >= 0) !== watch.absent;
-  const collapsed = (value) => String(value || '').trim().replace(/\\s+/g, ' ').toLowerCase();
-  const matchesOf = (candidate) => {
-    if (candidate.kind === 'selector') {
-      try { return Array.prototype.slice.call(document.querySelectorAll(candidate.selector)) }
-      catch (error) { return null }
-    }
-    let found = [];
-    try { found = Array.prototype.slice.call(document.querySelectorAll(CONTROLS)) } catch (error) { return [] }
-    const wantedName = collapsed(candidate.kind === 'text' ? candidate.text : candidate.name);
-    const wantedRole = candidate.kind === 'role' ? candidate.role : null;
-    return found.filter((el) => {
-      if (wantedRole !== null && roleOf(el) !== wantedRole) return false;
-      return collapsed(accessibleNameOf(el)) === wantedName;
-    });
-  };
-  const tried = [];
-  for (const candidate of candidates) {
-    const matches = matchesOf(candidate);
-    if (matches === null) { tried.push(candidate.label + ': not a usable selector'); continue }
-    if (matches.length === 0) { tried.push(candidate.label + ': no match'); continue }
-    let winner = null;
-    const reasons = [];
-    for (const el of matches) {
-      const reason = reachabilityOf(el);
-      if (reason === '') { winner = el; break }
-      if (reasons.indexOf(reason) < 0) reasons.push(reason);
-    }
-    if (winner === null) {
-      tried.push(candidate.label + ': matched ' + matches.length + ', none reachable (' + reasons.join(', ') + ')');
-      continue;
-    }
-    const host = laidOut(winner) ? 'self' : 'label';
-    const hit = host === 'label' ? labelHostOf(winner) : winner;
-    if (hit === null) { tried.push(candidate.label + ': no label to click'); continue }
-    const landed = candidate.label + ' -> ' + (roleOf(hit) || hit.tagName.toLowerCase());
-    // A reachable candidate ends the walk whether or not its click worked: the
-    // order is the recipe's, so a later candidate must not be tried behind the
-    // author's back. A throw is reported rather than silently moved past.
-    try { hit.click() } catch (error) { return { ok: false, tried: tried.concat(landed + ': the click threw (' + String(error) + ')') } }
-    return { ok: true, candidate: landed, before: before };
-  }
-  return { ok: false, tried: tried };
+  const found = resolveCandidates(candidates);
+  if (found.control === null) return { ok: false, tried: found.tried };
+  const landed = found.candidate + ' -> ' + (roleOf(found.hit) || found.hit.tagName.toLowerCase());
+  // A reachable candidate ends the walk whether or not its click worked: the
+  // order is the recipe's, so a later candidate must not be tried behind the
+  // author's back. A throw is reported rather than silently moved past.
+  try { found.hit.click() } catch (error) { return { ok: false, tried: found.tried.concat(landed + ': the click threw (' + String(error) + ')') } }
+  return { ok: true, candidate: landed, before: before };
 })()`
 }
 
