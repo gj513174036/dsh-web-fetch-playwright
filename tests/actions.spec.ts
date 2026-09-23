@@ -248,6 +248,25 @@ describe('runTargetActions, the state condition', () => {
     expect(outcome.ok && outcome.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
   })
 
+  it('keeps the last thing the page said when the final poll runs out of budget', async () => {
+    // The last poll gets whatever budget is left, which can be nothing: it must
+    // not erase the count the poll before it reported.
+    let calls = 0
+    const page = pageWith({
+      evaluate: async (script) => {
+        if (script.includes('const want = ') && !script.includes('const accept = ')) {
+          calls += 1
+          if (calls === 1) return { ok: true, scope: 'selector "#a"', total: 3, notInState: 2, holds: false, sample: '全选' }
+          return new Promise(() => {})
+        }
+        return true
+      },
+    })
+    const outcome = await runTargetActions(page, target(condition('checked')), options)
+    expect(outcome.ok).toBe(false)
+    expect((outcome as { failure: ActionFailure }).failure.detail).toContain('2 of 3 controls in selector "#a" are not checked (e.g. "全选")')
+  })
+
   it('is skipped like any other optional step', async () => {
     const outcome = await runTargetActions(
       statePage({ ok: true, scope: 'x', total: 2, notInState: 1, holds: false, sample: '' }),

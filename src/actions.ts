@@ -349,7 +349,10 @@ export async function runTargetActions(
           held = true
           break
         }
-        why = state.why
+        // Keep the last thing the page actually said: the final poll runs with
+        // almost no budget left, answers nothing, and must not erase the count
+        // that came before it.
+        if (state.why !== '') why = state.why
         if (Date.now() - startedAt >= budget) break
         await sleep(poll)
       }
