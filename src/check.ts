@@ -27,8 +27,8 @@
 
 import { looksLikeNavigation } from './click.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { raceTimeout, TIMED_OUT } from './race.ts'
-import { describeCandidate, type Candidate } from './targets.ts'
+import { askPage, messageOf } from './race.ts'
+import { labelledCandidates, type Candidate } from './targets.ts'
 import type { PlaywrightPage } from './types.ts'
 
 /** How long the page gets to answer the check probe (the click, plus the read-back). */
@@ -71,9 +71,8 @@ export type CheckOutcome =
  * @returns a script returning a `CheckOutcome`-shaped object.
  */
 export function checkScript(candidates: readonly Candidate[], state: ControlState): string {
-  const encoded = candidates.map((candidate) => ({ ...candidate, label: describeCandidate(candidate) }))
   return `(async () => {
-  const candidates = ${JSON.stringify(encoded)};
+  const candidates = ${JSON.stringify(labelledCandidates(candidates))};
   const want = ${JSON.stringify(state)};
   ${spliceFragments(PAGE_FRAGMENTS)}
   // Only a control that holds a state can be checked — which is also what keeps
@@ -127,21 +126,17 @@ export async function checkControl(
   if (evaluate === undefined) {
     return { kind: 'unreadable', problem: 'the page offers no scripting, so no candidate could be tried' }
   }
-  let answer: unknown
-  try {
-    answer = await raceTimeout(evaluate(checkScript(candidates, state)), Math.max(0, timeoutMs))
-  } catch (error: unknown) {
+  const answer = await askPage(evaluate, checkScript(candidates, state), timeoutMs)
+  if (answer.kind === 'failed') {
     // The act itself can navigate; the state then cannot be read back, and a
     // precondition that cannot be shown to hold is not one this verb can call
     // satisfied.
-    if (looksLikeNavigation(error)) return { kind: 'unverified', problem: 'the page navigated before the state could be read back' }
-    return { kind: 'unreadable', problem: error instanceof Error ? error.message : String(error) }
+    if (looksLikeNavigation(answer.error)) return { kind: 'unverified', problem: 'the page navigated before the state could be read back' }
+    return { kind: 'unreadable', problem: messageOf(answer.error) }
   }
-  if (answer === TIMED_OUT) return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
-  if (typeof answer !== 'object' || answer === null) {
-    return { kind: 'unreadable', problem: 'the page answered with something other than a check result' }
-  }
-  const shape = answer as { ok?: unknown; candidate?: unknown; state?: unknown; was?: unknown; acted?: unknown; attempted?: unknown; why?: unknown; tried?: unknown }
+  if (answer.kind === 'timeout') return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
+  if (answer.kind === 'unexpected') return { kind: 'unreadable', problem: 'the page answered with something other than a check result' }
+  const shape = answer.value as { ok?: unknown; candidate?: unknown; state?: unknown; was?: unknown; acted?: unknown; attempted?: unknown; why?: unknown; tried?: unknown }
   if (shape.ok === true) {
     const now = stateOf(shape.state)
     const was = stateOf(shape.was)

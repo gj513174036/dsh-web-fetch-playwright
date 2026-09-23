@@ -36,23 +36,32 @@ function pageWith(options: { url?: string; evaluate?: (script: string) => Promis
 function clickPage(answer: unknown | (() => unknown)): PlaywrightPage {
   return pageWith({
     evaluate: async (script) => {
-      if (!script.includes('const candidates = ')) return true
+      // Only the click script carries a watch.
+      if (!script.includes('const watch = ')) return true
       return typeof answer === 'function' ? (answer as () => unknown)() : answer
     },
   })
 }
 
-/** A page that answers the check probe and nothing else. */
+/**
+ * A page that answers the check probe and nothing else.
+ *
+ * The two probes are told apart by a marker unique to each script: only the
+ * check script passes an `accept` filter, and only the state script asks a
+ * `want` without one.
+ */
 function checkPage(answer: unknown): PlaywrightPage {
-  return pageWith({ evaluate: async (script) => (script.includes('const want = ') ? answer : true) })
+  return pageWith({ evaluate: async (script) => (script.includes('const accept = ') ? answer : true) })
 }
 
-/** A page that answers the state probe (and the text probe, when asked). */
+/** A page that answers the state probe and nothing else. */
 function statePage(answer: unknown): PlaywrightPage {
-  return pageWith({ evaluate: async (script) => (script.includes('const told = []') ? answer : true) })
+  return pageWith({
+    evaluate: async (script) => (script.includes('const want = ') && !script.includes('const accept = ') ? answer : true),
+  })
 }
 
-const allChecked = { ok: true, scope: 'selector "input[type=checkbox]"', total: 5, off: 0, holds: true, sample: '' }
+const allChecked = { ok: true, scope: 'selector "input[type=checkbox]"', total: 5, notInState: 0, holds: true, sample: '' }
 
 const options = { remainingMs: () => 5_000, stepCeilingMs: 20, pollMs: 1 }
 
@@ -121,6 +130,23 @@ describe('runTargetActions', () => {
     expect(calls).toBeGreaterThan(1)
   })
 
+  it('never reads a page that did not answer as the thing having gone', async () => {
+    // A throw or a timeout is "we do not know"; for an `absent` condition that
+    // must not be read as "it is gone", which would report a stalled page as the
+    // thing the recipe was waiting for.
+    const gone = text('加载中', true)
+    const stalled = await runTargetActions(pageWith({ evaluate: () => new Promise(() => {}) }), target(gone), options)
+    expect(stalled.ok).toBe(false)
+    expect((stalled as { failure: ActionFailure }).failure.detail).toContain('text "加载中" to disappear')
+
+    const throwing = await runTargetActions(
+      pageWith({ evaluate: async () => { throw new Error('Execution context was destroyed') } }),
+      target(gone),
+      options,
+    )
+    expect(throwing.ok).toBe(false)
+  })
+
   it('can wait to have left a URL, not only to have arrived at one', async () => {
     const left: WaitStep = { verb: 'waitFor', condition: { kind: 'url', url: 'https://a.example/search', absent: true } }
     const gone = await runTargetActions(pageWith({ url: 'https://a.example/results' }), target(left), options)
@@ -175,7 +201,7 @@ describe('runTargetActions, the state condition', () => {
 
   it('fails with what the page said, not only that it waited', async () => {
     const outcome = await runTargetActions(
-      statePage({ ok: true, scope: 'selector "input[type=checkbox]"', total: 5, off: 3, holds: false, sample: '全选' }),
+      statePage({ ok: true, scope: 'selector "input[type=checkbox]"', total: 5, notInState: 3, holds: false, sample: '全选' }),
       target(condition('checked')),
       options,
     )
@@ -188,7 +214,7 @@ describe('runTargetActions, the state condition', () => {
   })
 
   it('says when nothing could be asked at all', async () => {
-    const outcome = await runTargetActions(statePage({ ok: false, told: ['text "全选": no match'] }), target(condition('checked')), options)
+    const outcome = await runTargetActions(statePage({ ok: false, tried: ['text "全选": no match'] }), target(condition('checked')), options)
     expect(outcome.ok).toBe(false)
     expect((outcome as { failure: ActionFailure }).failure.detail).toContain('no candidate named a control that can be asked this (text "全选": no match)')
   })
@@ -199,9 +225,32 @@ describe('runTargetActions, the state condition', () => {
     expect((outcome as { failure: ActionFailure }).failure.detail).toContain('could not be read')
   })
 
+  it('reads a state watch before the click, so a wait that already held proves nothing', async () => {
+    // The click's confirmation rule is "the wait changed", and a state wait is no
+    // exception: it is read before the click like a URL one.
+    const holds = { ok: true, scope: 'selector "#a"', total: 1, notInState: 0, holds: true, sample: '' }
+    const page = pageWith({
+      evaluate: async (script) => {
+        if (script.includes('const accept = ')) return holds
+        if (script.includes('const want = ')) return holds
+        if (script.includes('const watch = ')) return { ok: true, candidate: 'selector "#a" -> button' }
+        return true
+      },
+    })
+    const outcome = await runTargetActions(
+      page,
+      target(click({ kind: 'selector', selector: '#a' }), {
+        verb: 'waitFor',
+        condition: { kind: 'state', state: 'checked', candidates: [{ kind: 'selector', selector: '#a' }] },
+      }),
+      options,
+    )
+    expect(outcome.ok && outcome.run.steps.map((step) => step.outcome)).toEqual(['unverified', 'met'])
+  })
+
   it('is skipped like any other optional step', async () => {
     const outcome = await runTargetActions(
-      statePage({ ok: true, scope: 'x', total: 2, off: 1, holds: false, sample: '' }),
+      statePage({ ok: true, scope: 'x', total: 2, notInState: 1, holds: false, sample: '' }),
       target({ ...condition('enabled'), optional: true }, { verb: 'waitFor', condition: { kind: 'time', ms: 1 } }),
       options,
     )

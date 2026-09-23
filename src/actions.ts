@@ -23,7 +23,7 @@ import type { PlaywrightPage } from './types.ts'
 import { checkControl } from './check.ts'
 import { clickCandidate } from './click.ts'
 import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
-import { raceTimeout } from './race.ts'
+import { raceTimeout, TIMED_OUT } from './race.ts'
 import { readState } from './state.ts'
 import { describeCandidate, urlIsUnder, type ActionStep, type Candidate, type Target, type WaitCondition, type WaitStep } from './targets.ts'
 
@@ -149,15 +149,20 @@ async function conditionHolds(
     // unanswerable, and that is the check above.
     return (await readState(evaluate, condition.candidates, condition.state, Math.max(1, remainingMs))) ?? { held: false, why: '' }
   }
-  let found: boolean
+  let answer: unknown
   try {
-    found = (await raceTimeout(evaluate(textProbeScript(condition.text)), Math.max(1, remainingMs))) === true
+    answer = await raceTimeout(evaluate(textProbeScript(condition.text)), Math.max(1, remainingMs))
   } catch {
     // A poll can fail for a transient reason — the navigation a click causes
     // destroys the execution context — and that is "not yet", not "unreadable".
     // Only a page with no scripting seam at all can never answer.
     return { held: false, why: '' }
   }
+  // A read that did not happen is *not* evidence that the text is gone: an
+  // `absent` condition that treated "no answer" as "not there" would report a
+  // stalled page as the thing it was waiting for.
+  if (answer === TIMED_OUT) return { held: false, why: 'the page did not answer' }
+  const found = answer === true
   return { held: condition.absent === true ? !found : found, why: '' }
 }
 
@@ -247,6 +252,14 @@ export async function runTargetActions(
       const urlBefore = page.url()
       if (confirming !== null && confirming.step.condition.kind === 'url') {
         heldBeforeClick.set(index, urlConditionHeld(urlBefore, confirming.step.condition))
+      }
+      // A state watch is read here, before the click, for the same reason a URL
+      // one is: a wait that already held is not evidence that the click did
+      // anything. The click script answers for a text watch; the other two kinds
+      // are the runner's to ask.
+      if (confirming !== null && confirming.step.condition.kind === 'state' && evaluate !== undefined) {
+        const read = await readState(evaluate, confirming.step.condition.candidates, confirming.step.condition.state, budget)
+        heldBeforeClick.set(index, read?.held ?? null)
       }
       const outcome = await clickCandidate(page, step.candidates, budget, confirming?.step.condition)
       if (outcome.kind === 'clicked') {

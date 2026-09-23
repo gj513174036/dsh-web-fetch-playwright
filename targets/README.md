@@ -20,6 +20,20 @@ harmless: `example.com`, `baidu.com`'s own search button, and the IANA page that
 `https://www.iana.org/help/example-domains` with that file loaded reports every
 candidate and why it was passed over.
 
+Measured for `verify-state-booking-gate` (0.2.21, a throwaway browser context against the real interstitial):
+
+```
+before   state checked  → { held: false, why: '5 of 5 controls in selector "input[type=checkbox]" are not checked (e.g. "全选")' }
+         state unchecked → { held: true }
+replay   1. waitFor text "需您同意" — met
+         2. waitFor all unchecked over selector "input[type=checkbox]" — met
+         3. check text "全选" -> label (was unchecked, now checked) — met
+         4. waitFor all checked over selector "input[type=checkbox]" — met
+         5. click text "同意" -> button — clicked
+         6. waitFor to have left https://www.booking.com/pipl_consent.zh-cn.html — met
+         → final document https://www.booking.com/? (HTTP 200)
+```
+
 `verify-state-booking-gate` needs a profile that has **not** consented to booking.com yet (a fresh browser context is enough) — the same fresh-profile caveat as the gate recipe in `verify-check.json`. `verify-state-w3schools` is the awkward one on purpose: the page's checkboxes are normally unticked, so its optional condition reports *not met* and is recorded as skipped, which is how you see the failure wording without failing a fetch.
 
 `verify-check-w3schools` is the plain one: two `check` steps on a page with three ordinary checkboxes, so it proves the pass *and* the second step's `already checked` without touching a real gate.

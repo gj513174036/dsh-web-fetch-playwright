@@ -168,7 +168,7 @@ describe('parseTargets', () => {
     expect(errorOf(file(''))).toContain('targets[0].actions')
     expect(errorOf(file('{ "verb": "press", "key": "Enter" }'))).toContain('targets[0].actions[0].verb')
     expect(errorOf(file('{ "verb": "click" }'))).toContain('targets[0].actions[0].candidates')
-    expect(errorOf(file('{ "verb": "click", "candidates": [] }'))).toContain('can never match')
+    expect(errorOf(file('{ "verb": "click", "candidates": [] }'))).toContain('can never name a control')
     expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "text", "text": "" } }'))).toContain('.condition.text')
     expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "time", "ms": -1 } }'))).toContain('.condition.ms')
     expect(errorOf(file('{ "verb": "waitFor", "condition": { "kind": "text", "text": "x" }, "condtion": 1 }'))).toContain('unknown key "condtion"')
@@ -232,7 +232,7 @@ describe('parseTargets', () => {
   it('refuses a check that names no control, no state, or a state that is not one', () => {
     const check = (step: string): string => file(step)
     expect(errorOf(check('{ "verb": "check" }'))).toContain('.candidates')
-    expect(errorOf(check('{ "verb": "check", "candidates": [] }'))).toContain('can never match')
+    expect(errorOf(check('{ "verb": "check", "candidates": [] }'))).toContain('can never name a control')
     expect(errorOf(check('{ "verb": "check", "candidates": [ { "text": "x" } ], "state": "enabled" }'))).toContain('.state: expected "checked" or "unchecked"')
     // A condition belongs to waitFor, not to a step that names a control.
     expect(errorOf(check('{ "verb": "check", "candidates": [ { "text": "x" } ], "condition": { "kind": "text", "text": "y" } }'))).toContain('unknown key "condition"')

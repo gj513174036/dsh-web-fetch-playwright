@@ -17,10 +17,10 @@ interface StateAnswer {
   ok: boolean
   scope?: string
   total?: number
-  off?: number
+  notInState?: number
   holds?: boolean
   sample?: string
-  told?: string[]
+  tried?: string[]
 }
 
 const GATE = `
@@ -53,7 +53,7 @@ describe('stateProbeScript', () => {
       ok: true,
       scope: 'selector "input[type=checkbox]"',
       total: 3,
-      off: 2,
+      notInState: 2,
       holds: false,
       sample: '全选',
     })
@@ -61,13 +61,13 @@ describe('stateProbeScript', () => {
 
   it('holds when every control in the scope is in the state', () => {
     const html = '<input id="a" type="checkbox" checked><input id="b" type="checkbox" checked>'
-    expect(runScript(html, [boxes], 'checked')).toMatchObject({ holds: true, total: 2, off: 0 })
+    expect(runScript(html, [boxes], 'checked')).toMatchObject({ holds: true, total: 2, notInState: 0 })
     expect(runScript('<input id="a" type="checkbox"><input id="b" type="checkbox">', [boxes], 'unchecked')).toMatchObject({ holds: true, total: 2 })
   })
 
   it('answers enabled and disabled of any control', () => {
     const html = '<button id="go">同意</button><button id="no" disabled>不同意</button>'
-    expect(runScript(html, [{ kind: 'selector', selector: 'button' }], 'enabled')).toMatchObject({ holds: false, total: 2, off: 1, sample: '不同意' })
+    expect(runScript(html, [{ kind: 'selector', selector: 'button' }], 'enabled')).toMatchObject({ holds: false, total: 2, notInState: 1, sample: '不同意' })
     expect(runScript(html, [{ kind: 'selector', selector: '#go' }], 'enabled')).toMatchObject({ holds: true, total: 1 })
     expect(runScript(html, [{ kind: 'selector', selector: '#no' }], 'disabled')).toMatchObject({ holds: true, total: 1 })
   })
@@ -90,7 +90,7 @@ describe('stateProbeScript', () => {
 
     const answer = runScript('<input id="q" type="text">', [{ kind: 'selector', selector: 'input' }], 'checked')
     expect(answer.ok).toBe(false)
-    expect(answer.told?.[0]).toContain('none of the 1 controls it names can be asked that')
+    expect(answer.tried?.[0]).toBe('selector "input": matched 1, nothing it names can be asked that')
   })
 
   it('reads a custom control’s announced state', () => {
@@ -104,7 +104,7 @@ describe('stateProbeScript', () => {
     const answer = runScript(GATE, [{ kind: 'selector', selector: '#missing' }, { kind: 'selector', selector: ':::' }], 'checked')
     expect(answer).toEqual({
       ok: false,
-      told: ['selector "#missing": no match', 'selector ":::": not a usable selector'],
+      tried: ['selector "#missing": no match', 'selector ":::": not a usable selector'],
     })
   })
 })
@@ -113,18 +113,18 @@ describe('readState', () => {
   const evaluateOf = (answer: unknown) => async (): Promise<unknown> => answer
 
   it('turns an answer into held, or into a sentence with the count', async () => {
-    const held = await readState(evaluateOf({ ok: true, scope: 'selector "#a"', total: 5, off: 0, holds: true, sample: '' }), [boxes], 'checked')
+    const held = await readState(evaluateOf({ ok: true, scope: 'selector "#a"', total: 5, notInState: 0, holds: true, sample: '' }), [boxes], 'checked')
     expect(held).toEqual({ held: true, why: '' })
 
-    const off = await readState(evaluateOf({ ok: true, scope: 'selector "#a"', total: 5, off: 3, holds: false, sample: '全选' }), [boxes], 'checked')
+    const off = await readState(evaluateOf({ ok: true, scope: 'selector "#a"', total: 5, notInState: 3, holds: false, sample: '全选' }), [boxes], 'checked')
     expect(off).toEqual({ held: false, why: '3 of 5 controls in selector "#a" are not checked (e.g. "全选")' })
 
-    const none = await readState(evaluateOf({ ok: true, scope: 'selector "#a"', total: 2, off: 2, holds: false, sample: '' }), [boxes], 'enabled')
+    const none = await readState(evaluateOf({ ok: true, scope: 'selector "#a"', total: 2, notInState: 2, holds: false, sample: '' }), [boxes], 'enabled')
     expect(none?.why).toBe('2 of 2 controls in selector "#a" are not enabled')
   })
 
   it('reports a scope nothing could answer as not held, with the reasons', async () => {
-    const outcome = await readState(evaluateOf({ ok: false, told: ['text "全选": no match'] }), [boxes], 'checked')
+    const outcome = await readState(evaluateOf({ ok: false, tried: ['text "全选": no match'] }), [boxes], 'checked')
     expect(outcome?.held).toBe(false)
     expect(outcome?.why).toBe('no candidate named a control that can be asked this (text "全选": no match)')
   })

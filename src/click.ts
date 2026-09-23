@@ -27,8 +27,8 @@
 
 import type { PlaywrightPage } from './types.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { raceTimeout, TIMED_OUT } from './race.ts'
-import { describeCandidate, type Candidate, type WaitCondition } from './targets.ts'
+import { askPage, messageOf } from './race.ts'
+import { labelledCandidates, type Candidate, type WaitCondition } from './targets.ts'
 
 /** How long the page gets to answer the click probe. */
 export const CLICK_TIMEOUT_MS = 5_000
@@ -72,10 +72,9 @@ export type ClickOutcome =
  * @returns a script returning a `ClickOutcome`-shaped object.
  */
 export function clickScript(candidates: readonly Candidate[], watch?: WaitCondition): string {
-  const encoded = candidates.map((candidate) => ({ ...candidate, label: describeCandidate(candidate) }))
   const watched = watch !== undefined && watch.kind === 'text' ? JSON.stringify({ text: watch.text, absent: watch.absent === true }) : 'null'
   return `(() => {
-  const candidates = ${JSON.stringify(encoded)};
+  const candidates = ${JSON.stringify(labelledCandidates(candidates))};
   const watch = ${watched};
   ${spliceFragments(PAGE_FRAGMENTS)}
   const before = watch === null ? null : (visibleTextOf().indexOf(watch.text) >= 0) !== watch.absent;
@@ -126,18 +125,16 @@ export async function clickCandidate(
   if (evaluate === undefined) {
     return { kind: 'unreadable', problem: 'the page offers no scripting, so no candidate could be tried' }
   }
-  let answer: unknown
-  try {
-    answer = await raceTimeout(evaluate(clickScript(candidates, watch)), Math.max(0, timeoutMs))
-  } catch (error: unknown) {
-    if (looksLikeNavigation(error)) return { kind: 'clicked-unreported' }
-    return { kind: 'unreadable', problem: error instanceof Error ? error.message : String(error) }
+  const answer = await askPage(evaluate, clickScript(candidates, watch), timeoutMs)
+  if (answer.kind === 'failed') {
+    // The click is what moved the page out from under the script, so this is a
+    // click that could not report — not a control that was not there.
+    if (looksLikeNavigation(answer.error)) return { kind: 'clicked-unreported' }
+    return { kind: 'unreadable', problem: messageOf(answer.error) }
   }
-  if (answer === TIMED_OUT) return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
-  if (typeof answer !== 'object' || answer === null) {
-    return { kind: 'unreadable', problem: 'the page answered with something other than a click result' }
-  }
-  const shape = answer as { ok?: unknown; candidate?: unknown; tried?: unknown; before?: unknown }
+  if (answer.kind === 'timeout') return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
+  if (answer.kind === 'unexpected') return { kind: 'unreadable', problem: 'the page answered with something other than a click result' }
+  const shape = answer.value as { ok?: unknown; candidate?: unknown; tried?: unknown; before?: unknown }
   if (shape.ok === true) {
     return {
       kind: 'clicked',

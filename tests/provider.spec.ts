@@ -818,7 +818,7 @@ describe('PlaywrightFetchProvider', () => {
     const stateWait = '{ "verb": "waitFor", "condition": { "kind": "state", "state": "checked", "candidates": [ { "selector": "input[type=checkbox]" } ] } }'
     const targetsFile = targetFor('https://example.com/docs', stateWait)
     const result = await new FakeProvider({ targetsFile }, {
-      evaluateQueue: [{ ok: true, scope: 'selector "input[type=checkbox]"', total: 5, off: 0, holds: true, sample: '' }],
+      evaluateQueue: [{ ok: true, scope: 'selector "input[type=checkbox]"', total: 5, notInState: 0, holds: true, sample: '' }],
     }).fetch({ url: 'https://example.com/docs' })
     const content = (result.body as { content: string }).content
     expect(content.startsWith('> actions: 1. waitFor all checked over selector "input[type=checkbox]" — met')).toBe(true)

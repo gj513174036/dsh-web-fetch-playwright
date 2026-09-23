@@ -10,7 +10,7 @@
  *
  * - **The scope is the first candidate that can answer.** The candidates are
  *   walked in the recipe's order and the first one naming at least one control
- *   that *holds* the state in question defines the set; later ones are not
+ *   that can *answer* the question defines the set; later ones are not
  *   consulted. That is the same ordered-candidate rule every verb follows, and it
  *   keeps a fallback candidate from silently widening the set the condition is
  *   about. A control that cannot be asked — a `<label>` that carries the words, a
@@ -32,13 +32,18 @@
  */
 
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { raceTimeout, TIMED_OUT } from './race.ts'
-import { describeCandidate, type Candidate, type WaitState } from './targets.ts'
+import { askPage } from './race.ts'
+import { labelledCandidates, type Candidate, type WaitState } from './targets.ts'
 
 /** How long one read of the page gets; the step's own budget caps the poll loop. */
 export const STATE_READ_TIMEOUT_MS = 5_000
 
-/** What one read of the page said about the condition. */
+/**
+ * What one read of the page said about a condition.
+ *
+ * The same shape every waiting condition answers with — text, URL and state — so
+ * the runner has one verdict to poll on and one sentence to fail with.
+ */
 export interface StateRead {
   readonly held: boolean
   /** Why it does not hold, in words a failure message can use (`''` when it holds). */
@@ -50,36 +55,35 @@ export interface StateRead {
  *
  * @param candidates - the condition's ordered candidates.
  * @param state - the state every control in the scope has to be in.
- * @returns a script returning `{ ok: true, scope, total, off, holds, sample }` or
- *   `{ ok: false, told }` with one reason per candidate that named nothing
- *   answerable.
+ * @returns a script returning `{ ok: true, scope, total, notInState, holds,
+ *   sample }` or `{ ok: false, tried }` with one reason per candidate that named
+ *   nothing answerable.
  */
 export function stateProbeScript(candidates: readonly Candidate[], state: WaitState): string {
-  const encoded = candidates.map((candidate) => ({ ...candidate, label: describeCandidate(candidate) }))
   return `(() => {
-  const candidates = ${JSON.stringify(encoded)};
+  const candidates = ${JSON.stringify(labelledCandidates(candidates))};
   const want = ${JSON.stringify(state)};
   ${spliceFragments(PAGE_FRAGMENTS)}
-  const told = [];
+  const tried = [];
   let scope = null;
   for (const candidate of candidates) {
     const matches = matchesOf(candidate);
-    if (matches === null) { told.push(candidate.label + ': not a usable selector'); continue }
-    if (matches.length === 0) { told.push(candidate.label + ': no match'); continue }
+    const unmatched = unmatchedReasonOf(candidate, matches);
+    if (unmatched !== null) { tried.push(unmatched); continue }
     const answerable = matches.filter((el) => matchesState(el, want) !== null);
-    if (answerable.length === 0) { told.push(candidate.label + ': none of the ' + matches.length + ' controls it names can be asked that'); continue }
+    if (answerable.length === 0) { tried.push(passedOver(candidate, matches.length, ['nothing it names can be asked that'])); continue }
     scope = { label: candidate.label, controls: answerable };
     break;
   }
-  if (scope === null) return { ok: false, told: told };
-  const off = scope.controls.filter((el) => matchesState(el, want) !== true);
-  const first = off.length === 0 ? null : off[0];
+  if (scope === null) return { ok: false, tried: tried };
+  const notInState = scope.controls.filter((el) => matchesState(el, want) !== true);
+  const first = notInState.length === 0 ? null : notInState[0];
   return {
     ok: true,
     scope: scope.label,
     total: scope.controls.length,
-    off: off.length,
-    holds: off.length === 0,
+    notInState: notInState.length,
+    holds: notInState.length === 0,
     sample: first === null ? '' : (accessibleNameOf(first) || first.tagName.toLowerCase()).slice(0, 40),
   };
 })()`
@@ -101,27 +105,24 @@ export async function readState(
   state: WaitState,
   timeoutMs: number = STATE_READ_TIMEOUT_MS,
 ): Promise<StateRead | null> {
-  let answer: unknown
-  try {
-    answer = await raceTimeout(evaluate(stateProbeScript(candidates, state)), Math.max(0, timeoutMs))
-  } catch {
-    return null
-  }
-  if (answer === TIMED_OUT || typeof answer !== 'object' || answer === null) return null
-  const shape = answer as { ok?: unknown; scope?: unknown; total?: unknown; off?: unknown; holds?: unknown; sample?: unknown; told?: unknown }
+  const answer = await askPage(evaluate, stateProbeScript(candidates, state), timeoutMs)
+  // Anything other than an answer is "not yet" here: the caller polls again, and
+  // its own budget is what ends the step.
+  if (answer.kind !== 'answer') return null
+  const shape = answer.value as { ok?: unknown; scope?: unknown; total?: unknown; notInState?: unknown; holds?: unknown; sample?: unknown; tried?: unknown }
   if (shape.ok !== true) {
-    const told = Array.isArray(shape.told) ? shape.told.filter((entry): entry is string => typeof entry === 'string') : []
+    const tried = Array.isArray(shape.tried) ? shape.tried.filter((entry): entry is string => typeof entry === 'string') : []
     return {
       held: false,
-      why: told.length === 0
+      why: tried.length === 0
         ? 'no control it names could be read'
-        : `no candidate named a control that can be asked this (${told.join('; ')})`,
+        : `no candidate named a control that can be asked this (${tried.join('; ')})`,
     }
   }
   if (shape.holds === true) return { held: true, why: '' }
   const scope = typeof shape.scope === 'string' ? shape.scope : 'the candidates'
   const total = typeof shape.total === 'number' ? shape.total : 0
-  const off = typeof shape.off === 'number' ? shape.off : 0
+  const notInState = typeof shape.notInState === 'number' ? shape.notInState : 0
   const sample = typeof shape.sample === 'string' ? shape.sample : ''
-  return { held: false, why: `${String(off)} of ${String(total)} controls in ${scope} are not ${state}${sample === '' ? '' : ` (e.g. "${sample}")`}` }
+  return { held: false, why: `${String(notInState)} of ${String(total)} controls in ${scope} are not ${state}${sample === '' ? '' : ` (e.g. "${sample}")`}` }
 }

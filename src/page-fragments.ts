@@ -205,6 +205,12 @@ export const CANDIDATE_CONTROLS = 'button, a[href], input, select, textarea, lab
  * selector is unusable" is a reason to report, not a reason to stop.
  */
 export const FRAGMENT_CANDIDATE_MATCH = `const CONTROLS = ${JSON.stringify(CANDIDATE_CONTROLS)};
+  const unmatchedReasonOf = (candidate, matches) => {
+    if (matches === null) return candidate.label + ': not a usable selector';
+    if (matches.length === 0) return candidate.label + ': no match';
+    return null;
+  };
+  const passedOver = (candidate, matched, why) => candidate.label + ': matched ' + matched + (why.length === 0 ? '' : ', ' + why.join(', '));
   const collapsed = (value) => String(value || '').trim().replace(/\\s+/g, ' ').toLowerCase();
   const matchesOf = (candidate) => {
     if (candidate.kind === 'selector') {
@@ -246,8 +252,8 @@ export const FRAGMENT_RESOLVE = `const resolveCandidates = (candidates, accept) 
     const tried = [];
     for (const candidate of candidates) {
       const matches = matchesOf(candidate);
-      if (matches === null) { tried.push(candidate.label + ': not a usable selector'); continue }
-      if (matches.length === 0) { tried.push(candidate.label + ': no match'); continue }
+      const unmatched = unmatchedReasonOf(candidate, matches);
+      if (unmatched !== null) { tried.push(unmatched); continue }
       let chosen = null;
       const unreachable = [];
       const unusable = [];
@@ -260,10 +266,10 @@ export const FRAGMENT_RESOLVE = `const resolveCandidates = (candidates, accept) 
         break;
       }
       if (chosen === null) {
-        const parts = [];
-        if (unreachable.length > 0) parts.push('none reachable (' + unreachable.join(', ') + ')');
-        if (unusable.length > 0) parts.push('not usable (' + unusable.join(', ') + ')');
-        tried.push(candidate.label + ': matched ' + matches.length + ', ' + parts.join(', '));
+        const why = [];
+        if (unreachable.length > 0) why.push('none reachable (' + unreachable.join(', ') + ')');
+        if (unusable.length > 0) why.push('not usable (' + unusable.join(', ') + ')');
+        tried.push(passedOver(candidate, matches.length, why));
         continue;
       }
       // The one wording for what a step landed on, so a summary, a failure
@@ -342,13 +348,24 @@ export const FRAGMENT_CONSENT_DOCUMENT = `const isConsentDocument = () => {
  * so answering `false` to "is it checked" would let a scope full of things that
  * are not checkboxes decide the condition. The caller drops those instead.
  *
- * Enabled and disabled are asked of any control, because `isDisabled` has an
- * answer for every element; checked and unchecked are asked of the controls that
- * hold a state, which is the same read `check` verifies with.
+ * Enabled and disabled are asked of the controls that can *be* disabled: a form
+ * control or something that plays an interactive role. A `<label>` or a `<p>`
+ * that happens to carry the same words is not "enabled", it is unaskable — the
+ * same distinction the checked question makes, for the same reason.
  */
-export const FRAGMENT_STATE_MATCH = `const matchesState = (el, wanted) => {
-    if (wanted === 'enabled') return !isDisabled(el);
-    if (wanted === 'disabled') return isDisabled(el);
+export const FRAGMENT_STATE_MATCH = `const DISABLEABLE_ROLES = ['button', 'link', 'checkbox', 'radio', 'switch', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'combobox', 'listbox', 'textbox', 'searchbox', 'spinbutton', 'slider'];
+  const canBeDisabled = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'button' || tag === 'fieldset' || tag === 'optgroup' || tag === 'option') return true;
+    if (el.hasAttribute('disabled') || el.getAttribute('aria-disabled') !== null) return true;
+    return DISABLEABLE_ROLES.indexOf(roleOf(el)) >= 0;
+  };
+  const matchesState = (el, wanted) => {
+    if (wanted === 'enabled' || wanted === 'disabled') {
+      if (!canBeDisabled(el)) return null;
+      const disabled = isDisabled(el);
+      return wanted === 'disabled' ? disabled : !disabled;
+    }
     const state = checkedStateOf(el);
     if (state === '') return null;
     return state === wanted;

@@ -27,7 +27,7 @@
 
 import type { PlaywrightPage } from './types.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { raceTimeout, TIMED_OUT } from './race.ts'
+import { askPage } from './race.ts'
 
 /** How long the page gets to answer the observation probe. */
 export const OBSERVE_TIMEOUT_MS = 5_000
@@ -151,14 +151,9 @@ export async function observePage(
 ): Promise<Observation | null> {
   const evaluate = page.evaluate?.bind(page)
   if (evaluate === undefined) return null
-  let answer: unknown
-  try {
-    answer = await raceTimeout(evaluate(OBSERVE_SCRIPT), Math.max(0, timeoutMs))
-  } catch {
-    return null
-  }
-  if (answer === TIMED_OUT || typeof answer !== 'object' || answer === null) return null
-  const shape = answer as Partial<Observation>
+  const answer = await askPage(evaluate, OBSERVE_SCRIPT, timeoutMs)
+  if (answer.kind !== 'answer') return null
+  const shape = answer.value as Partial<Observation>
   if (typeof shape.url !== 'string' || !Array.isArray(shape.controls)) return null
   return {
     url: shape.url,

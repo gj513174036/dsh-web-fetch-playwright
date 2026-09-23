@@ -184,8 +184,9 @@ describe('page fragments', () => {
   })
 
   describe('isDisabled and matchesState', () => {
+    const of = (expression: string, html: string): unknown => withFragments<unknown>(PAGE_FRAGMENTS, expression, html)
+
     it('answers disabled however the page says it, for any control', () => {
-      const of = (expression: string, html: string): unknown => withFragments<unknown>(PAGE_FRAGMENTS, expression, html)
       expect(of('isDisabled(document.querySelector("button"))', '<button disabled>go</button>')).toBe(true)
       expect(of('isDisabled(document.querySelector("div"))', '<div role="button" aria-disabled="true">go</div>')).toBe(true)
       expect(of('isDisabled(document.querySelector("button"))', '<fieldset disabled><button>go</button></fieldset>')).toBe(true)
@@ -193,7 +194,6 @@ describe('page fragments', () => {
     })
 
     it('answers the four states, and refuses to answer for a control that has none', () => {
-      const of = (expression: string, html: string): unknown => withFragments<unknown>(PAGE_FRAGMENTS, expression, html)
       expect(of('matchesState(document.querySelector("input"), "checked")', '<input type="checkbox" checked>')).toBe(true)
       expect(of('matchesState(document.querySelector("input"), "unchecked")', '<input type="checkbox">')).toBe(true)
       expect(of('matchesState(document.querySelector("div"), "checked")', '<div role="checkbox" aria-checked="true">x</div>')).toBe(true)
@@ -201,6 +201,11 @@ describe('page fragments', () => {
       expect(of('matchesState(document.querySelector("button"), "enabled")', '<button>x</button>')).toBe(true)
       expect(of('matchesState(document.querySelector("button"), "disabled")', '<button disabled>x</button>')).toBe(true)
       expect(of('matchesState(document.querySelector("button"), "disabled")', '<button>x</button>')).toBe(false)
+      expect(of('matchesState(document.querySelector("div"), "enabled")', '<div role="button">x</div>')).toBe(true)
+      // A label or a paragraph is not "enabled", it is unaskable — otherwise a
+      // candidate that matched the words rather than the control would decide.
+      expect(of('matchesState(document.querySelector("label"), "enabled")', '<label><input type="checkbox"> 同意</label>')).toBe(null)
+      expect(of('matchesState(document.querySelector("p"), "disabled")', '<p>同意</p>')).toBe(null)
       // Not "unchecked": a text field has no such state, and the caller must know.
       expect(of('matchesState(document.querySelector("input"), "unchecked")', '<input type="text">')).toBe(null)
       expect(of('matchesState(document.querySelector("label"), "checked")', '<label><input type="checkbox"> 全选</label>')).toBe(null)

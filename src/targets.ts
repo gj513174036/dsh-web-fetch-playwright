@@ -206,6 +206,20 @@ export function selectTarget(targets: readonly Target[], rawUrl: string): Target
 }
 
 /**
+ * The candidates as a page script receives them.
+ *
+ * Each one travels with its description already computed, so a script never
+ * phrases a candidate itself and the summary, the failure message and the recipe
+ * cannot drift apart.
+ *
+ * @param candidates - the recipe's candidates.
+ * @returns the same candidates, each with its `label`.
+ */
+export function labelledCandidates(candidates: readonly Candidate[]): readonly (Candidate & { readonly label: string })[] {
+  return candidates.map((candidate) => ({ ...candidate, label: describeCandidate(candidate) }))
+}
+
+/**
  * Does this URL carry a query string or hash?
  *
  * Comparison deliberately ignores both, so a pattern that writes them would mean
@@ -374,15 +388,15 @@ function parseCandidate(value: unknown, path: string): { candidate: Candidate } 
 /**
  * The candidate list a control-naming step carries.
  *
- * One place for the rules both `click` and `check` live by: at least one
- * candidate, and every one of them well formed.
+ * One place for the rules every control-naming step and condition lives by: at
+ * least one candidate, and every one of them well formed.
  */
 function parseCandidates(value: unknown, path: string, what: string): { parsed: Candidate[] } | { error: string } {
   if (!Array.isArray(value)) {
     return { error: `${at(path)}.candidates: expected an array of candidates, most precise first` }
   }
   if (value.length === 0) {
-    return { error: `${at(path)}.candidates: ${what} with no candidates can never match anything; give it one or remove it` }
+    return { error: `${at(path)}.candidates: ${what} with no candidates can never name a control; give it one or remove it` }
   }
   const parsed: Candidate[] = []
   for (const [index, raw] of value.entries()) {
