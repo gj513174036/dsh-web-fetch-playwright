@@ -27,7 +27,7 @@
 
 import type { PlaywrightPage } from './types.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { askPage, messageOf } from './race.ts'
+import { actFailure, askPage, seamFailure, sharedStepFailure, type ProbeAnswer } from './race.ts'
 import { labelledCandidates, type Candidate, type WaitCondition } from './targets.ts'
 
 /** How long the page gets to answer the click probe. */
@@ -89,19 +89,23 @@ export function clickScript(candidates: readonly Candidate[], watch?: WaitCondit
 })()`
 }
 
+/** A click attempt that did not succeed. */
+export type ClickFailure = Exclude<ClickOutcome, { readonly kind: 'clicked' } | { readonly kind: 'clicked-unreported' }>
+
 /**
- * Does this failure describe the page moving out from under the script?
+ * How a failed click reads to the person holding the error.
  *
- * The click is what caused it, so it cannot be read as "the control was not
- * there" — and a phrase list is the only signal the seam gives. Kept narrow and
- * in one place: anything else stays an honest "the page could not be read".
+ * The wording lives with the outcome it describes, so the runner does not rebuild
+ * it and two verbs cannot word the same kind of failure differently.
  *
- * @param error - what the scripting seam rejected with.
- * @returns true when the page most likely navigated.
+ * @param detail - the step's own description (`candidates: …`).
+ * @param candidates - the candidate list, for the message about passing over all of them.
+ * @param outcome - the failure.
+ * @returns one sentence for the fetch to fail with.
  */
-export function looksLikeNavigation(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  return /execution context was destroyed|navigat|target closed|context or browser has been closed|frame was detached|has been closed/i.test(message)
+export function describeClickFailure(detail: string, candidates: string, outcome: ClickFailure): string {
+  if (outcome.kind === 'not-clicked') return `no candidate could be clicked, out of ${candidates} — ${outcome.reasons.join('; ')}`
+  return sharedStepFailure(detail, outcome) ?? detail
 }
 
 /**
@@ -126,15 +130,15 @@ export async function clickCandidate(
     return { kind: 'unreadable', problem: 'the page offers no scripting, so no candidate could be tried' }
   }
   const answer = await askPage(evaluate, clickScript(candidates, watch), timeoutMs)
-  if (answer.kind === 'failed') {
+  if (answer.kind !== 'answer') {
+    const verdict = seamFailure(answer, 'click', timeoutMs)
     // The click is what moved the page out from under the script, so this is a
     // click that could not report — not a control that was not there.
-    if (looksLikeNavigation(answer.error)) return { kind: 'clicked-unreported' }
-    return { kind: 'unreadable', problem: messageOf(answer.error) }
+    return verdict?.kind === 'navigated'
+      ? { kind: 'clicked-unreported' }
+      : { kind: 'unreadable', problem: verdict?.problem ?? 'the page did not answer' }
   }
-  if (answer.kind === 'timeout') return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
-  if (answer.kind === 'unexpected') return { kind: 'unreadable', problem: 'the page answered with something other than a click result' }
-  const shape = answer.value as { ok?: unknown; candidate?: unknown; tried?: unknown; before?: unknown }
+  const shape = answer.value as ProbeAnswer & { before?: unknown }
   if (shape.ok === true) {
     return {
       kind: 'clicked',
@@ -144,6 +148,6 @@ export async function clickCandidate(
       before: typeof shape.before === 'boolean' ? shape.before : null,
     }
   }
-  const reasons = Array.isArray(shape.tried) ? shape.tried.filter((entry): entry is string => typeof entry === 'string') : []
-  return { kind: 'not-clicked', reasons }
+  const failure = actFailure(shape, 'the click could not be read back')
+  return failure.kind === 'unverified' ? { kind: 'clicked-unreported' } : { kind: 'not-clicked', reasons: failure.reasons }
 }

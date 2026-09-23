@@ -21,12 +21,12 @@
  */
 
 import type { PlaywrightPage } from './types.ts'
-import { checkControl } from './check.ts'
-import { clickCandidate } from './click.ts'
+import { checkControl, describeCheckFailure } from './check.ts'
+import { clickCandidate, describeClickFailure } from './click.ts'
 import { FRAGMENT_VISIBLE_TEXT, spliceFragments } from './page-fragments.ts'
 import { raceTimeout, TIMED_OUT } from './race.ts'
 import { readState } from './state.ts'
-import { typeInto } from './type.ts'
+import { describeTypeFailure, typeInto } from './type.ts'
 import { describeCandidate, urlIsUnder, type ActionStep, type Candidate, type Target, type WaitCondition, type WaitStep } from './targets.ts'
 
 /** Longest one step may take, before the fetch's own remaining budget caps it. */
@@ -244,7 +244,8 @@ export async function runTargetActions(
     }
 
     if (step.verb === 'click') {
-      const detail = `candidates: ${describeCandidates(step)}`
+      const candidates = describeCandidates(step)
+      const detail = `candidates: ${candidates}`
       if (budget === 0) {
         const stopped = endStep(`${detail} (only 0ms of the step budget is left)`)
         if (stopped !== null) return stopped
@@ -283,20 +284,14 @@ export async function runTargetActions(
         reports.push({ index, verb: step.verb, detail: 'a candidate (the page navigated before it could say which)', outcome: 'clicked' })
         continue
       }
-      if (outcome.kind === 'unreadable') {
-        const stopped = endStep(`${detail} (the page could not be read: ${outcome.problem})`)
-        if (stopped !== null) return stopped
-        continue
-      }
-      // Every candidate was passed over: the page says so, with one reason each.
-      const why = `no candidate could be clicked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
-      const stopped = endStep(why)
+      const stopped = endStep(describeClickFailure(detail, candidates, outcome))
       if (stopped !== null) return stopped
       continue
     }
 
     if (step.verb === 'type') {
-      const detail = `candidates: ${describeCandidates(step)}, value ${JSON.stringify(step.value)}`
+      const candidates = describeCandidates(step)
+      const detail = `candidates: ${candidates}, value ${JSON.stringify(step.value)}`
       if (budget === 0) {
         const stopped = endStep(`${detail} (only 0ms of the step budget is left)`)
         if (stopped !== null) return stopped
@@ -311,21 +306,14 @@ export async function runTargetActions(
         reports.push({ index, verb: step.verb, detail: `${outcome.candidate} (${how})`, outcome: 'met' })
         continue
       }
-      const why =
-        outcome.kind === 'mismatch'
-          ? `${outcome.candidate}: ${JSON.stringify(outcome.wanted)} was written into it (it held ${JSON.stringify(outcome.was)}) and it now holds ${JSON.stringify(outcome.value)} — the page did not take it`
-          : outcome.kind === 'unverified'
-            ? `${detail} (${outcome.problem})`
-            : outcome.kind === 'unreadable'
-              ? `${detail} (the page could not be read: ${outcome.problem})`
-              : `no candidate could be typed into, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
-      const stopped = endStep(why)
+      const stopped = endStep(describeTypeFailure(detail, candidates, outcome))
       if (stopped !== null) return stopped
       continue
     }
 
     if (step.verb === 'check') {
-      const detail = `candidates: ${describeCandidates(step)}, state ${step.state}`
+      const candidates = describeCandidates(step)
+      const detail = `candidates: ${candidates}, state ${step.state}`
       if (budget === 0) {
         const stopped = endStep(`${detail} (only 0ms of the step budget is left)`)
         if (stopped !== null) return stopped
@@ -340,15 +328,7 @@ export async function runTargetActions(
         reports.push({ index, verb: step.verb, detail: `${outcome.candidate} (${how})`, outcome: 'met' })
         continue
       }
-      const why =
-        outcome.kind === 'unchanged'
-          ? `${outcome.candidate}: it was ${outcome.was}, the click went out, and it reports ${outcome.now} — the page does not show the change`
-          : outcome.kind === 'unverified'
-            ? `${detail} (${outcome.problem})`
-            : outcome.kind === 'unreadable'
-              ? `${detail} (the page could not be read: ${outcome.problem})`
-              : `no candidate could be checked, out of ${describeCandidates(step)} — ${outcome.reasons.join('; ')}`
-      const stopped = endStep(why)
+      const stopped = endStep(describeCheckFailure(detail, candidates, outcome))
       if (stopped !== null) return stopped
       continue
     }

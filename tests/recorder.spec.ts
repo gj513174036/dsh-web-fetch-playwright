@@ -454,6 +454,15 @@ describe('NetworkRecorder', () => {
     expect(recorder).toBeUndefined()
   })
 
+  it('has the header on disk by the time create resolves', async () => {
+    // The contract, and the race that made two tests here flaky under load: the
+    // header append is async and best-effort, so `create` has to wait for it —
+    // a reader may open the dump the moment the fetch starts.
+    const recorder = await recorderWith(new FakeCdpSession(), { sessionId: () => 'header-first' })
+    expect(existsSync(recorder.jsonlPath)).toBe(true)
+    expect(readJsonl(recorder.dir)[0]).toMatchObject({ kind: 'session', fetchUrl: 'https://app.example.com/page' })
+  })
+
   it('keeps a session directory per capture, beside the base directory', async () => {
     expect(sessionDirectory('/tmp/base', 'abc')).toBe(join('/tmp/base', 'abc'))
     const recorder = await recorderWith(new FakeCdpSession(), { sessionId: () => 'two' })

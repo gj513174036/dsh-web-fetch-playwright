@@ -25,9 +25,8 @@
  * @module dsh-web-fetch-playwright/check
  */
 
-import { looksLikeNavigation } from './click.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { askPage, messageOf } from './race.ts'
+import { actFailure, askPage, seamFailure, sharedStepFailure, type ProbeAnswer } from './race.ts'
 import { labelledCandidates, type Candidate } from './targets.ts'
 import type { PlaywrightPage } from './types.ts'
 
@@ -102,6 +101,25 @@ export function checkScript(candidates: readonly Candidate[], state: ControlStat
 })()`
 }
 
+/** A check attempt that did not satisfy the precondition. */
+export type CheckFailure = Exclude<CheckOutcome, { readonly kind: 'checked' }>
+
+/**
+ * How a failed check reads to the person holding the error.
+ *
+ * @param detail - the step's own description (`candidates: …`).
+ * @param candidates - the candidate list, for the message about passing over all of them.
+ * @param outcome - the failure.
+ * @returns one sentence for the fetch to fail with.
+ */
+export function describeCheckFailure(detail: string, candidates: string, outcome: CheckFailure): string {
+  if (outcome.kind === 'unchanged') {
+    return `${outcome.candidate}: it was ${outcome.was}, the click went out, and it reports ${outcome.now} — the page does not show the change`
+  }
+  if (outcome.kind === 'not-checked') return `no candidate could be checked, out of ${candidates} — ${outcome.reasons.join('; ')}`
+  return sharedStepFailure(detail, outcome) ?? detail
+}
+
 /** A page answer that is one of the two states, or nothing. */
 function stateOf(value: unknown): ControlState | null {
   return value === 'checked' || value === 'unchecked' ? value : null
@@ -127,16 +145,16 @@ export async function checkControl(
     return { kind: 'unreadable', problem: 'the page offers no scripting, so no candidate could be tried' }
   }
   const answer = await askPage(evaluate, checkScript(candidates, state), timeoutMs)
-  if (answer.kind === 'failed') {
+  if (answer.kind !== 'answer') {
     // The act itself can navigate; the state then cannot be read back, and a
     // precondition that cannot be shown to hold is not one this verb can call
     // satisfied.
-    if (looksLikeNavigation(answer.error)) return { kind: 'unverified', problem: 'the page navigated before the state could be read back' }
-    return { kind: 'unreadable', problem: messageOf(answer.error) }
+    const verdict = seamFailure(answer, 'check', timeoutMs)
+    return verdict?.kind === 'navigated'
+      ? { kind: 'unverified', problem: 'the page navigated before the state could be read back' }
+      : { kind: 'unreadable', problem: verdict?.problem ?? 'the page did not answer' }
   }
-  if (answer.kind === 'timeout') return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
-  if (answer.kind === 'unexpected') return { kind: 'unreadable', problem: 'the page answered with something other than a check result' }
-  const shape = answer.value as { ok?: unknown; candidate?: unknown; state?: unknown; was?: unknown; acted?: unknown; attempted?: unknown; why?: unknown; tried?: unknown }
+  const shape = answer.value as ProbeAnswer & { state?: unknown; was?: unknown; acted?: unknown }
   if (shape.ok === true) {
     const now = stateOf(shape.state)
     const was = stateOf(shape.was)
@@ -146,10 +164,6 @@ export async function checkControl(
       ? { kind: 'checked', candidate, state: now, was, acted: shape.acted === true }
       : { kind: 'unchanged', candidate, was, now }
   }
-  if (typeof shape.attempted === 'string') {
-    const why = typeof shape.why === 'string' ? shape.why : 'the state could not be read back'
-    return { kind: 'unverified', problem: `${shape.attempted}: ${why}` }
-  }
-  const reasons = Array.isArray(shape.tried) ? shape.tried.filter((entry): entry is string => typeof entry === 'string') : []
-  return { kind: 'not-checked', reasons }
+  const failure = actFailure(shape, 'the state could not be read back')
+  return failure.kind === 'unverified' ? failure : { kind: 'not-checked', reasons: failure.reasons }
 }

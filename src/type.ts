@@ -34,9 +34,8 @@
  * @module dsh-web-fetch-playwright/type
  */
 
-import { looksLikeNavigation } from './click.ts'
 import { PAGE_FRAGMENTS, spliceFragments } from './page-fragments.ts'
-import { askPage, messageOf } from './race.ts'
+import { actFailure, askPage, seamFailure, sharedStepFailure, type ProbeAnswer } from './race.ts'
 import { labelledCandidates, type Candidate } from './targets.ts'
 import type { PlaywrightPage } from './types.ts'
 
@@ -104,31 +103,39 @@ export function typeScript(candidates: readonly Candidate[], value: string): str
   } catch (error) {
     return { ok: false, attempted: null, why: null, tried: found.tried.concat(found.landed + ': writing into it threw (' + String(error) + ')') };
   }
-  // Let the page react before believing anything, the same frame check waits.
-  await new Promise((resolve) => {
-    try { requestAnimationFrame(() => { setTimeout(resolve, 0) }) } catch (error) { setTimeout(resolve, 0) }
-  });
-  const live = field.isConnected === true ? field : resolveCandidates(candidates, accept).control;
+  // Let the page react first, then read the field it is showing now, the same way
+  // check judges its own act.
+  await settleFrame();
+  const live = currentControlOf(field, candidates, accept);
   if (live === null) return { ok: false, attempted: found.landed, why: 'the field could not be read back after typing (it is gone)', tried: found.tried };
   return { ok: true, candidate: found.landed, was: before, value: valueOfField(live), wanted: value };
 })()`
 }
 
+/** A type attempt whose value is not in the field. */
+export type TypeFailure = Exclude<TypeOutcome, { readonly kind: 'typed' }>
+
 /**
- * What the page answered, in the shape the script returns.
+ * How a failed write reads to the person holding the error.
  *
- * Every field is `unknown` on purpose: this is the boundary where a page's answer
- * stops being trusted, and each one is narrowed before it is used.
+ * @param detail - the step's own description (`candidates: …, value …`).
+ * @param candidates - the candidate list, for the message about passing over all of them.
+ * @param outcome - the failure.
+ * @returns one sentence for the fetch to fail with.
  */
-interface TypeAnswer {
-  readonly ok?: unknown
-  readonly candidate?: unknown
+export function describeTypeFailure(detail: string, candidates: string, outcome: TypeFailure): string {
+  if (outcome.kind === 'mismatch') {
+    return `${outcome.candidate}: ${JSON.stringify(outcome.wanted)} was written into it (it held ${JSON.stringify(outcome.was)}) and it now holds ${JSON.stringify(outcome.value)} — the page did not take it`
+  }
+  if (outcome.kind === 'not-typed') return `no candidate could be typed into, out of ${candidates} — ${outcome.reasons.join('; ')}`
+  return sharedStepFailure(detail, outcome) ?? detail
+}
+
+/** The fields only a `type` answer carries, on top of the seam's shared shape. */
+interface TypeAnswer extends ProbeAnswer {
   readonly was?: unknown
   readonly value?: unknown
   readonly wanted?: unknown
-  readonly attempted?: unknown
-  readonly why?: unknown
-  readonly tried?: unknown
 }
 
 /**
@@ -151,14 +158,14 @@ export async function typeInto(
     return { kind: 'unreadable', problem: 'the page offers no scripting, so no field could be written into' }
   }
   const answer = await askPage(evaluate, typeScript(candidates, value), timeoutMs)
-  if (answer.kind === 'failed') {
+  if (answer.kind !== 'answer') {
     // A submit that navigates can tear the context down mid-write; the field then
     // cannot be read back, and an unproven write is not a written field.
-    if (looksLikeNavigation(answer.error)) return { kind: 'unverified', problem: 'the page navigated before the field could be read back' }
-    return { kind: 'unreadable', problem: messageOf(answer.error) }
+    const verdict = seamFailure(answer, 'type', timeoutMs)
+    return verdict?.kind === 'navigated'
+      ? { kind: 'unverified', problem: 'the page navigated before the field could be read back' }
+      : { kind: 'unreadable', problem: verdict?.problem ?? 'the page did not answer' }
   }
-  if (answer.kind === 'timeout') return { kind: 'unreadable', problem: `the page did not answer within ${String(timeoutMs)}ms` }
-  if (answer.kind === 'unexpected') return { kind: 'unreadable', problem: 'the page answered with something other than a type result' }
   const shape = answer.value as TypeAnswer
   if (shape.ok === true) {
     if (typeof shape.value !== 'string' || typeof shape.wanted !== 'string') {
@@ -170,10 +177,6 @@ export async function typeInto(
       ? { kind: 'typed', candidate, was, value: shape.value }
       : { kind: 'mismatch', candidate, was, value: shape.value, wanted: shape.wanted }
   }
-  if (typeof shape.attempted === 'string') {
-    const why = typeof shape.why === 'string' ? shape.why : 'the field could not be read back'
-    return { kind: 'unverified', problem: `${shape.attempted}: ${why}` }
-  }
-  const reasons = Array.isArray(shape.tried) ? shape.tried.filter((entry): entry is string => typeof entry === 'string') : []
-  return { kind: 'not-typed', reasons }
+  const failure = actFailure(shape, 'the field could not be read back')
+  return failure.kind === 'unverified' ? failure : { kind: 'not-typed', reasons: failure.reasons }
 }

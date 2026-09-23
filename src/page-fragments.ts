@@ -381,11 +381,11 @@ export const FRAGMENT_STATE_MATCH = `const DISABLEABLE_ROLES = ['button', 'link'
  * input types that carry a value the page owns (file, range, color, hidden) are
  * refused rather than written into behind the page's back.
  */
-export const FRAGMENT_TEXT_FIELD = `const TEXT_FIELD_INPUT_TYPES = ['checkbox', 'radio', 'submit', 'button', 'reset', 'image', 'file', 'hidden', 'range', 'color'];
+export const FRAGMENT_TEXT_FIELD = `const INPUTS_THAT_TAKE_NO_TEXT = ['checkbox', 'radio', 'submit', 'button', 'reset', 'image', 'file', 'hidden', 'range', 'color'];
   const takesTextField = (el) => {
     const tag = el.tagName.toLowerCase();
     const type = (el.getAttribute('type') || '').toLowerCase();
-    if (tag === 'input') return TEXT_FIELD_INPUT_TYPES.indexOf(type) < 0;
+    if (tag === 'input') return INPUTS_THAT_TAKE_NO_TEXT.indexOf(type) < 0;
     if (tag === 'textarea') return true;
     // A native select plays the combobox role and takes no text: choosing an
     // option is a different act, and this plugin has no verb for it on purpose.
@@ -401,6 +401,24 @@ export const FRAGMENT_TEXT_FIELD = `const TEXT_FIELD_INPUT_TYPES = ['checkbox', 
     if (tag === 'input' || tag === 'textarea') return String(el.value === undefined || el.value === null ? '' : el.value);
     return String(el.textContent === undefined || el.textContent === null ? '' : el.textContent);
   };`
+
+/**
+ * Let the page react to what was just done, then hand back what it shows now.
+ *
+ * `check` and `type` both act on a control and then have to judge the result, and
+ * both learned the same two lessons: a page that owns the control re-renders
+ * after the event (a React input reverts `checked`, a controlled field restores
+ * the old value), so reading immediately would call a reverted act a success —
+ * hence a frame and a tick before reading. And the control to read is the one the
+ * page is showing *now*: the same node when the page kept it, a freshly resolved
+ * one when it replaced it — resolved through the same walk and the same filter,
+ * so the thing that answers the question is the thing the verb meant to act on.
+ */
+export const FRAGMENT_SETTLE = `const settleFrame = () => new Promise((resolve) => {
+    try { requestAnimationFrame(() => { setTimeout(resolve, 0) }) } catch (error) { setTimeout(resolve, 0) }
+  });
+
+  const currentControlOf = (el, candidates, accept) => el.isConnected === true ? el : resolveCandidates(candidates, accept).control;`
 
 /** The page-reading fragments, in the order they must be declared. */
 export const PAGE_FRAGMENTS: readonly string[] = [
@@ -418,6 +436,7 @@ export const PAGE_FRAGMENTS: readonly string[] = [
   FRAGMENT_CHECKED_STATE,
   FRAGMENT_STATE_MATCH,
   FRAGMENT_TEXT_FIELD,
+  FRAGMENT_SETTLE,
 ]
 
 /** The consent fragments, in the order they must be declared. */
