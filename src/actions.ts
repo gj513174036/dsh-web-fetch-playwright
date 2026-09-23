@@ -229,12 +229,18 @@ function watchResponses(): ResponseLog {
     else waiting.push(requests)
     return requests
   }
+  /**
+   * Which request a response belongs to, as a sequence number.
+   *
+   * An arrival nobody can trace to a request is stamped `0` — before every
+   * watermark — so it can satisfy a wait but can never be credited to a click.
+   * Crediting it would be a guess in the direction this whole feature exists to
+   * avoid: the act's credit is claimed only on evidence.
+   */
   const startOf = (request: object | undefined, url: string): number => {
     const known = request === undefined ? undefined : started.get(request)
     if (known !== undefined) return known
-    const waiting = byUrl.get(url)
-    const oldest = waiting?.shift()
-    return oldest ?? (requests += 1)
+    return byUrl.get(url)?.shift() ?? 0
   }
   const statusOf = (response: { status?: () => number }): number | null => {
     try {
@@ -266,9 +272,8 @@ function watchResponses(): ResponseLog {
           const arrival: Arrival = {
             url,
             page,
-            // Traced to its request's start when the backend reports one, and to
-            // this moment when nobody did (a response-only seam): an arrival with
-            // no request behind it cannot be older than now.
+            // Traced to its request's start when the backend reports one; a
+            // response-only seam stamps it `0`, which no watermark can precede.
             started: startOf(request, url),
             usable: !isDocumentResponse(response) && (status === null || status < 400),
             spent: false,

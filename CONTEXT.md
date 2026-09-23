@@ -78,8 +78,10 @@ _Avoid_: inspect
 **Response(响应)**:
 A reply the browser *received*, as a wait can watch for it. It is an event, not a state: it happened once, at
 a moment, and the page may not have rendered it yet — which is what makes it the direct "the data has
-arrived" signal. A target's action run only counts the responses that arrived while it was running, and each
-wait claims one arrival.
+arrived" signal. A target's run counts only what arrived while it was running, on the page it is on; a wait
+spends every matching arrival in hand (a burst is one arrival's worth of evidence); and a main-frame
+document or a failed fetch is not the data arriving. Whether a *click* may be credited with an arrival is
+decided by when its request went out, not by what was in hand.
 _Avoid_: request (that is what was sent), network log (that is the capture)
 
 **Action recording(动作录制)**:

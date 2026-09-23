@@ -1,4 +1,3 @@
-import type { PlaywrightPage, PlaywrightResponse } from './types.ts'
 /**
  * Bounding one call into the page, and naming what came back.
  *
@@ -185,23 +184,4 @@ export function actFailure(shape: ProbeAnswer, lostReason: string): ActVerdict {
   }
   const tried = shape['tried']
   return { kind: 'passed-over', reasons: Array.isArray(tried) ? tried.filter((entry): entry is string => typeof entry === 'string') : [] }
-}
-
-/**
- * Whether a response event belongs to the page's main frame as a document
- * navigation — the filter the challenge wait uses to keep the LAST such
- * response (challenge pages reload the same URL into the real document).
- * Structural members are optional; when the backend does not expose them the
- * check degrades to "looks like a document" so fakes stay usable.
- */
-export function isMainFrameDocument(response: PlaywrightResponse, page: PlaywrightPage): boolean {
-  const request = response.request?.()
-  if (request === undefined) return true
-  if (typeof request.isNavigationRequest === 'function' && !request.isNavigationRequest()) return false
-  const resourceType = typeof request.resourceType === 'function' ? request.resourceType() : undefined
-  if (resourceType !== undefined && resourceType !== 'document') return false
-  if (typeof request.frame === 'function' && typeof page.mainFrame === 'function') {
-    return request.frame() === page.mainFrame()
-  }
-  return true
 }

@@ -77,8 +77,7 @@ function statePage(answer: unknown): PlaywrightPage {
  */
 interface ResponseBeat {
   url: string
-  at: 'arm' | 'probe' | 'timer'
-  afterMs?: number
+  at: 'arm' | 'probe'
   /** When the request went out; defaults to the moment the response lands. */
   requestAt?: 'arm' | 'probe'
   /** The status the response carries; 500 models a failed fetch. */
@@ -139,12 +138,6 @@ function responsePage(beats: readonly ResponseBeat[]): PlaywrightPage {
         }
         for (const [index, beat] of beats.entries()) {
           if (beat.at === 'arm') fireResponse(index)
-          else if (beat.at === 'timer') {
-            setTimeout(() => {
-              if (beat.requestAt === undefined) fireRequest(index)
-              fireResponse(index)
-            }, beat.afterMs ?? 5)
-          }
         }
       }
       return undefined
@@ -390,6 +383,7 @@ describe('runTargetActions', () => {
     // page's data as the new page's answer.
     const opened = responsePage([])
     let fromThePageItLeft: ((response: unknown) => void) | undefined
+    let delivered = false
     const lateUrl = 'https://a.example/api/search?from=the-first-page'
     const opener = {
       url: () => 'https://a.example/search',
@@ -403,8 +397,10 @@ describe('runTargetActions', () => {
         queueMicrotask(() => {
           listener(opened as never)
           // In flight when the click went out; it lands while the NEW page is
-          // being waited on.
+          // being waited on. Its delivery is asserted below, so this case cannot
+          // pass just because the arrival never came.
           setTimeout(() => {
+            delivered = true
             fromThePageItLeft?.({
               url: () => lateUrl,
               status: () => 200,
@@ -426,6 +422,8 @@ describe('runTargetActions', () => {
     const failure = (outcome as { failure: ActionFailure }).failure
     expect(failure.index).toBe(1)
     expect(failure.detail).toContain('response under https://a.example/api/search')
+    // The arrival really happened, on the page the run had left.
+    expect(delivered).toBe(true)
   })
 
   it('never lets one wait verify a click that another act came after', async () => {
