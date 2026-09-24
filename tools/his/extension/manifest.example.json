@@ -1,0 +1,21 @@
+{
+  "_comment": "扩展清单的**模板**。里面的站点是占位符 —— 真实站点由 tools/his/build_extension.py 从仓库外的端点表生成，不进公开仓库（内网地址与路径不该公开）。",
+  "manifest_version": 3,
+  "name": "病例查询面板",
+  "version": "0.1.0",
+  "description": "在病例系统页面里直接查一个人：异常指标、历次值与趋势。同源直查，不需要后端；数据不离开页面。",
+  "content_scripts": [
+    {
+      "matches": ["https://his.example.org/*"],
+      "js": ["site.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["portal-core.js", "portal-direct.js", "portal-app.js", "portal-app.css", "bootstrap.js"],
+      "matches": ["https://his.example.org/*"]
+    }
+  ],
+  "permissions": []
+}
