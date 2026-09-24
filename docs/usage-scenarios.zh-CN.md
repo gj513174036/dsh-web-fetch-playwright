@@ -19,6 +19,7 @@
 | 站点要登录 / 要你本机的网络环境 | [场景 E](#6-场景-e本地可视浏览器隧道) | `backend: cdp` + 启动器 | 复用你本机真实 profile 的登录态 |
 | 服务器上长期跑、无人值守 | [场景 F](#7-场景-f服务器无头生产) | `backend: managed`（或 `local`） | 浏览器归 DSH 自己管，profile 长期保留 |
 | 站点前面有 Cloudflare 挑战页 | [场景 G](#8-场景-gcloudflare-挑战页) | `challengeWaitMs`（默认已开） | 等浏览器自己过验证，而不是把中间页当正文 |
+| **每天采集某个内部业务系统的数据**（登录墙 + 当日名单 + 逐人明细，如病例系统） | [实战手册：病例系统每日采集](./hospital-daily-collection.zh-CN.md) | `recordNetwork` + `targetsFile` + netdump | 一次侦察，之后是服务器上的离线作业；谁做什么、判据与红线都写在那份手册里 |
 
 三条主线，一句话各说一遍：
 
@@ -409,6 +410,7 @@ autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>
 | 想知道什么 | 读哪份 |
 | --- | --- |
 | **按场景怎么用**（本文） | `docs/usage-scenarios.zh-CN.md` |
+| **实战：病例系统每日采集**（挂号 → 就诊/体检/检验 → 异常值；含"谁做什么"分工、三个判据、红线） | [`docs/hospital-daily-collection.zh-CN.md`](./hospital-daily-collection.zh-CN.md) |
 | 装在哪、怎么部署、容器里浏览器放哪儿、字段全表 | [`docs/deployment-guide.zh-CN.md`](./deployment-guide.zh-CN.md) |
 | 真机验收怎么做（P0 代理 → P1 启动器/隧道 → P2 抓包 → P3 离线爬虫 → P4 动作模型） | [`docs/end-to-end-acceptance-manual.md`](./end-to-end-acceptance-manual.md) |
 | 特性清单、配置项语义、抓包细节、挑战处理 | [`README.zh-CN.md`](../README.zh-CN.md) / [`README.md`](../README.md) |

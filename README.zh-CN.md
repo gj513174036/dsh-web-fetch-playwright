@@ -262,6 +262,7 @@ PYTHONPATH=tools/netdump python3 -m netdump summary net-dumps/<session>/network.
 | 想知道什么 | 读哪份 |
 | --- | --- |
 | **按场景怎么用**（推荐入口） | [`docs/usage-scenarios.zh-CN.md`](./docs/usage-scenarios.zh-CN.md) |
+| **实战：病例系统每日采集**（挂号 → 就诊/体检/检验 → 异常值；含"谁做什么"分工、判据与红线） | [`docs/hospital-daily-collection.zh-CN.md`](./docs/hospital-daily-collection.zh-CN.md) |
 | 装在哪、容器里浏览器放哪儿、配置字段全表 | [`docs/deployment-guide.zh-CN.md`](./docs/deployment-guide.zh-CN.md) |
 | 真机验收怎么做（P0–P4） | [`docs/end-to-end-acceptance-manual.md`](./docs/end-to-end-acceptance-manual.md) |
 | 动作模型的设计与取舍 | [`docs/action-model-design.zh-CN.md`](./docs/action-model-design.zh-CN.md) |

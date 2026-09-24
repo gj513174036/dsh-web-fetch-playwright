@@ -262,6 +262,7 @@ Security boundary (deliberate): no clicking through Turnstile, no CAPTCHA solvin
 | What you want to know | Read |
 | --- | --- |
 | **How to use it, by scenario** (start here) | [`docs/usage-scenarios.zh-CN.md`](./docs/usage-scenarios.zh-CN.md) (Chinese) |
+| **Worked example: a daily hospital-record collection** (registrations → visits/exams/labs → abnormal values; who does what, the three go/no-go checks, the red lines) | [`docs/hospital-daily-collection.zh-CN.md`](./docs/hospital-daily-collection.zh-CN.md) (Chinese) |
 | Deployment: where to run it, containers, every setting | [`docs/deployment-guide.zh-CN.md`](./docs/deployment-guide.zh-CN.md) (Chinese) |
 | End-to-end acceptance (P0–P4) | [`docs/end-to-end-acceptance-manual.md`](./docs/end-to-end-acceptance-manual.md) |
 | The action model's design and trade-offs | [`docs/action-model-design.zh-CN.md`](./docs/action-model-design.zh-CN.md) (Chinese) |
