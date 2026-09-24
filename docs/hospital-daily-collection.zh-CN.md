@@ -152,16 +152,24 @@ autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>
 
 ```jsonc
 {
-  "name": "his-patient-detail",
-  "match": { "kind": "prefix", "url": "https://his.example.org/patient/" },
-  "actions": [
-    { "verb": "waitFor", "condition": { "kind": "text", "text": "就诊记录" } },
-    { "verb": "click",   "candidates": [{ "text": "检验" }], "opensPage": true },
-    { "verb": "waitFor", "condition": { "kind": "response",
-        "match": { "kind": "prefix", "url": "https://his.example.org/api/lab/list" } } }
+  "targets": [
+    {
+      "name": "his-patient-detail",
+      "match": { "kind": "prefix", "url": "https://his.example.org/patient/" },
+      "actions": [
+        { "verb": "waitFor", "condition": { "kind": "text", "text": "就诊记录" } },
+        { "verb": "click",   "candidates": [{ "text": "检验" }], "opensPage": true },
+        { "verb": "waitFor", "condition": { "kind": "response",
+            "match": { "kind": "prefix", "url": "https://his.example.org/api/lab/list" } } }
+      ]
+    }
   ]
 }
 ```
+
+> 文件顶层**必须是 `{"targets": [ … ]}`**：解析器只认这一个键，多一个未知键、少一层包裹都会直接报错
+> （`src/targets.ts` 的 `parseTargets()`）。`match` 里的 URL **不含 query 与 hash**，所以带一次性 ticket
+> 的地址照样能匹配——这也意味着**配方里不需要、也不应该写 ticket 之类的凭据**。
 
 把路径填进卡片的**目标文件（JSON）**，关掉观察模式，反复抓 → 逐步补齐。**最后一次成功的抓取就是你要的那份 dump。**
 下面把"反复抓"讲清楚，因为这一步最容易卡住。
