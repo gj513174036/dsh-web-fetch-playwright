@@ -426,6 +426,11 @@ print(r.status_code, body.get("status"), len((body.get("data") or {}).get("list"
 
 ## 5. 日常作业（第 13–16 步）
 
+> **这一步已经有一份可用的参考实现**：[`tools/his/`](../tools/his/README.md) —— `collect.py`（名单 → 就诊 →
+> 检验/检查 → 体检 → 单项历史 → 危急值，幂等续跑、名单 0 条告警）、`rules.py`（异常判定，带 `ruleId` /
+> `ruleVersion` / `why` 审计字段）、一个假病例系统与 19 个测试用例。它的端点表是**占位示例**，真实路径放在
+> 仓库之外用 `--endpoints` 指过去 —— 所以工具本身可以公开，你的系统细节留在自己机器上。
+
 ### 第 13 步：会话头保鲜
 
 * 长期有效：跳过，手工更新 `session-headers.json` 即可。
