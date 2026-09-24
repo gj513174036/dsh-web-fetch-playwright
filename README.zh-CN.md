@@ -6,6 +6,21 @@
 
 ![npm](https://img.shields.io/npm/v/dsh-web-fetch-playwright) ![license](https://img.shields.io/npm/l/dsh-web-fetch-playwright) ![node](https://img.shields.io/node/v/dsh-web-fetch-playwright) ![CI](https://img.shields.io/github/actions/workflow/status/chendefine/dsh-web-fetch-playwright/ci.yml) ![stars](https://img.shields.io/github/stars/chendefine/dsh-web-fetch-playwright)
 
+## 按场景选路
+
+先看这一张表，再决定动哪个开关（详细到命令、配置与失败处理的那份手册：[`docs/usage-scenarios.zh-CN.md`](./docs/usage-scenarios.zh-CN.md)）：
+
+| 你要干的事 | 走哪条路 | 一句话 |
+| --- | --- | --- |
+| 把页面正文拿回来（含 SPA） | 默认即可 | 渲染 + 降噪就是默认行为 |
+| 陌生站点，先判断"难在哪" | `node tools/probe/probe-site.mjs '<url>'` | 判词只作分流线索，结论来自正式路径 |
+| 长期批量取数，站点有干净接口 | `recordNetwork: true` → `netdump` | 生成**无浏览器、无 AI** 的 `httpx` 爬虫 |
+| 数据要**先在页面上操作几步**才出现 | `targetsFile`（先 `observe: true` 看一眼） | 把发现固化成仓库里的配方，确定性重放 |
+| 站点要登录 / 要你本机网络环境 | `backend: cdp` + `dsh-web-fetch-launch` | 复用本机真实 profile 的登录态 |
+| 服务器长期无人值守 | `backend: managed` | 浏览器归 DSH 自己管，profile 长期保留 |
+
+**决策顺序**：先问"接口优先"——能拿到干净接口的站点根本不需要动作模型；接口挖不到、页面又必须操作，才写配方。
+
 ## 特性
 
 - **目标（URL → 动作）** —— 一个 JSON 文件提供具名配方：精确或前缀的 URL 匹配，随后是一串有序步骤，每步的后置条件必须成立才会读取文档。最长匹配者胜；两条同样具体的匹配是配置错误；没有命中的 URL 与今天完全一致地抓取。`waitFor` 等的是可见文本出现/消失、URL、固定时长、**一串候选之上的状态**（全部选中 / 全部未选 / 全部可用 / 全部禁用）——这种正是闸门需要的：它的要求住在状态里，任何标签上都没写——或者**某个 URL 的响应到达**（用与目标相同的 match 子句）：这是"数据已经到了"的直接信号，从动作开始那一刻就在听，所以**运行开始时那一页**在此之前取到的响应不能充当等待的答案（`opensPage` 点开的那一页从弹出那一刻起就被监听，它加载时自己的流量在窗口内——那一页就是抓取要读的文档）。响应是**事件**而不是状态，所以定下了六条：等待会把手里所有匹配的到达**一起消费**（双请求留下的重复不能应付下一次等待）；只有运行**当前所在的那一页**能作答（被 `opensPage` 离开的那一页不算）；主文档与 4xx/5xx **都不算**"数据到了"（但失败句里会点名，含状态码）；点击的功劳**按请求何时发出**算——点击派发前记一个请求水位，只有水位之后发出的请求带来的匹配响应才算这次点击的功劳（点击时已经在飞行中的响应证明不了任何事，被此前等待消费过的也不算），并且**一次等待只确认它前面紧挨着的那个动作**；页面没有响应事件缝时这一步响亮失败，而不是空等预算。`click` 说的是**意图**加一串**有序候选**（CSS 选择器、可见文本、角色+可访问名），点的是第一个**够得着**的候选——够不够得着（存在、占布局、没被盖住、没禁用）在**点之前**就验过；候选全部落空则整次抓取失败，错误里带第几步、试过哪些候选、当时 URL。标了 `"opensPage": true` 的点击**预期会开一个新标签页**（`target="_blank"`、`window.open`）：整次运行会等它、接着在它上面跑，抓取读的也是**那一页**的文档；没开出来就这一步失败，而不是拿它停留的那一页冒充结果。点击**不替页面承诺效果**：跟在它后面的 `waitFor` 才是判据，没有后续 `waitFor` 确认的点击在摘要里标成 `clicked (unverified)`。`type` 把值写进第一个够得着的输入框，并且**让页面真的收到**（先聚焦、走**原型链上的** value setter、再派发 `input` 与 `change`）；它替换原有内容而不是追加，写完回读一次——页面把改动还原回去时会响亮失败，而不是拿一个空查询框去搜。`check` 满足一个前置条件：按人的做法把控件置入某状态——点控件本身，或点把点击转发给它的 `<label>`——并且**只有在控件事后确实报出该状态时**才算通过；已经在目标状态里的控件不会被再点一次。某步不成立时以 `WEB_FETCH_ACTION` 停止抓取，而不是读取一个目标从未到达的页面；目标跑过后，正文首行是"跑了什么、最终落在哪一页"的一行摘要：
@@ -241,6 +256,18 @@ PYTHONPATH=tools/netdump python3 -m netdump summary net-dumps/<session>/network.
 4. **明确失败** —— 返回独立的 `WEB_FETCH_CHALLENGE` 错误码（web seam 的 `code` 是开放字符串，允许 provider 专属码），消息中写明站点、等待预算与最后一次挑战响应的状态。
 
 安全边界（刻意为之）：不点击 Turnstile、不解验证码、不注入 token、不伪装指纹/UA、不做代理**轮换**（配置的代理是单一的静态出口，绝不会按请求切换以绕过挑战）、不导出 cookie——隔离模式下本次抓取挣到的通关态随其 context 一起销毁；profile 模式下它留在远端浏览器自己的 profile 里，插件从不复制或清理。等待始终受 `challengeWaitMs` 与 45s 单次抓取预算双重约束，永不无限阻塞。
+
+## 文档
+
+| 想知道什么 | 读哪份 |
+| --- | --- |
+| **按场景怎么用**（推荐入口） | [`docs/usage-scenarios.zh-CN.md`](./docs/usage-scenarios.zh-CN.md) |
+| 装在哪、容器里浏览器放哪儿、配置字段全表 | [`docs/deployment-guide.zh-CN.md`](./docs/deployment-guide.zh-CN.md) |
+| 真机验收怎么做（P0–P4） | [`docs/end-to-end-acceptance-manual.md`](./docs/end-to-end-acceptance-manual.md) |
+| 动作模型的设计与取舍 | [`docs/action-model-design.zh-CN.md`](./docs/action-model-design.zh-CN.md) |
+| 配方资产清单 | [`targets/README.md`](./targets/README.md) |
+| 抓包 → 接口清单 → 爬虫 | [`tools/netdump/README.md`](./tools/netdump/README.md) |
+| 领域词汇 | [`CONTEXT.md`](./CONTEXT.md) |
 
 ## 开发
 

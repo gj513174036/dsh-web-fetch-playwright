@@ -335,7 +335,69 @@ python3 crawler.py --limit 20
 
 ---
 
-## 9. 待你真机验证项（本环境无法验证，**未声称已验证**）
+## 9. P4：动作模型（目标 / observe / 重放）
+
+前置：一个带 `--remote-debugging-port` 的浏览器（拓扑 B），或本机能跑 `local`/`managed`。
+
+### 9.1 观察（发现阶段）
+
+设置卡片打开 `observe`，抓一次目标页。预期：返回**可操作状态**而不是正文——最终 URL 与标题、可触及控件及其标签与状态（`checked`/`unchecked`/`disabled`/`covered`、以标签形式可见）、完整计数、可见文本开头。
+
+判定：从这份报告里能读出"这页要求什么、下一步能点什么"。读不出来就说明这个站不适合动作模型（可能该走接口路径，§7）。
+
+### 9.2 重放（固化之后）
+
+设置 `targetsFile` 指向仓库里的配方（例如 `targets/nmpa-datasearch.json`），把 `dismissConsent` 关掉（闸门类站点由配方接管；开启时它自己会以 `WEB_FETCH_CONSENT` 失败）：
+
+```
+web_fetch("https://datasearch.nmpa.gov.cn/datasearch/home-index.html")
+```
+
+真机预期（本仓库 0.2.26 实测，逐字）：
+
+```
+> actions: 1. waitFor text "使用提示" — met
+  · 2. click selector "a[title=\"境内生产药品\"]" -> a — clicked (unverified)
+  · 3. type selector "input[data-step=\"4\"]" -> textbox (now "阿司匹林") — met
+  · 4. click selector "button[data-step=\"5\"]" -> button (it opened a page; the rest of the target runs there) — clicked
+  · 5. waitFor response under https://datasearch.nmpa.gov.cn/datasearch/data/nmpadata/countNums — met
+  · 6. waitFor text "阿司匹林肠溶片" — met
+  → final document https://datasearch.nmpa.gov.cn/datasearch/search-result.html (HTTP 200)
+```
+
+判定要点：
+
+- 第 4 步是 `clicked`（不是 `clicked (unverified)`）——被第 5 步的响应条件证明；第 2 步后面紧挨着 `type`，如实标 `clicked (unverified)`。
+- 正文是登记册自己的结果表（`国药准字H23022137 | 阿司匹林肠溶片 | …`）。
+- 抓取前后浏览器标签页数不变（没有野标签页）。
+
+### 9.3 负向对照（必做）
+
+把配方第 5 步换成一个页面从不调用的端点，重跑。预期：**响亮失败**，而不是空等到超时说不清原因：
+
+```
+WEB_FETCH_ACTION
+target "…" step 5 (waitFor) did not hold: response under …/never-this-endpoint:
+  the last response was …/config/ff80808183cad75001840881f848179f.json?date=… (HTTP 200)
+  (not met within 10000ms) — at https://datasearch.nmpa.gov.cn/datasearch/search-result.html
+```
+
+### 9.4 配方文件的其它判定
+
+| 判定 | 预期 |
+| --- | --- |
+| 两条一样具体的 `match` | 抓取失败 `WEB_FETCH_TARGET`，消息点名两个 target |
+| 配方 JSON 非法 / 结构非法 | `WEB_FETCH_TARGET`，消息带 JSON 路径 |
+| 没有目标命中该 URL | 照常抓取，正文**不出现**动作摘要 |
+| 某步标了 `"optional": true` 且没达成 | 该步在摘要里记 `skipped`，其余步骤仍严格 |
+| 中间隔着别的动作时 | 前面的点击不会被后面的等待"背书"（记 `clicked (unverified)`） |
+| 动作打开的页面 | 标 `"opensPage": true` 的点击会接管它，之后所有步骤与抓取读取的文档都在那一页，且它随抓取关闭 |
+
+配方资产清单与每份配方的用途：[`targets/README.md`](../targets/README.md)；写法的完整语法与场景：[`usage-scenarios.zh-CN.md`](./usage-scenarios.zh-CN.md) §5。
+
+---
+
+## 10. 待你真机验证项（本环境无法验证，**未声称已验证**）
 
 | 项 | 为什么本环境无法验证 | 你在真机上的判定方法 |
 | --- | --- | --- |
@@ -348,7 +410,7 @@ python3 crawler.py --limit 20
 
 ---
 
-## 10. 最终门禁结论
+## 11. 最终门禁结论
 
 复核方式：从最终提交 `d95361a` 用 `git archive` 取**干净检出**到 `/tmp/t8-clean`（不含 `node_modules`、`lib/`），在干净检出里 `pnpm install --frozen-lockfile` 重装依赖（`prepare` 顺带产出 `lib/`），再跑三条门禁。
 
@@ -365,7 +427,7 @@ python3 crawler.py --limit 20
 
 ---
 
-## 11. 交付物自洽核对（摘要）
+## 12. 交付物自洽核对（摘要）
 
 - README(en/zh) 与 `SECURITY.md` 对「代理在各后端的行为」「CDP 拓扑不下发代理凭据」「DevTools 端口只绑回环」「profile 复制排除与 `--force`」「抓包产物 0700/0600 且含明文凭据」的描述逐条一致。
 - 旧声明已清理：README 里裸的 `no proxy rotation` 已改写为「配置的代理是单一静态出口，插件不按请求轮换」（离线 crawler 的 `--proxy`/`--proxies-file` 轮换属于生成物，不是插件行为）；`always headless` 的表述已改为「按 `headless` 设置，作用于 local 与 managed，CDP 下只影响启动器命令」。

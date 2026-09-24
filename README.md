@@ -6,6 +6,21 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) plug
 
 ![npm](https://img.shields.io/npm/v/dsh-web-fetch-playwright) ![license](https://img.shields.io/npm/l/dsh-web-fetch-playwright) ![node](https://img.shields.io/node/v/dsh-web-fetch-playwright) ![CI](https://img.shields.io/github/actions/workflow/status/chendefine/dsh-web-fetch-playwright/ci.yml) ![stars](https://img.shields.io/github/stars/chendefine/dsh-web-fetch-playwright)
 
+## Choose your path
+
+| What you want | Where to go | In one line |
+| --- | --- | --- |
+| The article text of a page (SPA included) | nothing to configure | rendering + denoise is the default |
+| Meet an unfamiliar site and find out what makes it hard | `node tools/probe/probe-site.mjs '<url>'` | a verdict is a routing hint; the answer comes from the formal path |
+| Long-running batch collection where the site has a clean API | `recordNetwork: true` → `netdump` | produces an `httpx` crawler that needs **no browser and no AI** |
+| Data that only appears after **acting on the page** | `targetsFile` (look first with `observe: true`) | freeze the discovery as a committed target and replay it |
+| A site that needs a login, or your own machine's network | `backend: cdp` + `dsh-web-fetch-launch` | reuse the real profile of the browser on your machine |
+| A server that runs unattended | `backend: managed` | DSH keeps one persistent browser; the profile survives restarts |
+
+**Order of decisions**: ask about the API first — a site with a clean endpoint needs no action model at all; only when the endpoint is unreachable and the page must be operated do you write a target.
+
+The step-by-step manual (scenarios, commands, settings, failure handling) is [`docs/usage-scenarios.zh-CN.md`](./docs/usage-scenarios.zh-CN.md) — written in Chinese; this README covers the same surface in English, and the deployment/acceptance guides are also Chinese.
+
 ## Features
 
 - **Targets (URL → actions)** — a JSON file of named recipes: an exact or prefix URL match, then ordered steps whose post-conditions must hold before the document is read. The longest match wins; two equally specific matches are a configuration error; a URL that matches nothing is fetched exactly as before. `waitFor` waits for visible text appearing or disappearing, a URL, a fixed time, a **state** over a candidate list (`all checked` / `all unchecked` / `all enabled` / `all disabled`) — the one a gate needs, whose requirement lives in state and in no label — or a **response** whose URL matches (the same match clause a target carries): the direct "the data has arrived" signal, watched from the moment the actions start, so a response the page the run starts on fetched before the run cannot satisfy a wait (the page an `opensPage` click opens is watched from the moment it opens, so its own loading traffic is inside the window — that page *is* the document the fetch reads). A response is an event rather than a state: a wait spends every matching arrival in hand (so a duplicate from a double-fetch cannot answer the next wait), only the page the run is on answers (not the one an `opensPage` step left), a main-frame document or a 4xx/5xx never counts as the data arriving (though both are named in a failure), and a click is credited only with a response from a request that started **after** the click — a response already in flight when it went out proves nothing, as does one an earlier wait spent — with a wait confirming only the act immediately before it. `click` names an intent and an ordered candidate list (a CSS selector, a visible text, or a role with an accessible name) and clicks the first *reachable* one — reachability (exists, laid out, not covered, not disabled) is verified before the click, and a candidate list that runs out fails the fetch with the step, the candidates and the URL. A click marked `"opensPage": true` is expected to open a tab (`target="_blank"`, `window.open`): the run waits for it, continues on it, and the fetch reads *that* document; no tab, and the step fails instead of reading the page it stayed on. The click does not claim its own effect: the `waitFor` after it is what proves the page moved, and a click no later `waitFor` confirmed is marked `clicked (unverified)` in the summary. `type` writes a value into the first reachable field that takes text and makes the page hear it (focus, the prototype's value setter, `input` + `change`), replacing what was there and reading it back so a page that reverted it fails loudly instead of searching with an empty box. `check` satisfies a precondition by putting a control into a state the way a person does it — through the control itself, or the `<label>` that forwards a click to it — and passes only when the control *reports* that state afterwards; a control already in it is left alone. A step that does not hold stops the fetch with `WEB_FETCH_ACTION` instead of reading a page the target never reached, and when a target runs the body opens with a one-line summary of what ran and where it ended:
@@ -241,6 +256,18 @@ With the wait on (default):
 4. **Clear failure** — `WEB_FETCH_CHALLENGE` (a provider-specific code the web seam's open-string `code` allows) naming the site, the budget spent, and the last challenge status.
 
 Security boundary (deliberate): no clicking through Turnstile, no CAPTCHA solving or token injection, no fingerprint/UA spoofing, and no proxy **rotation** (the configured proxy is a single static egress hop — it is never swapped per request to dodge a challenge) — and no cookie export: in isolated mode the clearance a fetch's browser earns dies with that fetch's context; in profile mode it stays in the browser's own profile, which this plugin never copies or cleans. The wait is always bounded by `challengeWaitMs` and the 45s per-fetch deadline; nothing blocks forever.
+
+## Documentation
+
+| What you want to know | Read |
+| --- | --- |
+| **How to use it, by scenario** (start here) | [`docs/usage-scenarios.zh-CN.md`](./docs/usage-scenarios.zh-CN.md) (Chinese) |
+| Deployment: where to run it, containers, every setting | [`docs/deployment-guide.zh-CN.md`](./docs/deployment-guide.zh-CN.md) (Chinese) |
+| End-to-end acceptance (P0–P4) | [`docs/end-to-end-acceptance-manual.md`](./docs/end-to-end-acceptance-manual.md) |
+| The action model's design and trade-offs | [`docs/action-model-design.zh-CN.md`](./docs/action-model-design.zh-CN.md) (Chinese) |
+| The committed targets | [`targets/README.md`](./targets/README.md) |
+| Capture → endpoint inventory → crawler | [`tools/netdump/README.md`](./tools/netdump/README.md) |
+| Domain vocabulary | [`CONTEXT.md`](./CONTEXT.md) |
 
 ## Development
 

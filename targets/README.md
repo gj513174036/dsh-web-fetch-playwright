@@ -1,5 +1,10 @@
 # Targets
 
+> **怎么写一份配方？** 完整语法（四个动词、五种等待条件、候选、`optional`、`opensPage`）、
+> 三步走（发现 → 固化 → 重放）、怎么读动作摘要与失败句：见
+> [`docs/usage-scenarios.zh-CN.md` §5](../docs/usage-scenarios.zh-CN.md#5-场景-d页面要先操作才出数据)。
+> 本文只说明**这个目录里各份文件是什么、证明什么**。
+
 Recipes that a fetch can be pointed at with the `targetsFile` setting, in two kinds:
 
 - **`verify-*.json` — verification assets.** They exist so a release's behaviour can be
