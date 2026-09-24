@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>病例查询端口</title>
+<link rel="stylesheet" href="portal-app.css">
+</head>
+<body>
+<!--
+  这一页只是"后端取数"这个载体的一层薄壳：
+  界面在 portal-app.js，判定与聚合在 portal-core.js，取数在 portal-transport-http.js。
+  同一个界面还能跑在医院站点自己的页面里（portal-direct.js + 扩展），
+  那时不需要后端 —— 三条路共用同一份判定，所以结论不会因为载体不同而不同。
+-->
+<div id="his-portal-root" style="min-height:100vh"></div>
+<script src="portal-core.js"></script>
+<script src="portal-app.js"></script>
+<script src="portal-transport-http.js"></script>
+<script>
+  "use strict";
+  HisPortalApp.mount(document.getElementById("his-portal-root"), HisHttpTransport.create());
+</script>
+</body>
+</html>
