@@ -129,6 +129,47 @@ class ExtensionEndToEndTest(unittest.TestCase):
         # 状态栏必须显示"同源直查"这条路径，而不是后端
         self.assertIn("同源直查", report["status"])
 
+    def test_pagination_works_in_the_browser_too(self) -> None:
+        """真页面上证明"翻到底"：端点表把每页调成 2 条，5 份检验报告必须一份不少。
+
+        真机上就是这里出的问题：检验报告共 71 份、一页只回 50 份，只取第一页会少 21 份。
+        """
+        with open(os.path.join(TOOLS, "endpoints.example.json"), encoding="utf-8") as handle:
+            doc = json.load(handle)
+        for key in ("reports", "checkups", "crisis", "clinicRecords"):
+            doc[key]["pageSize"] = 2
+        endpoints_path = os.path.join(self.tmp.name, "endpoints-paged.json")
+        with open(endpoints_path, "w", encoding="utf-8") as handle:
+            json.dump(doc, handle, ensure_ascii=False)
+        extension = os.path.join(self.tmp.name, "extension-paged")
+        build_extension.build(endpoints_path, self.base, extension, hospital_id="c" * 32)
+
+        env = dict(os.environ)
+        env["CHROME_PATH"] = self.chrome
+        if os.path.isdir("/tmp/sysroot/usr/lib/x86_64-linux-gnu"):
+            env["LD_LIBRARY_PATH"] = "/tmp/sysroot/usr/lib/x86_64-linux-gnu:/tmp/sysroot/lib/x86_64-linux-gnu"
+            env["FONTCONFIG_PATH"] = "/tmp/sysroot/etc/fonts"
+        result = subprocess.run(
+            [NODE, DRIVER, extension, f"{self.base}/demo", "测试丙", "13800000003"],
+            capture_output=True, text=True, timeout=600, env=env, cwd=REPO)
+        try:
+            report = json.loads(result.stdout[result.stdout.index("{"):])
+        except (ValueError, json.JSONDecodeError):
+            self.fail(f"驱动没有输出结论（returncode={result.returncode}）\n"
+                      f"stdout: {result.stdout[-1500:]}\nstderr: {result.stderr[-1500:]}")
+        detail = json.dumps(report, ensure_ascii=False, indent=1)
+        self.assertEqual(report["errors"], [], detail)
+        counts = report.get("counts") or {}
+        self.assertEqual(counts.get("labs"), 5, detail)        # 每页 2 条 → 要翻 3 页
+        self.assertEqual(counts.get("checkups"), 3, detail)    # 每页 2 条 → 要翻 2 页
+        # 明细也要一份不少：检验 2+3+4+5+6=20 项、体检 2+3+4=9 项、处方 2 条 = 31
+        self.assertEqual(counts.get("items"), 31, detail)
+        self.assertEqual(counts.get("visits"), 2, detail)      # 其中一次缺 registerId
+        # 缺 registerId 的那次就诊：浏览器侧也要"不报错、但给出警告"（与 Python 侧同款行为）
+        self.assertEqual(report.get("metaErrors"), [], detail)
+        self.assertTrue(any("registerId" in warning for warning in (report.get("metaWarnings") or [])),
+                        detail)
+
     def test_session_loss_is_reported_not_swallowed(self) -> None:
         """假系统缺 Cookie 时回 HTTP 200 + 业务 401 —— 页面必须说出"会话失效"，不能白屏。"""
         if not self.chrome:

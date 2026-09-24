@@ -60,6 +60,13 @@
     return doc ? doc.data : null;
   }
 
+  /** 每页多少条：放进端点表里，因为不同站点的上限不一样。 */
+  function pageSizeOf(endpoints, key, fallback) {
+    const spec = endpoints[key] || {};
+    const size = Number(spec.pageSize);
+    return Number.isFinite(size) && size >= 1 ? Math.floor(size) : (fallback || 50);
+  }
+
   /** 把端点表里的一条渲染成 URL + 参数（`path` 里的 `{name}` 用 values 替换）。 */
   function renderEndpoint(endpoints, key, values) {
     const spec = endpoints[key];
@@ -268,6 +275,30 @@
     return [day, String(who), kind, String(sourceId)].join("|");
   }
 
+  /**
+   * "同一份报告这次比上次少了几个明细项" → 告警文案。
+   *
+   * 为什么需要它：真机上实测到过一次**事实条数完全相同、只有某条明细的项数少了 9 项**
+   * （而且零接口报错）。数值变少是最该被人看见的一类静默变化 —— 可能是报告被修订，
+   * 也可能上游改版了。所以重新采集时逐条比一比，少一条就写进 `errors`，
+   * 让页面顶上把它显出来，而不是安静地少显示几个值。
+   */
+  function shrinkWarnings(previousFacts, freshFacts) {
+    const before = new Map();
+    for (const fact of previousFacts || []) before.set(fact.key, (fact.items || []).length);
+    const warnings = [];
+    for (const fact of freshFacts || []) {
+      const was = before.get(fact.key);
+      if (was === undefined) continue;
+      const now = (fact.items || []).length;
+      if (now < was) {
+        warnings.push(`${fact.kind}/${fact.source.sourceId}: 明细从 ${was} 项降到 ${now} 项`
+                      + "（报告可能被修订，或上游改版了）");
+      }
+    }
+    return warnings;
+  }
+
   function factRow(day, patient, kind, sourceId, endpoint, items, extra) {
     return {
       key: factKey(day, patient, kind, sourceId),
@@ -337,6 +368,7 @@
     let dictionaries = null;
     let dictionariesEnabled = config.dictionaries !== false;
     let lastErrors = [];
+    let lastWarnings = [];
 
     function headers() {
       const head = { Accept: "*/*", "Content-Type": "application/json" };
@@ -371,6 +403,54 @@
       return { url, doc: assertBusiness(key, await request(url)) };
     }
 
+    /**
+     * 按 `total` 翻到底。
+     *
+     * **只取第一页会安静地少掉三成**：实测某患者检验报告共 71 份、一页只回 50 份；
+     * 就诊病历共 175 条、一页只回 19 条。而且分页边界不稳定，"少几条"看起来像偶发抖动。
+     * 所以这里一律翻到底，取不全就记一条警告（与 Python 侧同一套做法）。
+     */
+    async function fetchPages(key, values, fallbackSize) {
+      const size = pageSizeOf(endpoints, key, fallbackSize);
+      const rows = [];
+      let total = null;
+      let pages = null;
+      let previous = null;
+      for (let page = 1; page <= 500; page += 1) {
+        const doc = assertBusiness(key, await request(renderEndpoint(endpoints, key,
+          { ...values, pageNum: page, pageSize: size })));
+        const batch = rowsOf(doc);
+        // 服务端忽略 pageNum 时第二页会和第一页一模一样：必须停，否则既抄很多遍，
+        // 又会因为"行数够了"误判成取全了。
+        const signature = batch.map((row) => String(row && row.id)).join("|");
+        if (signature && signature === previous) break;
+        previous = signature;
+        if (total === null) {
+          const data = doc && doc.data;
+          const pagination = data && data.pagination;
+          const raw = (pagination && pagination.total) !== undefined ? pagination.total
+            : (data && data.total);
+          const parsed = Number(raw);
+          total = Number.isFinite(parsed) ? parsed : null;
+          const parsedPages = Number(pagination && pagination.pages);
+          pages = Number.isFinite(parsedPages) ? parsedPages : null;
+        }
+        rows.push(...batch);
+        if (!batch.length) break;
+        if (total !== null && rows.length >= total) break;
+        // **不能因为"这页不满 size"就停**：真机上 `clinic_record/page` 每页行数不定
+        // （19/15/30/15），第一页就不满 50 —— 按老写法 175 条只拿到 19 条。
+        // 只要服务端还说有下一页，就继续翻。
+        if (pages !== null && page >= pages) break;
+        if (total === null && pages === null && batch.length < size) break;
+      }
+      if (total !== null && rows.length < total) {
+        lastWarnings.push(`${key}: 拿到 ${rows.length} 行 / 服务端声称共 ${total} 条`
+                          + "（该接口每页行数不定或分页有重叠，对不上账；已把服务端愿意给的全部取回）");
+      }
+      return { rows, total };
+    }
+
     async function getSoft(key, values) {
       const url = renderEndpoint(endpoints, key, values);
       return { url, doc: await soft(key, request(url)) };
@@ -382,13 +462,15 @@
 
     // ---- 搜索：姓名 → 全部同名候选 ---------------------------------- //
     async function search(name, telephone) {
-      const { doc } = await get("identity", { name, pageNum: 1, pageSize: 50 });
+      // 同名的人如果被分页截断，可能就看不到"真正的那个人" —— 这里必须翻全
+      const { rows } = await fetchPages("identity", { name }, 50);
       const wanted = String(telephone || "").trim();
-      return rowsOf(doc).map((row) => {
+      return rows.map((row) => {
         const phone = String(row.telephone || "");
         return {
           name: row.name,
-          sex: row.gender === "M" ? "男" : row.gender === "F" ? "女" : String(row.gender || ""),
+          // 真机 identity 行的性别是 M/F，字典码也可能是 1/2 —— 两种都认，认不出就原样显示
+          sex: ({ M: "男", F: "女", "1": "男", "2": "女" })[String(row.gender)] || String(row.gender || ""),
           age: row.age,
           telephoneMasked: CORE.maskPhone(phone),
           identityCardMasked: CORE.maskCard(row.identityCard),
@@ -405,6 +487,7 @@
       const report = settings.onProgress || (() => {});
       const day = today();
       lastErrors = [];
+      lastWarnings = [];
       const patient = {
         hisUserId: candidate.hisUserId,
         hmsUserId: candidate.hmsUserId,
@@ -419,6 +502,7 @@
       if (!hisUserId && !hmsUserId) throw new Error("这条候选没有可用的患者 id，无法采集");
 
       let facts = cache.load(patient);
+      const previous = facts.slice();   // 重新采集会清缓存，先留一份用来比"明细有没有变少"
       if (settings.refresh) {
         cache.clear(patient);
         facts = [];
@@ -431,13 +515,14 @@
       await dictionaries.load();
 
       // ② 就诊病历 + 医嘱/处方（病历详情里的 itemList）
+      const withoutRegister = [];
       if (hisUserId) {
-        const { url, doc } = await get("clinicRecords", { userId: hisUserId, pageNum: 1, pageSize: 50 });
-        const records = rowsOf(doc);
+        const { rows: records } = await fetchPages("clinicRecords", { userId: hisUserId }, 50);
         report(PHASES.visit, 0, records.length);
         for (const [index, record] of records.entries()) {
           report(PHASES.visit, index + 1, records.length);
           const visitId = String(record.id);
+          const registerId = record.registerId;
           const key = factKey(day, patient, "visit", visitId);
           if (!done.has(key)) {
             const fact = factRow(day, patient, "visit", visitId, String(endpoints.clinicRecords.path), [], {
@@ -448,9 +533,15 @@
             collected.push(fact);
             done.add(key);
           }
-          const detailPath = endpoints.visitDetail && endpoints.visitDetail.path;
+          // 详情接口**硬要求** registerId，而实测有 11/76 条就诊记录没有这个字段
+          // （用 recordsNo 或 id 顶上去都会被拒："not exist"）。这类别白费请求，
+          // 也不要报成错误 —— 记一条警告，说明这次就诊的处方明细拿不到。
+          if (!registerId) {
+            withoutRegister.push(String(record.recordsNo || visitId));
+            continue;
+          }
           const { url: detailUrl, doc: detail } = await getSoft("visitDetail",
-            { id: visitId, registerId: record.registerId });
+            { id: visitId, registerId });
           if (!detail) continue;
           const orders = prescriptionItems(detail, dictionaries);
           const orderKey = factKey(day, patient, "prescription", visitId);
@@ -467,8 +558,7 @@
       for (const kind of ["lab", "exam"]) {
         if (!hisUserId) break;
         const itemType = itemTypes()[kind] || kind.toUpperCase();
-        const { doc } = await get("reports", { userId: hisUserId, itemType, pageNum: 1, pageSize: 50 });
-        const reports = rowsOf(doc);
+        const { rows: reports } = await fetchPages("reports", { userId: hisUserId, itemType }, 50);
         report(PHASES[kind], 0, reports.length);
         for (const [index, report_] of reports.entries()) {
           report(PHASES[kind], index + 1, reports.length);
@@ -487,8 +577,7 @@
 
       // ⑤⑧ 体检 + 危急值（档案侧，用 hmsUserId）
       if (hmsUserId) {
-        const { doc } = await get("checkups", { userId: hmsUserId, pageNum: 1, pageSize: 50 });
-        const reports = rowsOf(doc);
+        const { rows: reports } = await fetchPages("checkups", { userId: hmsUserId }, 50);
         report(PHASES.checkup, 0, reports.length);
         for (const [index, row] of reports.entries()) {
           report(PHASES.checkup, index + 1, reports.length);
@@ -512,17 +601,25 @@
           if (medicalNo) {
             const crisisKey = factKey(day, patient, "crisis", String(medicalNo));
             if (!done.has(crisisKey)) {
-              const { url: crisisUrl, doc: crisisDoc } = await get("crisis",
-                { medicalNo: String(medicalNo), pageNum: 1, pageSize: 200 });
-              collected.push(factRow(day, patient, "crisis", String(medicalNo), crisisUrl,
-                crisisItems(rowsOf(crisisDoc))));
+              const crisisPath = renderEndpoint(endpoints, "crisis", { medicalNo: String(medicalNo) });
+              const { rows: crisisRows } = await fetchPages("crisis",
+                { medicalNo: String(medicalNo) }, 200);
+              collected.push(factRow(day, patient, "crisis", String(medicalNo), crisisPath,
+                crisisItems(crisisRows)));
               done.add(crisisKey);
             }
           }
         }
       }
 
+      if (withoutRegister.length) {
+        const shown = withoutRegister.slice(0, 8).join("、")
+          + (withoutRegister.length > 8 ? "…" : "");
+        lastWarnings.push(`就诊病历: ${withoutRegister.length} 次没有 registerId，`
+          + `处方/医嘱明细取不到（病历号 ${shown}）；详情接口硬要求该参数`);
+      }
       const all = facts.concat(collected);
+      lastWarnings.push(...shrinkWarnings(previous, all));
       cache.save(patient, all);
       report("完成", 1, 1);
       return finish(patient, all, day, collected.length);
@@ -537,8 +634,10 @@
         totalFacts: facts.length,
         dictionaries: dictionaries ? dictionaries.loaded() : {},
         errors: lastErrors.slice(),
+        warnings: lastWarnings.slice(),
       });
       view.meta.errors = lastErrors.slice();
+      view.meta.warnings = lastWarnings.slice();
       view_ = view;
       return view;
     }
@@ -571,7 +670,8 @@
       if (!hospitalId) warnings.push("未识别院区");
       return {
         label: `同源直查 · ${hospitalId ? "院区已识别" : "待设置"}`,
-        detail: lastErrors.length ? `${lastErrors.length} 个接口报错` : "",
+        detail: lastErrors.length ? `${lastErrors.length} 个接口报错`
+          : (lastWarnings.length ? `${lastWarnings.length} 条警告` : ""),
         warnings,
         setup: hospitalId ? null : {
           title: "还需要一个院区 id",
@@ -606,5 +706,5 @@
     };
   }
 
-  root.HisDirectTransport = { create, detectHospital, renderEndpoint, rowsOf, dataOf };
+  root.HisDirectTransport = { create, detectHospital, renderEndpoint, pageSizeOf, rowsOf, dataOf, shrinkWarnings };
 })(typeof globalThis !== "undefined" ? globalThis : this);

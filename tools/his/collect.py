@@ -146,6 +146,8 @@ class Client:
         self.via_curl = via_curl
         self.strict = strict
         self.errors: list[str] = []
+        #: 不是报错、但必须让人看见的事（例如"只取到 50 / 共 71 份"）
+        self.warnings: list[str] = []
         self._config: str | None = None
 
     def __enter__(self) -> "Client":
@@ -275,6 +277,19 @@ def rows_of(doc: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+def pages_of(doc: dict[str, Any]) -> int | None:
+    """服务端声明的总页数（有些站点给，有些站点不给）。"""
+    data = doc.get("data")
+    if isinstance(data, dict):
+        pagination = data.get("pagination")
+        if isinstance(pagination, dict) and isinstance(pagination.get("pages"), (int, str)):
+            try:
+                return int(pagination["pages"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def total_of(doc: dict[str, Any]) -> int | None:
     data = doc.get("data")
     if isinstance(data, dict):
@@ -375,15 +390,74 @@ def fetch_roster(client: Client, endpoints: Endpoints, doctor: str, day: str | N
         page += 1
 
 
+def page_size_of(endpoints: Endpoints, key: str, default: int = 50) -> int:
+    """每页多少条。放进端点表里，是因为不同站点的上限不一样（有的服务端只认 20）。"""
+    spec = endpoints.table.get(key) or {}
+    try:
+        return max(1, int(spec.get("pageSize") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_pages(client: Client, endpoints: Endpoints, key: str, *, page_size: int | None = None,
+                max_pages: int = 500, **values: Any) -> tuple[list[dict[str, Any]], int | None]:
+    """按 ``total`` 翻到底，返回 ``(所有行, total)``。
+
+    **只取第一页会安静地少掉三成**：实测某患者检验报告共 71 份，一页只回 50 份；
+    就诊病历共 175 条，一页只回 19 条。更麻烦的是分页边界不稳定 —— 第二页的第一条
+    有时落在第一页、有时不落，于是"少几条"看起来像偶发抖动，很难查。
+    所以这里一律翻到底，并且**取不全就记一条警告**（不静默）。
+    """
+    size = page_size or page_size_of(endpoints, key)
+    rows: list[dict[str, Any]] = []
+    total: int | None = None
+    pages: int | None = None
+    page = 1
+    previous: tuple[str, ...] | None = None
+    while page <= max_pages:
+        path, params = endpoints.render(key, pageNum=page, pageSize=size, **values)
+        doc = client.get(path, **params)
+        batch = rows_of(doc)
+        if total is None:
+            total, pages = total_of(doc), pages_of(doc)
+        # 服务端忽略 pageNum 时，第二页会回和第一页一模一样的内容。此时必须停 ——
+        # 否则既会把同一页抄很多遍，又会因为"行数够了"而误判成取全了（靠测试兜住）。
+        signature = tuple(str(row.get("id")) for row in batch)
+        if signature and signature == previous:
+            break
+        previous = signature
+        rows.extend(batch)
+        if not batch:
+            break
+        if total is not None and len(rows) >= total:
+            break
+        # **不能因为"这页不满 size"就停**：真机上 `clinic_record/page` 每页行数不定
+        # （19/15/30/15），第一页就不满 50，按老写法只取了第一页 → 175 条只拿到 19 条。
+        # 只要服务端还说有下一页，就继续翻。
+        if pages is not None and page >= pages:
+            break
+        if total is None and pages is None and len(batch) < size:
+            break
+        page += 1
+    if total is not None and len(rows) < total:
+        client.warnings.append(
+            f"{key}: 拿到 {len(rows)} 行 / 服务端声称共 {total} 条"
+            + "（该接口每页行数不定或分页有重叠，对不上账；已把服务端愿意给的全部取回）"
+        )
+    return rows, total
+
+
 def bridge_ids(client: Client, endpoints: Endpoints, his_user_id: str) -> list[dict[str, Any]]:
-    path, params = endpoints.render("clinicRecords", userId=his_user_id, pageNum=1, pageSize=50)
-    return rows_of(client.get(path, **params))
+    rows, _total = fetch_pages(client, endpoints, "clinicRecords", userId=his_user_id)
+    return rows
 
 
-def his_reports(client: Client, endpoints: Endpoints, his_user_id: str, kind: str, page_size: int = 50) -> list[dict[str, Any]]:
+def his_reports(client: Client, endpoints: Endpoints, his_user_id: str, kind: str,
+                page_size: int | None = None) -> list[dict[str, Any]]:
     item_type = endpoints.item_types.get(kind, kind)
-    path, params = endpoints.render("reports", userId=his_user_id, itemType=item_type, pageNum=1, pageSize=page_size)
-    return rows_of(client.get(path, **params))
+    rows, _total = fetch_pages(client, endpoints, "reports", page_size=page_size,
+                               userId=his_user_id, itemType=item_type)
+    return rows
 
 
 def report_detail(client: Client, endpoints: Endpoints, report_id: str) -> dict[str, Any]:
@@ -391,9 +465,10 @@ def report_detail(client: Client, endpoints: Endpoints, report_id: str) -> dict[
     return client.get(path, **params)
 
 
-def checkup_reports(client: Client, endpoints: Endpoints, hms_user_id: str, page_size: int = 50) -> list[dict[str, Any]]:
-    path, params = endpoints.render("checkups", userId=hms_user_id, pageNum=1, pageSize=page_size)
-    return rows_of(client.get(path, **params))
+def checkup_reports(client: Client, endpoints: Endpoints, hms_user_id: str,
+                    page_size: int | None = None) -> list[dict[str, Any]]:
+    rows, _total = fetch_pages(client, endpoints, "checkups", page_size=page_size, userId=hms_user_id)
+    return rows
 
 
 def checkup_summary(client: Client, endpoints: Endpoints, report_id: str) -> dict[str, Any]:
@@ -401,9 +476,10 @@ def checkup_summary(client: Client, endpoints: Endpoints, report_id: str) -> dic
     return client.get(path, **params)
 
 
-def crisis_list(client: Client, endpoints: Endpoints, medical_no: str, page_size: int = 200) -> list[dict[str, Any]]:
-    path, params = endpoints.render("crisis", medicalNo=medical_no, pageNum=1, pageSize=page_size)
-    return rows_of(client.get(path, **params))
+def crisis_list(client: Client, endpoints: Endpoints, medical_no: str,
+                page_size: int | None = None) -> list[dict[str, Any]]:
+    rows, _total = fetch_pages(client, endpoints, "crisis", page_size=page_size, medicalNo=medical_no)
+    return rows
 
 
 def item_history(client: Client, endpoints: Endpoints, hms_user_id: str, item_name: str) -> dict[str, Any]:
@@ -420,8 +496,7 @@ def person_by_name(client: Client, endpoints: Endpoints, name: str, telephone: s
         path, params = endpoints.render("personByName", name=name, telephone=telephone)
         data = data_of(client.get(path, **params))
         return data if isinstance(data, dict) else None
-    path, params = endpoints.render("personSearch", nameOrPhone=name, pageNum=1, pageSize=10)
-    rows = rows_of(client.get(path, **params))
+    rows, _total = fetch_pages(client, endpoints, "personSearch", nameOrPhone=name)
     return rows[0] if len(rows) == 1 else None
 
 
@@ -754,6 +829,7 @@ def run_daily(client: Client, endpoints: Endpoints, sink: Sink, doctor: str, day
                                        extra={"groupItemName": item_name}))
                     summary["facts"] += 1
     summary["errors"] = list(client.errors)
+    summary["warnings"] = list(client.warnings)
     return summary
 
 
@@ -763,8 +839,7 @@ def resolve_identity(client: Client, endpoints: Endpoints, name: str, telephone:
     走 ``identity`` 接口；它的 ``telephone`` 过滤参数**被服务端忽略**（实测），
     所以精确匹配必须在客户端做 —— 同名患者是常态。
     """
-    path, params = endpoints.render("identity", name=name, pageNum=1, pageSize=20)
-    rows = rows_of(client.get(path, **params))
+    rows, _total = fetch_pages(client, endpoints, "identity", name=name)
     if telephone:
         rows = [row for row in rows if str(row.get("telephone") or "") == str(telephone)]
     if len(rows) != 1:
@@ -827,6 +902,10 @@ def collect_person_records(
     _emit(on_progress, "就诊病历", 0, 1)
     seen_item_names: list[str] = []
     records = bridge_ids(client, endpoints, his_user_id)
+    #: 详情接口**硬要求** registerId，而实测有 11/76 条就诊记录没有这个字段
+    #: （用 recordsNo 或 id 顶上去都会被拒："not exist"）。这类就别白费请求，也不要
+    #: 报成错误 —— 记一条警告，说明"这次就诊的处方明细拿不到"。
+    without_register: list[str] = []
     for index, record in enumerate(records, 1):
         _emit(on_progress, "就诊病历", index, len(records))
         visit_id = str(record.get("id"))
@@ -843,6 +922,9 @@ def collect_person_records(
                                       "deptName": record.get("deptName")}))
             summary["facts"] += 1
         summary["visits"] += 1
+        if not register_id:
+            without_register.append(str(record.get("recordsNo") or visit_id))
+            continue
         detail_path, detail_params = endpoints.render("visitDetail", id=visit_id, registerId=register_id)
         detail = client.get_soft(detail_path, **detail_params)
         if not detail:
@@ -933,8 +1015,15 @@ def collect_person_records(
                                    endpoint=trend_path, items=items, extra={"groupItemName": item_name}))
                 summary["facts"] += 1
 
+    if without_register:
+        shown = "、".join(without_register[:8]) + ("…" if len(without_register) > 8 else "")
+        client.warnings.append(
+            f"就诊病历: {len(without_register)} 次没有 registerId，处方/医嘱明细取不到"
+            f"（病历号 {shown}）；详情接口硬要求该参数，用 recordsNo/id 替代会被拒"
+        )
     _emit(on_progress, "完成", 1, 1)
     summary["errors"] = list(client.errors)
+    summary["warnings"] = list(client.warnings)
     return summary
 
 

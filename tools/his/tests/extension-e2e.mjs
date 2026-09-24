@@ -108,6 +108,13 @@ try {
       badges: Array.from(node.querySelectorAll(".chip")).map((chip) => chip.innerText.trim()),
     })));
   report.charts = await page.$$eval("#his-portal-root .metric svg", (nodes) => nodes.length);
+  // 计数 / 告警 / 逐条明细数：断言"翻到底了"和"没有静默截断"要看这些
+  report.counts = await page.evaluate(() => (globalThis.__hisPortal && globalThis.__hisPortal.view)
+    ? globalThis.__hisPortal.view.counts : null);
+  report.metaErrors = await page.evaluate(() => (globalThis.__hisPortal && globalThis.__hisPortal.view)
+    ? (globalThis.__hisPortal.view.meta.errors || []).slice(0, 8) : null);
+  report.metaWarnings = await page.evaluate(() => (globalThis.__hisPortal && globalThis.__hisPortal.view)
+    ? (globalThis.__hisPortal.view.meta.warnings || []).slice(0, 8) : null);
   report.tabs = await page.$$eval("#his-portal-root .tabs button",
     (nodes) => nodes.map((node) => node.innerText.replace(/\s+/g, " ").trim()));
   report.patient = (await page.textContent("#his-portal-root #detail h2") || "").trim();

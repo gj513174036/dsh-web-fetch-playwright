@@ -53,6 +53,7 @@ from collect import (
     data_of,
     fact_key,
     fact_row,
+    fetch_pages,
     load_curlrc,
     load_session_json,
     rows_of,
@@ -599,9 +600,9 @@ class Portal:
     # -- 搜索 -------------------------------------------------------------- #
     def search(self, name: str, telephone: str = "") -> list[dict[str, Any]]:
         """姓名 → **全部**同名候选。手机号只用来标"就是他"，绝不替人做决定。"""
-        path, params = self.endpoints.render("identity", name=name, pageNum=1, pageSize=50)
+        # 翻到底：同名的人如果被分页截断，可能就看不到"真正的那个人"（实测真机同名 3 个）
         with Client(self.session, via_curl=self.via_curl) as client:
-            rows = rows_of(client.get(path, **params))
+            rows, _total = fetch_pages(client, self.endpoints, "identity", name=name)
         wanted = str(telephone or "").strip()
         dicts = self.dicts()
         out: list[dict[str, Any]] = []
@@ -693,6 +694,7 @@ class Portal:
                 "dictionaries": dicts.loaded(),
                 "summary": summary,
                 "errors": errors,
+                "warnings": list(summary.get("warnings") or []),
             })
             with self._lock:
                 job.update(state="done", phase="完成", done=1, total=1, result=view,

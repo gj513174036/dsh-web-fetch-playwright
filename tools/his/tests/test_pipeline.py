@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import subprocess
@@ -132,6 +133,127 @@ class VerdictPriorityTest(unittest.TestCase):
     def test_positive_flag_is_abnormal(self) -> None:
         row = rules.verdict_of({"result": "阳性", "reference": "阴性", "isYang": "1"})
         self.assertEqual((row["verdict"], row["ruleId"]), ("positive", "report-positive"))
+
+
+def paged_endpoints(directory: str, **sizes: int) -> str:
+    """复制一份占位端点表，把某些端点的每页条数调小 —— 用来证明"翻页真的翻到底了"。"""
+    with open(os.path.join(TOOLS, "endpoints.example.json"), encoding="utf-8") as handle:
+        doc = json.load(handle)
+    for key, size in sizes.items():
+        doc[key]["pageSize"] = size
+    path = os.path.join(directory, "endpoints-paged.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle, ensure_ascii=False)
+    return path
+
+
+class PaginationTest(unittest.TestCase):
+    """只取第一页会**安静地少三成**：真机上检验报告共 71 份、一页只回 50 份。
+
+    假系统现在真的会按 pageNum/pageSize 切片，所以这两条能证明"翻到底了"。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server, cls.base = mock_his.make_server()
+        cls.tmp = tempfile.TemporaryDirectory(prefix="his-page-")
+        cls.session_path = os.path.join(cls.tmp.name, "session.json")
+        with open(cls.session_path, "w", encoding="utf-8") as handle:
+            json.dump({"base": cls.base, "headers": {"Cookie": "x-auth-token=test"}, "proxy": ""}, handle)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    def _collect(self, endpoints: str, outdir: str) -> tuple[subprocess.CompletedProcess, dict]:
+        result = subprocess.run(
+            [sys.executable, os.path.join(TOOLS, "collect.py"), "--session", self.session_path,
+             "--endpoints", endpoints, "--date", "2026-09-24", "--doctor", "PAGED",
+             "--out", outdir, "--via-curl"],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout[result.stdout.index("{"):result.stdout.rindex("}") + 1])
+        return result, summary
+
+    def test_every_page_is_fetched(self) -> None:
+        # 每页 2 条：5 份检验报告要翻 3 页、3 次体检要翻 2 页
+        endpoints = paged_endpoints(self.tmp.name, reports=2, checkups=2, crisis=1)
+        outdir = os.path.join(self.tmp.name, "out-paged")
+        _result, summary = self._collect(endpoints, outdir)
+        self.assertEqual(summary["warnings"], [], summary)
+        facts = [json.loads(line) for line in
+                 open(os.path.join(outdir, "facts-2026-09-24.jsonl"), encoding="utf-8")]
+        kinds = collections.Counter(fact["kind"] for fact in facts)
+        self.assertEqual(kinds["lab"], len(mock_his.LAB_REPORTS_C), kinds)   # 5 份，一份不少
+        self.assertEqual(kinds["checkup"], len(mock_his.CHECKUP_LIST_C), kinds)  # 3 次
+        self.assertEqual(kinds["crisis"], len(mock_his.CHECKUP_LIST_C), kinds)
+        # 明细项数也要一份不少：第 1 份 2 项、第 5 份 6 项
+        lab_items = {fact["source"]["sourceId"]: len(fact["items"])
+                     for fact in facts if fact["kind"] == "lab"}
+        self.assertEqual(lab_items["rep-c-1"], 2, lab_items)
+        self.assertEqual(lab_items["rep-c-5"], 6, lab_items)
+
+
+    def test_short_pages_with_overlap_are_still_all_fetched(self) -> None:
+        """真机上 `clinic_record/page` 每页行数不定（19/15/30/15）且相邻页重叠。
+
+        "这页不满 pageSize 就停"会把 175 条的清单只取回第一页 —— 这是实测踩到的坑。
+        正确做法：只要服务端还说有下一页就继续翻，最后对不上账就报一条警告。
+        """
+        endpoints = paged_endpoints(self.tmp.name, reports=2, checkups=2, crisis=2)
+        outdir = os.path.join(self.tmp.name, "out-short")
+        mock_his.SHORT_PAGES = 1        # 每页只回 1 行，且与上一页重叠
+        mock_his.INFLATED_TOTAL = 90    # 服务端声称的 total 远大于它能给出的行数（真机就是这样）
+        try:
+            _result, summary = self._collect(endpoints, outdir)
+        finally:
+            mock_his.SHORT_PAGES = 0
+            mock_his.INFLATED_TOTAL = 0
+        facts = [json.loads(line) for line in
+                 open(os.path.join(outdir, "facts-2026-09-24.jsonl"), encoding="utf-8")]
+        labs = {fact["source"]["sourceId"] for fact in facts if fact["kind"] == "lab"}
+        # 每页 1 行、重叠 1 行、共 3 页：第 1、3、5 条能拿到（服务端偏移就是按请求的 pageSize 走的）
+        self.assertTrue(labs, "一份都没拿到")
+        self.assertGreater(len(labs), 1, f"在第一个短页就停了：{labs}")
+        self.assertTrue(any("对不上账" in warning for warning in summary["warnings"]),
+                        f"服务端的 total 与实得行数对不上时必须报警：{summary['warnings']}")
+
+    def test_missing_register_id_is_a_warning_not_an_error(self) -> None:
+        """真机上 11/76 条就诊记录没有 registerId，详情接口硬要这个参数。
+
+        正确做法：别白费请求、也别报成"接口失败"，而是记一条看得见的警告 ——
+        这次就诊的处方明细拿不到，但这次就诊本身（日期/科室/诊断）还在。
+        """
+        endpoints = paged_endpoints(self.tmp.name)
+        outdir = os.path.join(self.tmp.name, "out-no-register")
+        result = subprocess.run(
+            [sys.executable, os.path.join(TOOLS, "collect.py"), "--session", self.session_path,
+             "--endpoints", endpoints, "--date", "2026-09-24", "--mode", "person",
+             "--name", "测试丙", "--telephone", "13800000003", "--out", outdir, "--via-curl"],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout[result.stdout.index("{"):result.stdout.rindex("}") + 1])
+        self.assertEqual(summary["errors"], [], summary)
+        self.assertTrue(any("registerId" in warning for warning in summary["warnings"]), summary["warnings"])
+        facts = [json.loads(line) for line in
+                 open(os.path.join(outdir, "facts-2026-09-24.jsonl"), encoding="utf-8")]
+        # 两次就诊都要在（缺 registerId 的那次只是没有处方明细）
+        visits = [fact for fact in facts if fact["kind"] == "visit"]
+        self.assertEqual(len(visits), 2, visits)
+
+    def test_server_that_ignores_the_page_number_is_reported(self) -> None:
+        """服务端不翻页时不能把同一页抄 500 遍，也不能装作取全了 —— 要出一条警告。"""
+        endpoints = paged_endpoints(self.tmp.name, reports=2, checkups=2)
+        outdir = os.path.join(self.tmp.name, "out-nopage")
+        mock_his.IGNORE_PAGINATION = True
+        try:
+            _result, summary = self._collect(endpoints, outdir)
+        finally:
+            mock_his.IGNORE_PAGINATION = False
+        self.assertTrue(summary["warnings"], "取不全时必须留下警告，不能静默")
+        self.assertTrue(any("对不上账" in warning for warning in summary["warnings"]), summary["warnings"])
 
 
 class PipelineEndToEndTest(unittest.TestCase):

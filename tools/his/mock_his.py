@@ -136,12 +136,111 @@ ARCHIVE_PAGE = [ARCHIVE_PERSON, {"id": "hms-a-9999", "name": "测试甲", "telep
                                  "age": 41, "gender": "1", "companyName": "示例公司"}]
 
 
+# ---- 多报告患者：分页测试专用（报告数故意多于每页条数） ----
+HIS_C, HMS_C = "his-c-0003", "hms-c-0003"
+
+ROSTER_C = {
+    "userId": HIS_C, "name": "测试丙", "gender": "1", "age": 52, "telephone": "13800000003",
+    "deptName": "检后管理门诊", "clinicTime": 1790179800000, "firstDiagnose": "血脂异常",
+    "receiptState": "2", "id": "reg-c", "recordsId": "rec-c",
+}
+#: 5 份检验报告 —— 端点表把 pageSize 设成 2 时，必须翻 3 页才取得全
+LAB_REPORTS_C = [
+    {"id": f"rep-c-{index}", "itemType": "LAB", "groupItemName": f"组套{index}", "userId": HIS_C,
+     "checkTime": f"2026-0{index}-10 09:00:00", "executeStatus": "1"}
+    for index in range(1, 6)
+]
+#: 3 次体检
+CHECKUP_LIST_C = [
+    {"id": f"med-c-{index}", "medicalDataId": f"med-data-c-{index}", "medicalNo": f"MC{index}",
+     "userId": HMS_C, "medicalDate": 1789000000000 + index, "registerUserName": "测试丙", "age": 52}
+    for index in range(1, 4)
+]
+IDENTITY_ROW_C = {"id": HIS_C, "hmsArchivesUserId": HMS_C, "name": "测试丙",
+                  "telephone": "13800000003", "identityCard": "440000199505050003",
+                  "gender": "1", "age": 52}
+
+
+def lab_detail_c(report_id: str) -> dict[str, Any]:
+    """每份报告的明细项数不同，翻页漏掉哪一份一眼能看出来。"""
+    index = int(report_id.rsplit("-", 1)[-1])
+    return {
+        "id": report_id, "userId": HIS_C, "groupItemName": f"组套{index}",
+        "detailList": [
+            {"itemCode": f"C{index}-{item}", "itemName": f"分页项目{index}-{item}",
+             "result": str(index * 10 + item), "itemUnit": "mmol/L", "reference": "0--5",
+             "abnormalTips": "", "resultRemark": None, "haveCrisis": "0", "crisisValue": None,
+             "crtTime": f"2026-0{index}-10 09:00:00"}
+            for item in range(1, index + 2)          # 第 1 份 2 项、第 5 份 6 项
+        ],
+    }
+
+
+def checkup_summary_c(data_id: str) -> dict[str, Any]:
+    index = int(data_id.rsplit("-", 1)[-1])
+    return {
+        "id": data_id, "checkNum": index, "grade": "A",
+        "medicalDataRelDiseases": [
+            {"disease": f"结论{index}-{item}", "diseaseId": f"dc-{index}-{item}",
+             "crisisLevel": "0", "crisisLevelName": ""}
+            for item in range(1, index + 2)
+        ],
+        "suggests": [],
+    }
+
+
 def _ok(data: Any) -> dict[str, Any]:
     return {"httpStatus": 200, "status": "0", "message": "success", "result": {}, "data": data}
 
 
-def _paged(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"list": rows, "pagination": {"pageSize": 50, "pageNum": 1, "pages": 1, "total": len(rows)}}
+#: 测试用：置 True 时服务端**忽略 pageNum**、永远回第一页 —— 复现"页码没生效"的服务端
+IGNORE_PAGINATION = False
+#: 测试用：每页最多回这么多行（不管请求的 pageSize），并且**与上一页重叠一行**。
+#: 这是真机上 `clinic_record/page` 的真实形状：19/15/30/15 行一页，`pages=4` 但 total=175。
+SHORT_PAGES = 0
+#: 测试用：服务端声称的 total 比实际能给出的行数多这么多 —— 真机上 `clinic_record/page`
+#: 就是 `total=175` 而四页加起来只有 79 行。用来验证"对不上账要报警"。
+INFLATED_TOTAL = 0
+
+
+def _paged(rows: list[dict[str, Any]], query: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    """真的按 pageNum/pageSize 切片。
+
+    假系统必须会翻页，否则"采集有没有翻到底"这件事在测试里根本证明不了 ——
+    而真机上正是这里出的问题（检验报告共 71 份、一页只回 50 份）。
+
+    ``IGNORE_PAGINATION`` 复现另一种真实故障：**服务端忽略 pageNum**，第二页和第一页
+    一模一样。这时候客户端必须停下来并且报"取不全"，不能把同一页抄很多遍。
+    """
+    total = len(rows)
+
+    def _int(key: str, fallback: int) -> int:
+        try:
+            return max(1, int((query.get(key) or [str(fallback)])[0]))
+        except (TypeError, ValueError):
+            return fallback
+
+    if not query:
+        return {"list": rows,
+                "pagination": {"pageSize": total or 1, "pageNum": 1, "pages": 1, "total": total}}
+
+    page_num = _int("pageNum", 1)
+    size = _int("pageSize", 50)
+    claimed = total + INFLATED_TOTAL
+    pages = max(1, (claimed + size - 1) // size)
+    if IGNORE_PAGINATION:
+        return {"list": rows[:size],
+                "pagination": {"pageSize": size, "pageNum": page_num, "pages": pages, "total": claimed}}
+    start = (page_num - 1) * size
+    if SHORT_PAGES:
+        # 偏移按请求的 pageSize 算，但只回 SHORT_PAGES 行，并叠上一页的最后一行
+        chunk = rows[start:start + SHORT_PAGES]
+        if page_num > 1 and start > 0 and chunk:
+            chunk = [rows[start - 1]] + chunk
+        return {"list": chunk,
+                "pagination": {"pageSize": size, "pageNum": page_num, "pages": pages, "total": claimed}}
+    return {"list": rows[start:start + size],
+            "pagination": {"pageSize": size, "pageNum": page_num, "pages": pages, "total": claimed}}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -180,10 +279,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         one = lambda key: (query.get(key) or [""])[0]  # noqa: E731
         if path == "/api/example/roster":
-            rows = [] if one("doctorName") == "NOBODY" else [ROSTER_A, ROSTER_B]
-            self._send(_ok(_paged(rows)))
+            if one("doctorName") == "NOBODY":
+                rows = []
+            elif one("doctorName") == "PAGED":
+                rows = [ROSTER_C]          # 多报告患者：分页测试专用
+            else:
+                rows = [ROSTER_A, ROSTER_B]
+            self._send(_ok(_paged(rows, query)))
         elif path == "/api/example/identity":
-            self._send(_ok(_paged([r for r in IDENTITY_ROWS if r["name"] == one("name")])))
+            wanted = one("name")
+            rows = [r for r in IDENTITY_ROWS if r["name"] == wanted]
+            if wanted == IDENTITY_ROW_C["name"]:
+                rows = [IDENTITY_ROW_C]
+            self._send(_ok(_paged(rows, query)))
         elif path == "/api/example/dictionaries":
             wanted = [c for c in one("dictionaryTypeCode").split(",") if c]
             self._send(_ok({c: DICT_ENTRIES.get(c, []) for c in wanted}))
@@ -192,7 +300,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/example/visits":
             user = one("userId")
             rows = []
-            if user == HIS_A:
+            if user == HIS_C:
+                rows = [
+                    {"id": "visit-c1", "hisUserId": HIS_C, "hmsUserId": HMS_C, "name": "测试丙",
+                     "recordsNo": "R0003", "registerId": "reg-c", "clinicTime": 1790179800000,
+                     "diagnosisList": [{"diseaseName": "血脂异常"}], "mainSuit": ""},
+                    # 真机上有 11/76 条就诊记录没有 registerId，详情接口会拒 —— 假系统照实模拟
+                    {"id": "visit-c2", "hisUserId": HIS_C, "hmsUserId": HMS_C, "name": "测试丙",
+                     "recordsNo": "R0004", "registerId": None, "clinicTime": 1790179900000,
+                     "diagnosisList": [{"diseaseName": "高尿酸血症"}], "mainSuit": ""},
+                ]
+            elif user == HIS_A:
                 rows = [{"id": "visit-a1", "hisUserId": HIS_A, "hmsUserId": HMS_A, "name": "测试甲",
                          "recordsNo": "R0001", "registerId": "reg-a", "clinicTime": 1790179200000,
                          "diagnosisList": [{"diseaseName": "高尿酸血症"}], "mainSuit": "体检复查"}]
@@ -200,24 +318,41 @@ class Handler(BaseHTTPRequestHandler):
                 rows = [{"id": "visit-b1", "hisUserId": HIS_B, "hmsUserId": HMS_B, "name": "测试乙",
                          "recordsNo": "R0002", "registerId": "reg-b", "clinicTime": 1790179500000,
                          "diagnosisList": [{"diseaseName": "高脂血症"}], "mainSuit": ""}]
-            self._send(_ok(_paged(rows)))
+            self._send(_ok(_paged(rows, query)))
         elif path == "/api/example/reports":
             item_type = one("itemType")
             rows = []
-            if one("userId") == HIS_A:
+            if one("userId") == HIS_C:
+                if "LAB" in item_type:
+                    rows = list(LAB_REPORTS_C)
+            elif one("userId") == HIS_A:
                 for wanted, row in (("LAB", LAB_REPORT), ("EXAM", EXAM_REPORT)):
                     if wanted in item_type:
                         rows.append(row)
-            self._send(_ok(_paged(rows)))
+            self._send(_ok(_paged(rows, query)))
         elif re.match(r"^/api/example/report/[^/]+$", path):
-            self._send(_ok(LAB_DETAIL if "lab" in path else {"id": path.rsplit("/", 1)[-1], "detailList": []}))
+            report_id = path.rsplit("/", 1)[-1]
+            if report_id.startswith("rep-c-"):
+                self._send(_ok(lab_detail_c(report_id)))
+            else:
+                self._send(_ok(LAB_DETAIL if "lab" in path else {"id": report_id, "detailList": []}))
         elif path == "/api/example/checkups":
-            self._send(_ok(_paged(CHECKUP_LIST if one("userId") == HMS_A else [])))
+            if one("userId") == HMS_A:
+                rows = CHECKUP_LIST
+            elif one("userId") == HMS_C:
+                rows = CHECKUP_LIST_C
+            else:
+                rows = []
+            self._send(_ok(_paged(rows, query)))
         elif re.match(r"^/api/example/checkup/[^/]+$", path):
             # 小结只认体检数据 id；用报告行 id 会被拒绝 —— 真实系统就是这个行为
-            self._send(_ok(CHECKUP_SUMMARY if path.endswith("/checkup/med-data-1") else None))
+            data_id = path.rsplit("/", 1)[-1]
+            if data_id.startswith("med-data-c-"):
+                self._send(_ok(checkup_summary_c(data_id)))
+            else:
+                self._send(_ok(CHECKUP_SUMMARY if data_id == "med-data-1" else None))
         elif path == "/api/example/crisis":
-            self._send(_ok(_paged(CRISIS_ROWS if one("medicalNo") == MED_A else [])))
+            self._send(_ok(_paged(CRISIS_ROWS if one("medicalNo") == MED_A else [], query)))
         elif path == "/api/example/item-history":
             self._send(_ok(TREND if one("userId") == HMS_A else {}))
         elif path == "/api/example/person":
@@ -225,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(_ok(ARCHIVE_PERSON if match else None))
         elif path == "/api/example/person-search":
             rows = ARCHIVE_PAGE if one("nameOrPhone") == "测试甲" else []
-            self._send(_ok(_paged(rows)))
+            self._send(_ok(_paged(rows, query)))
         else:
             self._send(_ok(None), 200)
 

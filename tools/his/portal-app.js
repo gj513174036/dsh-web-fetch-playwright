@@ -346,6 +346,9 @@ function panelAudit(){
     ${errs.length ? `<div class="warn" style="margin-top:12px"><b>${errs.length} 个接口调用失败</b>
       <div class="mono" style="margin-top:6px">${errs.map(esc).join("<br>")}</div></div>`
       : `<div class="chip ok" style="margin-top:12px">没有接口报错</div>`}
+    ${(m.warnings || []).length ? `<div class="warn" style="margin-top:12px">
+      <b>${m.warnings.length} 条采集警告</b>
+      <div class="mono" style="margin-top:6px">${m.warnings.map(esc).join("<br>")}</div></div>` : ""}
   </div>
   <div class="flex">
     <div class="card grow"><h3>判定分布（verdict）</h3><table><tbody>${kv(view.audit.byVerdict)}</tbody></table></div>
@@ -407,6 +410,9 @@ function render(){
       ${view.meta.errors && view.meta.errors.length
         ? `<div class="warn" style="margin-top:12px">有 ${view.meta.errors.length} 个接口调用失败，
            结果可能不完整 —— 详情见「审计」页。</div>` : ""}
+      ${view.meta.warnings && view.meta.warnings.length
+        ? `<div class="warn" style="margin-top:12px">有 ${view.meta.warnings.length} 条采集警告：
+           ${esc(view.meta.warnings.slice(0, 3).join("；"))} —— 详情见「审计」页。</div>` : ""}
       ${!p.hmsUserId ? `<div class="warn" style="margin-top:12px">这个人没有档案侧 id（hmsUserId）：
         体检、单项历史、危急值都取不到。</div>` : ""}
     </div>

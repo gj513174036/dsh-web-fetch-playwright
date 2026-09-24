@@ -153,6 +153,34 @@ class JavaScriptSyntaxTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr[:400])
         self.assertIn("object function function", result.stdout)
 
+    def test_shrink_alarm_flags_reports_that_lost_items(self) -> None:
+        """真机上实测过一次"事实条数一样、某条明细少了 9 项、零报错" —— 这类变化要被看见。
+
+        这条用 node 直接调那个纯函数，不依赖浏览器。
+        """
+        import pathlib
+        module_url = pathlib.Path(os.path.join(TOOLS, "portal-direct.js")).as_uri()
+        previous = [
+            {"key": "k1", "kind": "lab", "source": {"sourceId": "rep-1"}, "items": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]},
+            {"key": "k2", "kind": "checkup", "source": {"sourceId": "med-1"}, "items": [1, 2]},
+        ]
+        fresh = [
+            {"key": "k1", "kind": "lab", "source": {"sourceId": "rep-1"}, "items": [1, 2, 3]},          # 少了 9 项
+            {"key": "k2", "kind": "checkup", "source": {"sourceId": "med-1"}, "items": [1, 2, 3]},      # 变多了，不报
+            {"key": "k3", "kind": "lab", "source": {"sourceId": "rep-2"}, "items": [1]},                # 新增，不报
+        ]
+        script = (f"await import({module_url!r});"
+                  "const warnings = globalThis.HisDirectTransport.shrinkWarnings("
+                  f"{json.dumps(previous, ensure_ascii=False)}, {json.dumps(fresh, ensure_ascii=False)});"
+                  "console.log(JSON.stringify(warnings));")
+        result = subprocess.run([NODE, "--input-type=module", "-e", script],
+                                capture_output=True, text=True, timeout=60, cwd=REPO)
+        self.assertEqual(result.returncode, 0, result.stderr[:400])
+        warnings = json.loads(result.stdout.strip())
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("rep-1", warnings[0])
+        self.assertIn("12 项降到 3 项", warnings[0])
+
     def test_portal_html_only_references_shipped_files(self) -> None:
         """薄壳页引用的每一份文件都必须在仓库里，否则后端版会白屏。"""
         html = open(os.path.join(TOOLS, "portal.html"), encoding="utf-8").read()
