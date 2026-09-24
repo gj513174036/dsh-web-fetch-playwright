@@ -241,6 +241,22 @@ PYTHONPATH=tools/netdump python3 -m netdump build capture.har -o netdump-out
 `netdump` 原生支持 HAR 1.2，这条路完全不需要 AI。代价是：**发现过程留在你的浏览器里、不进仓库**——
 下次接口改版，你得自己重来一遍；而配方可以重放，这正是第 6b 步值得花那 1~2 小时的原因。
 
+#### 三条没有时间上限的采集路线
+
+插件的一次抓取有一串硬上限（工具层超时 → 插件预算 `fetchBudgetMs` → 单步 10 秒），
+而"人工把陌生系统从头点一遍"经常比这更久。下面三条都没有上限，产出也都能直接喂 `netdump`：
+
+| 路线 | 命令 | 什么时候用 |
+| --- | --- | --- |
+| **本仓库脚本** | `node tools/his/capture.mjs --url <url> --out out.jsonl --minutes 20 --new-tab` | 想让人点、又要让 AI 接着分析：脚本连 CDP 录制那个标签页，写 netdump 能直接读的 JSONL |
+| Playwright CLI | `npx playwright codegen --save-har=a.har --save-storage=s.json <url>` | 顺手想要一份可重放的脚本 |
+| Chrome DevTools | Network → **Save all as HAR (with content)** | 零安装，最快 |
+
+三者的产物都含**明文 Cookie / Authorization / 正文**：按密码文件对待（`capture.mjs` 写出的文件固定 `0600`）。
+
+> 一个实测过的坑：插件的录制**只覆盖它自己打开的那个标签页**。让某人在他**自己**的标签页里点，
+> 什么都不会被录到——要录人工操作，要么用上面的三条路线，要么让他去插件刚打开的那个标签页里点。
+
 两条硬规矩（细节见 [`action-model-design.zh-CN.md`](./action-model-design.zh-CN.md) §18）：
 
 * `click` 后面紧跟的 `waitFor` 才认这次点击的功劳；中间插了别的动作，就**不认**了——所以"点开 → 等接口"要写成相邻两步；
