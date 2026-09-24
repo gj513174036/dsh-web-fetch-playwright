@@ -141,9 +141,13 @@ python3 tools/his/collect.py --mode person --name "张三" --telephone "13800000
 ## 6. 自测
 
 ```sh
-python3 -m unittest discover -s tools/his/tests -t tools/his     # 19 个用例，只用标准库
+python3 -m unittest discover -s tools/his/tests -t tools/his     # 76 个用例
 python3 tools/his/mock_his.py --port 8099                        # 手工起假系统
 ```
+
+两条**真浏览器**用例需要 `node` + 仓库里的 `playwright-core` + 一个 Chromium；
+缺任一样会明确跳过（不会假装通过）。它们验的是只有真浏览器能回答的事：
+扩展能不能装、内容脚本能不能注入、同源直查的 Cookie 与院区头有没有生效。
 
 覆盖：参考区间（区间 / 单边 / 定性 / 分段 / 反序）、判定优先级（危急值 > 标志 > 区间 > 判不了）、
 `M/N` 正常码、`haveCrisis` 降级、体检结论分级、处方归 `recorded`，以及端到端（起 mock → 采集 → 判定）、
@@ -155,4 +159,47 @@ python3 tools/his/mock_his.py --port 8099                        # 手工起假�
 * 体检小结里只有"结论条目"，其**数值明细**走单项历史（`itemHistory`）那条线；
 * 检查报告多为描述型（无 `result`），结论在报告级字段里，本工具放进 `extra` 而不进异常清单；
 * 参考区间的单位换算、年龄/性别分组区间尚未实现；
-* 规则是"提示"而非诊断：`review` 那 92 条就是刻意留给人的。
+* 规则是"提示"而非诊断：`review` 那些条目就是刻意留给人的。
+
+---
+
+## 8. 三种用法，同一份判定
+
+界面只有一份（`portal-app.js`），判定与聚合也只有一份（`portal-core.js`，是 `rules.py` v5
+的移植，被 `tests/test_core_conformance.py` 逐条对照着）。换载体只换"数据怎么来"：
+
+| 载体 | 数据来源 | 要不要后端 | 刷新后 | 装法 |
+| --- | --- | --- | --- | --- |
+| **后端页** `portal.py` | 服务端代取（Cookie 在服务端） | 要 | 不丢 | 打开一个网址 |
+| **扩展**（本目录 `extension/`） | 浏览器**同源直查** | 不要 | 不丢（内容脚本重新挂载） | 加载已解压的扩展程序 |
+| 书签小工具 / DevTools 片段 | 同上 | 不要 | 会丢，重跑一次 | 拖一个书签 / 粘一段代码 |
+
+### 为什么直查必须跑在病例系统自己的页面里（实测，不是推测）
+
+* 会话**只在 Cookie 里**：只带 `x-auth-token` 请求头、不带 Cookie → `401 登录超时`；
+* 真实 Cookie 是 **`SameSite=Lax`**：从别的源（包括本地 HTML 文件）发请求，浏览器根本不带它
+  → 还是 `401`。实测把 Cookie 改成 `SameSite=None` 才通 —— 而这个属性由服务端决定，不在我们手里；
+* 响应确实带 `Access-Control-Allow-Origin: *`，但 `*` 与"带凭据"互斥，而且自定义头会触发预检；
+* 还需要一个**院区请求头**（真机上是 `x-current-hospital`），否则 `4000001 未选择院区`。
+
+结论：界面要跑在**病例站点自己的源**里（扩展注入 / 书签 / 片段），这些约束就全都不存在了。
+
+### 生成扩展（真实站点信息不进仓库）
+
+```sh
+python3 tools/his/build_extension.py \
+    --endpoints net-dumps/his/endpoints.json \
+    --host https://his.example.org \
+    --out net-dumps/his/extension-build
+```
+
+然后 `chrome://extensions` → 打开"开发者模式" → "加载已解压的扩展程序" → 选产物目录。
+病例系统页面右下角会出现「病例查询」。**权限是零项**：同源请求本来就带着会话，
+所以不申请 `cookies`、不申请 `<all_urls>`。
+
+两个只有真浏览器才暴露得出来的坑，已经写进代码注释与测试：
+
+* 内容脚本注入的**内联**脚本会被 CSP 拦（`Executing inline script violates …`），
+  所以配置走 `postMessage`、代码走 web_accessible_resource 的外部文件（`extension/bootstrap.js`）；
+* `waitForSelector` 默认等**可见**元素，而 `#his-portal-root .card` 第一个匹配是默认隐藏的
+  `#setup` —— 等它会白等到超时。

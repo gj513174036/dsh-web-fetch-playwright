@@ -559,6 +559,38 @@ def prescription_items(detail: dict[str, Any], dicts: "Dictionaries") -> list[di
     return out
 
 
+def trend_points(series: Any) -> list[dict[str, Any]]:
+    """单项历史（``report/item/result``）→ 事实行。
+
+    响应是**字典**：``data`` 的键是组套名，值是该项目在该组套下的时间序列数组。
+    传一个项目名可能返回整个组套的历史点（实测 57 / 345 个点），所以这里把
+    组套名一起记下来，页面才能说清"这个值是哪次体检的哪一项"。
+    """
+    items: list[dict[str, Any]] = []
+    if not isinstance(series, dict):
+        return items
+    for group, points in series.items():
+        for point in points or []:
+            if not isinstance(point, dict):
+                continue
+            items.append({
+                "itemCode": point.get("itemCode"),
+                "itemName": point.get("itemName") or group,
+                "result": point.get("result"),
+                "unit": point.get("unit") or point.get("resultUnit"),
+                "reference": point.get("referenceRange"),
+                "flagText": point.get("tipsContent"),
+                "arrow": None,
+                "crisis": False,
+                "isYang": point.get("isYang"),
+                "minValue": point.get("minValue"),
+                "maxValue": point.get("maxValue"),
+                "groupItemName": point.get("groupItemName") or group,
+                "checkTime": point.get("checkTime"),
+            })
+    return items
+
+
 def crisis_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """危急值事件列表 → 事实行。
 
@@ -751,23 +783,37 @@ def resolve_identity(client: Client, endpoints: Endpoints, name: str, telephone:
     }
 
 
-def run_person(
+def _emit(on_progress: Any, phase: str, done: int, total: int) -> None:
+    """进度回调；回调自己出错不该弄坏采集。"""
+    if on_progress is None:
+        return
+    try:
+        on_progress(phase, done, total)
+    except Exception:  # noqa: BLE001  —— 展示层的毛病不是采集层的毛病
+        pass
+
+
+def collect_person_records(
     client: Client,
     endpoints: Endpoints,
     sink: Sink,
-    name: str,
-    telephone: str,
-    with_trends: bool,
+    patient: dict[str, Any],
     dicts: "Dictionaries",
+    with_trends: bool = False,
+    on_progress: Any = None,
+    day: str | None = None,
 ) -> dict[str, Any]:
-    """姓名 + 电话 → 这个人的全部记录（就诊 / 处方医嘱 / 检验 / 检查 / 体检 / 危急值）。"""
-    date = dt.date.today().isoformat()
-    patient = resolve_identity(client, endpoints, name, telephone)
-    his_user_id = patient["hisUserId"]
-    hms_user_id = patient["hmsUserId"]
+    """已知是谁（``patient`` 里带两套 id）→ 这个人的全部记录。
+
+    与 ``run_person`` 分开，是因为查询端口**必须由人点选**同名候选后再采：
+    那时 id 已经确定，不该再去 ``resolve_identity`` 撞一次"身份定位不唯一"。
+    """
+    date = day or dt.date.today().isoformat()
+    his_user_id = patient.get("hisUserId")
+    hms_user_id = patient.get("hmsUserId")
     summary: dict[str, Any] = {
         "date": date,
-        "person": name,
+        "person": patient.get("name"),
         "hisUserId": his_user_id,
         "hmsUserId": hms_user_id,
         "visits": 0,
@@ -778,8 +824,11 @@ def run_person(
     }
 
     # ② 就诊病历 + 医嘱/处方（病历详情里的 itemList）
+    _emit(on_progress, "就诊病历", 0, 1)
     seen_item_names: list[str] = []
-    for record in bridge_ids(client, endpoints, his_user_id):
+    records = bridge_ids(client, endpoints, his_user_id)
+    for index, record in enumerate(records, 1):
+        _emit(on_progress, "就诊病历", index, len(records))
         visit_id = str(record.get("id"))
         register_id = record.get("registerId")
         key = fact_key(date, patient, "visit", visit_id)
@@ -789,7 +838,9 @@ def run_person(
                                extra={"diagnosisList": record.get("diagnosisList"),
                                       "mainSuit": record.get("mainSuit"),
                                       "recordsNo": record.get("recordsNo"),
-                                      "registerId": register_id}))
+                                      "registerId": register_id,
+                                      "clinicTime": record.get("clinicTime"),
+                                      "deptName": record.get("deptName")}))
             summary["facts"] += 1
         summary["visits"] += 1
         detail_path, detail_params = endpoints.render("visitDetail", id=visit_id, registerId=register_id)
@@ -811,8 +862,11 @@ def run_person(
                 seen_item_names.append(item_name)
 
     # ③④ 检验 / 检查报告 + 明细
-    for kind in ("lab", "exam"):
-        for report in his_reports(client, endpoints, his_user_id, kind):
+    for kind, phase in (("lab", "检验报告"), ("exam", "检查报告")):
+        reports = his_reports(client, endpoints, his_user_id, kind)
+        _emit(on_progress, phase, 0, len(reports))
+        for index, report in enumerate(reports, 1):
+            _emit(on_progress, phase, index, len(reports))
             report_id = str(report.get("id"))
             key = fact_key(date, patient, kind, report_id)
             if key in sink.done:
@@ -823,7 +877,8 @@ def run_person(
                 continue
             sink.raw(detail_path, detail_params, detail)
             items = lab_items(detail) if kind == "lab" else []
-            extra = {"groupItemName": report.get("groupItemName")}
+            extra = {"groupItemName": report.get("groupItemName"),
+                     "checkTime": report.get("checkTime")}
             if kind == "exam":
                 extra.update(exam_conclusion(detail))
             sink.fact(fact_row(day=date, patient=patient, kind=kind, source_id=report_id,
@@ -832,7 +887,10 @@ def run_person(
 
     # ⑤⑧ 体检 + 危急值（档案侧，用 hmsUserId）
     if hms_user_id:
-        for report in checkup_reports(client, endpoints, hms_user_id):
+        reports = checkup_reports(client, endpoints, hms_user_id)
+        _emit(on_progress, "体检报告", 0, len(reports))
+        for index, report in enumerate(reports, 1):
+            _emit(on_progress, "体检报告", index, len(reports))
             report_id = str(report.get("medicalDataId") or report.get("id"))
             medical_no = report.get("medicalNo")
             key = fact_key(date, patient, "checkup", report_id)
@@ -844,6 +902,9 @@ def run_person(
                     sink.fact(fact_row(day=date, patient=patient, kind="checkup", source_id=report_id,
                                        endpoint=summary_path, items=diagnosis_items(summary_doc),
                                        extra={"medicalNo": medical_no,
+                                              "medicalDate": report.get("medicalDate"),
+                                              "grade": (data_of(summary_doc) or {}).get("grade")
+                                              if isinstance(data_of(summary_doc), dict) else None,
                                               "medicalType": dicts.label("medicalType", report.get("medicalType")),
                                               "medicalGroup": dicts.label("medicalGroup", report.get("medicalGroup"))}))
                     summary["facts"] += 1
@@ -857,31 +918,41 @@ def run_person(
 
     # ⑦ 单项历史（可选）
     if with_trends and hms_user_id:
-        for item_name in seen_item_names[:8]:
+        wanted = seen_item_names[:8]
+        _emit(on_progress, "单项历史", 0, len(wanted))
+        for index, item_name in enumerate(wanted, 1):
+            _emit(on_progress, "单项历史", index, len(wanted))
             key = fact_key(date, patient, "trend", item_name)
             if key in sink.done:
                 continue
             trend_path, trend_params = endpoints.render("itemHistory", itemName=item_name, userId=hms_user_id)
             history = client.get_soft(trend_path, **trend_params)
-            series = data_of(history)
-            items: list[dict[str, Any]] = []
-            if isinstance(series, dict):
-                for group, points in series.items():
-                    for point in points or []:
-                        if isinstance(point, dict):
-                            items.append({"itemCode": point.get("itemCode"),
-                                          "itemName": point.get("itemName") or group,
-                                          "result": point.get("result"), "unit": None,
-                                          "reference": point.get("referenceRange"),
-                                          "flagText": point.get("tipsContent"), "isYang": point.get("isYang"),
-                                          "checkTime": point.get("checkTime")})
+            items = trend_points(data_of(history))
             if items:
                 sink.fact(fact_row(day=date, patient=patient, kind="trend", source_id=item_name,
                                    endpoint=trend_path, items=items, extra={"groupItemName": item_name}))
                 summary["facts"] += 1
 
+    _emit(on_progress, "完成", 1, 1)
     summary["errors"] = list(client.errors)
     return summary
+
+
+def run_person(
+    client: Client,
+    endpoints: Endpoints,
+    sink: Sink,
+    name: str,
+    telephone: str,
+    with_trends: bool,
+    dicts: "Dictionaries",
+    on_progress: Any = None,
+    day: str | None = None,
+) -> dict[str, Any]:
+    """姓名 + 电话 → 这个人的全部记录（就诊 / 处方医嘱 / 检验 / 检查 / 体检 / 危急值）。"""
+    patient = resolve_identity(client, endpoints, name, telephone)
+    return collect_person_records(client, endpoints, sink, patient, dicts,
+                                  with_trends=with_trends, on_progress=on_progress, day=day)
 
 
 # --------------------------------------------------------------------------- #
@@ -936,7 +1007,8 @@ def main(argv: list[str] | None = None) -> int:
                     print("[his] mode=person 需要 --name", file=sys.stderr)
                     return 2
                 dicts = Dictionaries(client, endpoints, enabled=not args.no_dictionaries)
-                summary = run_person(client, endpoints, sink, args.name, args.telephone, args.with_trends, dicts)
+                summary = run_person(client, endpoints, sink, args.name, args.telephone,
+                                     args.with_trends, dicts, day=args.date)
         except CollectError as error:
             print(f"[his] 采集失败: {error}", file=sys.stderr)
             return 1

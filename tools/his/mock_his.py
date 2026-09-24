@@ -11,7 +11,7 @@
 手工起服务::
 
     python3 tools/his/mock_his.py --port 8099
-    curl 'http://127.0.0.1:8099/apis/auth/me' -H 'Cookie: x=1'
+    curl 'http://127.0.0.1:8099/api/example/auth/me' -H 'Cookie: x=1'
 
 测试里用 `make_server()`（随机端口，进程内启动）。"""
 
@@ -117,6 +117,8 @@ IDENTITY_ROWS = [
      "identityCard": "440000199001010000", "gender": "1", "age": 41},
     {"id": "his-a-9998", "hmsArchivesUserId": "hms-a-9998", "name": "测试甲",
      "telephone": "13900000009", "identityCard": "440000199001010009", "gender": "2", "age": 41},
+    {"id": HIS_B, "hmsArchivesUserId": HMS_B, "name": "测试乙", "telephone": "13800000002",
+     "identityCard": "440000199303030002", "gender": "2", "age": 33},
 ]
 DICT_ENTRIES = {
     "MD_ITEM_USAGE": [{"itemValue": "01", "name": "口服"}, {"itemValue": "02", "name": "外用"}],
@@ -160,6 +162,18 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        # 一个最小的"工作台页面"：扩展要注入到真实的页面里，所以假系统也得有页面。
+        # 它故意不带 CSP —— 真实系统实测也没有（否则注入的内联引导会被浏览器拦掉）。
+        if path in ("/", "/demo", "/demo/"):
+            page = ("<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+                    "<title>假工作台</title></head><body><h1>假工作台</h1>"
+                    "<p>用来验证扩展的注入与同源直查。</p></body></html>").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+            return
         # 会话校验：缺 Cookie 就回 HTTP 200 + 业务 401（真实系统的行为）
         if "cookie" not in {k.lower() for k in self.headers}:
             self._send({"httpStatus": 200, "status": "401", "message": "登录超时", "data": None})

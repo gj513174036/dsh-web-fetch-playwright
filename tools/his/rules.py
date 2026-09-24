@@ -29,7 +29,7 @@ import re
 import sys
 from typing import Any
 
-RULE_VERSION = "4"
+RULE_VERSION = "5"
 
 #: 结果里的方向标记与噪声。**裸 +/- 不算方向**：那会把 "-1.5" 的符号和 "3.5-9.5" 的连字符误当异常标记，
 #: 所以"清理数值"和"读方向"用两套模式。
@@ -43,6 +43,9 @@ _POSITIVE_CODES = {"P", "POS", "阳性", "POSITIVE", "+"}
 _FLAG_HIGH = re.compile(r"(↑|H|high|偏高|增高|升高|\+)", re.I)
 _FLAG_LOW = re.compile(r"(↓|L|low|偏低|降低|减低|-)", re.I)
 _QUALITATIVE_NEGATIVE = re.compile(r"(阴性|negative|正常|未见异常|\(-\)|normal)", re.I)
+#: 定性结果里的"阳性"线索。**只在参考文本明说是阴性时**才用它判方向：
+#: 裸 "+" 单独出现仍按无方向处理。
+_POSITIVE_HINT = re.compile(r"(阳性|弱阳|positive|reactive|检出|\+)", re.I)
 _RANGE = re.compile(
     r"^\s*([-+]?\d+(?:\.\d+)?)\s*(?:--|-|~|—|–|～|至|到)\s*([-+]?\d+(?:\.\d+)?)\s*$"
 )
@@ -50,6 +53,18 @@ _RANGE = re.compile(
 _SEGMENT = re.compile(r"^\s*([^:|]{0,12}?)\s*:\s*(.+?)\s*$")
 _UPPER = re.compile(r"^\s*(?:<|≤|＜|不高于|低于)\s*([-+]?\d+(?:\.\d+)?)\s*$")
 _LOWER = re.compile(r"^\s*(?:>|≥|＞|不低于|高于)\s*([-+]?\d+(?:\.\d+)?)\s*$")
+
+
+def _normalize_qual(text: Any) -> str:
+    """定性文本归一：去掉括号里的补充（``黄色(-)`` → ``黄色``）、去空白、统一大小写。"""
+    raw = re.sub(r"[（(][^）)]*[）)]", "", str(text or ""))
+    return re.sub(r"\s+", "", raw).strip().lower()
+
+
+def _same_qualitative(result: Any, reference: Any) -> bool:
+    """结果与参考逐字相同（归一后）且非空 —— 定性项目的"正常"证据。"""
+    left, right = _normalize_qual(result), _normalize_qual(reference)
+    return bool(left) and left == right
 
 
 def parse_number(text: Any) -> float | None:
@@ -161,10 +176,14 @@ def verdict_of(item: dict[str, Any], item_extra: dict[str, Any] | None = None) -
     arrow_text = item.get("arrow")
 
     low, high, kind = parse_reference(reference_text)
-    if low is None and extra.get("minValue") is not None:
-        low = parse_number(extra.get("minValue"))
-    if high is None and extra.get("maxValue") is not None:
-        high = parse_number(extra.get("maxValue"))
+    # 区间还有两种给法：事实级的 extra（检查报告）与明细自带的 minValue/maxValue
+    # （单项历史的时间序列点就只给这两个，referenceRange 可能是空的）。
+    low_source = extra.get("minValue") if extra.get("minValue") is not None else item.get("minValue")
+    high_source = extra.get("maxValue") if extra.get("maxValue") is not None else item.get("maxValue")
+    if low is None and low_source is not None:
+        low = parse_number(low_source)
+    if high is None and high_source is not None:
+        high = parse_number(high_source)
     if (low is not None or high is not None) and kind == "unknown":
         kind = "numeric"
 
@@ -255,6 +274,16 @@ def verdict_of(item: dict[str, Any], item_extra: dict[str, Any] | None = None) -
                        why=f"定性结果 {str(result_text).strip()!r} 本身为阴性")
         return verdict
 
+    # 3.6) 定性结果**与参考文本一致** → 正常。
+    #      粪便常规那一整张单子都是"未见 / 未见"、"黄色 / 黄色"这种形状，实测会刷出
+    #      8 条毫无意义的"待复核"。参考文本对定性项目来说就是"正常该是什么样"，
+    #      结果与它逐字相同，就是最硬的正常证据 —— 比关键词表更可靠。
+    #      （kind=qualitative 的那一类留给下面第 5 步，它的 why 会带上参考，信息更多。）
+    if value is None and kind != "qualitative" and _same_qualitative(result_text, reference_text):
+        verdict.update(verdict="negative", severity="info", ruleId="qualitative-match",
+                       why=f"定性结果 {str(result_text).strip()!r} 与参考 {str(reference_text).strip()!r} 一致")
+        return verdict
+
     # 4) 只有 haveCrisis 线索：降级为"请人看一眼"
     if _truthy(item.get("crisisHint")):
         verdict.update(verdict="unknown", severity="review", ruleId="crisis-hint",
@@ -264,9 +293,19 @@ def verdict_of(item: dict[str, Any], item_extra: dict[str, Any] | None = None) -
     # 5) 判不了就明说
     if value is None and str(result_text or "").strip():
         if kind == "qualitative" or _QUALITATIVE_NEGATIVE.search(str(reference_text)):
-            verdict.update(verdict="negative" if _QUALITATIVE_NEGATIVE.search(str(result_text)) else "abnormal",
-                           severity="info", ruleId="qualitative",
-                           why=f"定性结果 {str(result_text).strip()!r} 对参考 {reference_text!r}")
+            text = str(result_text).strip()
+            if _QUALITATIVE_NEGATIVE.search(text):
+                verdict.update(verdict="negative", severity="info", ruleId="qualitative",
+                               why=f"定性结果 {text!r} 对参考 {reference_text!r}：阴性")
+            elif _POSITIVE_HINT.search(text):
+                verdict.update(verdict="positive", severity="abnormal", ruleId="qualitative",
+                               why=f"定性结果 {text!r} 对参考 {reference_text!r}：阳性")
+            else:
+                # 参考说是阴性，结果既不是阴性也不像阳性（"未查"、"见描述"…）。
+                # 这类**不能算异常，更不能算正常** —— 先前这里写死 severity=info，
+                # 结果"阳性(+)"对"阴性(-)"这种真异常会被异常清单静默丢掉。
+                verdict.update(verdict="unknown", severity="review", ruleId="qualitative",
+                               why=f"定性结果 {text!r} 对参考 {reference_text!r}：既非阴性也非阳性")
         else:
             verdict.update(verdict="unknown", severity="review", ruleId="unparsed",
                            why=f"既无异常标志、也无法解析数值（result={result_text!r} reference={reference_text!r}）")
