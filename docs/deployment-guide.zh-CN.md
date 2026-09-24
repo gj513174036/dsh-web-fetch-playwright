@@ -247,7 +247,7 @@ dsh plugin --profile web add file:/绝对路径/web_fetch_playwright
 git clone <repo> && cd dsh-web-fetch-playwright
 pnpm install          # 依赖 + 自动构建（prepare → build）
 pnpm run typecheck    # 类型检查
-pnpm test             # 单元测试（12 文件 / 323 用例；真实浏览器用例自动跳过）
+pnpm test             # 单元/集成测试（当前 22 文件 / 588 用例；无可用浏览器时真机用例自动跳过）
 pnpm build            # 产出 lib/index.js（宿主）与 lib/client.js（界面卡片）
 ```
 
@@ -755,7 +755,7 @@ WantedBy=multi-user.target
 1. 真实代理连通性（含需鉴权的 HTTP 代理）；
 2. Chrome 用户目录**跨机迁移后的可解密性**（绑定 OS keyring/DPAPI/Keychain）；
 3. 真实站点鉴权流量抓取（真实 Token/Cookie 的 XHR/WS）；
-4. 真实浏览器三种后端 + Cloudflare 挑战（本环境 15 个集成用例**自跳过**，**跳过≠通过**）；
+4. 真实浏览器三种后端 + Cloudflare 挑战 + 响应条件（无可用浏览器时 `tests/integration.browser.spec.ts` 的 18 个用例**自跳过**，**跳过≠通过**）；
 5. `autossh` 反向隧道端到端；
 6. 真实 CDP extra-info 的**到达顺序与省略情形**（限制 1–3 的根源）；
 7. 生成脚本的真实 httpx 运行（本环境未安装 httpx，测试用等价假模块；`httpx < 0.26` 回退分支未实测）。

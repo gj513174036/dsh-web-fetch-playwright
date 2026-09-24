@@ -8,11 +8,12 @@
 | P1 | DSH 托管持久浏览器（一键 headless/user-data-dir）+ 本地 GUI 启动器 + autossh 隧道拓扑 | §4、§5 |
 | P2 | 每次 fetch 一条 CDP 会话抓 XHR/Fetch/WS，JSONL 实时落盘 + HAR 1.2 | §6 |
 | P3 | `tools/netdump/` 离线流水线：过滤静态资源 → 业务 API 清单 → httpx 异步爬虫 | §7、§8 |
+| P4 | 动作模型：`observe` 发现 → 配方固化 → 确定性重放（含"新标签页"与"响应条件"） | §9 |
 
 - 适用版本：`package.json` 版本 **0.2.7** 之上的 `[Unreleased]` 变更集（本仓库分支 `feat/proxy-capture-pipeline`）。
 - 本手册中出现的每个配置项名、脚本路径、CLI 参数都可在附录 A 索引里对回源码（附录 A 是逐字核对过的清单）。
 - 本手册中的「预期输出」片段来自本仓库的真实执行记录（干净检出 + 真实启动器二进制 + 真实 netdump 运行），不是示意。
-- 预计耗时：§1–§3 约 15 分钟；§4 或 §5 任选一条拓扑约 20 分钟；§6–§8 约 20 分钟。
+- 预计耗时：§1–§3 约 15 分钟；§4 或 §5 任选一条拓扑约 20 分钟；§6–§8 约 20 分钟；§9（动作模型）约 10 分钟。
 
 ---
 
@@ -28,7 +29,7 @@
 | `autossh`（仅拓扑 B） | 反向隧道 | `autossh -V` | 有输出 |
 | `httpx`（仅 P3 生成脚本运行） | 服务器裸跑爬虫 | `python3 -c "import httpx; print(httpx.__version__)"` | 有输出；没有则 `pip install "httpx[http2,socks]"` |
 
-> 本仓库的验证环境**没有可启动的浏览器**（`~/.cache/ms-playwright` 为空、`$PATH` 无 chromium/chrome），因此本文中所有依赖真实浏览器、真实代理、真实隧道的步骤都标注为「待你真机验证」；自动化测试里对应的 15 个真机用例会**自跳过**（详见 §11）。
+> 本仓库的验证环境**没有可启动的浏览器**（`~/.cache/ms-playwright` 为空、`$PATH` 无 chromium/chrome），因此本文中所有依赖真实浏览器、真实代理、真实隧道的步骤都标注为「待你真机验证」；自动化测试里对应的真机用例会**自跳过**（详见 §12）。
 
 ---
 
@@ -404,7 +405,7 @@ target "…" step 5 (waitFor) did not hold: response under …/never-this-endpoi
 | **真实代理连通性**（含认证代理） | 验证环境没有代理服务端，也没有可启动的浏览器 | §3.2/§3.3 抓一次包，在代理服务端日志确认请求经过；认证代理按 §5.1 用免鉴权跳或代理侧白名单 |
 | **本机 Chrome profile 跨机迁移后的可解密性** | 需要真实 Chrome profile 与操作系统凭据库（Linux 上 Chrome 用 `libsecret`/`kwallet` 派生密钥加密 `Login Data`） | §5.1 在**目标机**上启动副本浏览器，打开一个需要登录的站点，看是否仍是登录态；若被要求重新登录，属平台密钥不同导致的预期行为，用有头模式手动登录一次 |
 | **真实站点鉴权流量抓取效果** | 需要真实登录会话与目标站点 | §6 打开 `recordNetwork` 抓一个登录后的接口，确认 `network.jsonl`/`har.json` 里出现该接口且带 `Authorization`/`Cookie`；再喂给 §7 生成 crawler 并在服务器跑通 |
-| 真实浏览器三后端渲染、Cloudflare 挑战、并发标签页 | `~/.cache/ms-playwright` 为空且 `$PATH` 无 chromium/chrome，自动化里的 15 个真机用例自跳过（§11） | 按 §3/§4/§5 手工跑一遍，确认抓取返回真实文章而不是 `Just a moment…` |
+| 真实浏览器三后端渲染、Cloudflare 挑战、并发标签页 | `~/.cache/ms-playwright` 为空且 `$PATH` 无 chromium/chrome，自动化里的真机用例自跳过（§12） | 按 §3/§4/§5 手工跑一遍，确认抓取返回真实文章而不是 `Just a moment…` |
 | `autossh` 反向隧道端到端 | 没有隧道目标主机 | §5.2 建隧道后在插件宿主机 `curl http://127.0.0.1:9222/json/version`，应返回该浏览器的 DevTools 版本信息 |
 | 真实 CDP 的 extra-info 到达顺序/省略情形 | 自动化只用**合成** CDP 事件流覆盖（README 与 `src/recorder.ts` 均如此声明） | §6 抓一个真实 301 跳转站点，检查 `network.jsonl` 里每跳 `requestExtra`/`responseExtra` 的 `hop` 与凭据归属 |
 
@@ -418,12 +419,12 @@ target "…" step 5 (waitFor) did not hold: response under …/never-this-endpoi
 | --- | --- |
 | `pnpm install --frozen-lockfile` | exit 0（`Done in 10.5s using pnpm v12.4.2`） |
 | `pnpm run typecheck` | **exit 0**（输出仅 `$ tsc --noEmit`） |
-| `pnpm test` | **exit 0**：`Test Files 12 passed (12)` / `Tests 323 passed (323)` |
+| `pnpm test` | **exit 0**：全部通过（当前 `Test Files 22 passed (22)` / `Tests 588 passed (588)`；本节里那份 12/323 是 P0–P3 那轮交付时的快照） |
 | `python3 -m unittest discover -s tools/netdump/tests -t tools/netdump` | **exit 0**：`Ran 140 tests … OK` |
 
-**自跳过说明（跳过 ≠ 通过）**：`tests/integration.browser.spec.ts` 的 **15 个用例**（3 个 browser smoke + 6 个 CDP smoke + 6 个 challenge A/B）在无可用浏览器时于用例体内提前 return，vitest 把它们计入 passed；`beforeAll` 的启动探针会打印 `skipping browser smoke: browserType.launch: Executable doesn't exist at …/ms-playwright/…`。因此「真机浏览器」相关的行为在本仓库**未被验证**，必须按 §9 由你在真机上确认。
+**自跳过说明（跳过 ≠ 通过）**：`tests/integration.browser.spec.ts` 的 **18 个用例**（3 个 browser smoke + 6 个 CDP smoke + 6 个 challenge A/B + 3 个响应条件）在无可用浏览器时于用例体内提前 return，vitest 把它们计入 passed；`beforeAll` 的启动探针会打印 `skipping browser smoke: browserType.launch: Executable doesn't exist at …/ms-playwright/…`。因此「真机浏览器」相关的行为在本仓库**未被验证**，必须按 §10 由你在真机上确认。
 
-结论：**代码门禁全绿**；配置卡片、README(en/zh)、`SECURITY.md`、`package.json` 的 `dsh.disclosure.permissions`、`CHANGELOG.md` 相互一致（核对明细见 §11 与任务报告）；本轮交付可以进入发布评审，真机项按 §9 验收。
+结论：**代码门禁全绿**；配置卡片、README(en/zh)、`SECURITY.md`、`package.json` 的 `dsh.disclosure.permissions`、`CHANGELOG.md` 相互一致（核对明细见 §12 与任务报告）；本轮交付可以进入发布评审，真机项按 §9 验收。
 
 ---
 

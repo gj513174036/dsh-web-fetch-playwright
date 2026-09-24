@@ -1,0 +1,380 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dsh-web-fetch-playwright 插件架构",
+    "output": "dsh-web-fetch-playwright-architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/gj513174036/dsh-web-fetch-playwright",
+      "revision": "f2168fa1a9b778e89300f836eac15500ea96f195"
+    },
+    "views": [
+      {
+        "id": "fetch-path",
+        "label": "抓取主路径",
+        "focus": [
+          "agent",
+          "webseam",
+          "provider",
+          "pool",
+          "browser"
+        ],
+        "note": "从模型的抓取调用，到真实浏览器渲染出的页面。"
+      },
+      {
+        "id": "page-driving",
+        "label": "页面驱动与守卫",
+        "focus": [
+          "targets",
+          "provider",
+          "guards",
+          "browser"
+        ],
+        "note": "目标重放、挑战页等待与同意横幅处理，都发生在同一个页面上下文里。"
+      },
+      {
+        "id": "evidence",
+        "label": "降噪与抓包产物",
+        "focus": [
+          "provider",
+          "denoise",
+          "capture",
+          "browser"
+        ],
+        "note": "同一次抓取分别产出模型读的正文与留档的网络记录。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "agent",
+      "type": "external",
+      "label": "模型与工具调用",
+      "sublabel": "web_fetch",
+      "pos": [
+        40,
+        400
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "webseam",
+      "type": "backend",
+      "label": "抓取接缝",
+      "sublabel": "ctx.web 提供方注册表",
+      "pos": [
+        260,
+        400
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "provider",
+      "type": "backend",
+      "label": "PlaywrightFetchProvider",
+      "sublabel": "抓取提供方 id: playwright",
+      "pos": [
+        470,
+        400
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "src/provider.ts",
+          "line": 589
+        }
+      ]
+    },
+    {
+      "id": "pool",
+      "type": "backend",
+      "label": "浏览器后端池",
+      "sublabel": "local / managed / cdp",
+      "pos": [
+        710,
+        400
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/browser-pool.ts",
+          "line": 88
+        },
+        {
+          "path": "src/cdp-pool.ts",
+          "line": 58
+        }
+      ]
+    },
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "真实浏览器",
+      "sublabel": "渲染出的目标页面",
+      "pos": [
+        920,
+        400
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "settings",
+      "type": "frontend",
+      "label": "设置卡片",
+      "sublabel": "web-fetch-playwright 分区",
+      "pos": [
+        470,
+        660
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/client/card.tsx"
+        },
+        {
+          "path": "src/index.ts",
+          "line": 53
+        }
+      ]
+    },
+    {
+      "id": "targets",
+      "type": "database",
+      "label": "目标库",
+      "sublabel": "targets/*.json 固化脚本",
+      "pos": [
+        470,
+        140
+      ],
+      "size": [
+        180,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/targets.ts",
+          "line": 148
+        },
+        {
+          "path": "src/target-store.ts"
+        }
+      ]
+    },
+    {
+      "id": "guards",
+      "type": "security",
+      "label": "页面守卫",
+      "sublabel": "挑战页 / 同意横幅",
+      "pos": [
+        920,
+        140
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/challenge.ts",
+          "line": 202
+        },
+        {
+          "path": "src/consent.ts"
+        }
+      ]
+    },
+    {
+      "id": "denoise",
+      "type": "backend",
+      "label": "降噪",
+      "sublabel": "htmlToMarkdown",
+      "pos": [
+        260,
+        660
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/markdown.ts",
+          "line": 249
+        }
+      ]
+    },
+    {
+      "id": "launcher",
+      "type": "cloud",
+      "label": "本地启动器",
+      "sublabel": "dsh-web-fetch-launch",
+      "pos": [
+        710,
+        660
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "bin/launch-browser.mjs"
+        },
+        {
+          "path": "src/launcher.ts",
+          "line": 757
+        }
+      ]
+    },
+    {
+      "id": "capture",
+      "type": "database",
+      "label": "网络抓包",
+      "sublabel": "network.jsonl + HAR 1.2",
+      "pos": [
+        920,
+        660
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/recorder.ts",
+          "line": 363
+        },
+        {
+          "path": "src/har.ts"
+        }
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "agent-to-webseam",
+      "from": "agent",
+      "to": "webseam",
+      "label": "web_fetch 调用",
+      "variant": "emphasis",
+      "labelDy": 56
+    },
+    {
+      "id": "webseam-to-provider",
+      "from": "webseam",
+      "to": "provider",
+      "label": "注册抓取提供方",
+      "labelDy": -23
+    },
+    {
+      "id": "provider-to-pool",
+      "from": "provider",
+      "to": "pool",
+      "label": "按后端租借"
+    },
+    {
+      "id": "pool-to-browser",
+      "from": "pool",
+      "to": "browser",
+      "label": "Playwright / CDP",
+      "labelDy": 56
+    },
+    {
+      "id": "targets-to-provider",
+      "from": "targets",
+      "to": "provider",
+      "label": "匹配并重放目标",
+      "labelDy": 24
+    },
+    {
+      "id": "settings-to-provider",
+      "from": "settings",
+      "to": "provider",
+      "label": "配置实时投影"
+    },
+    {
+      "id": "guards-to-browser",
+      "from": "guards",
+      "to": "browser",
+      "label": "等待挑战页 / 关闭横幅",
+      "labelDy": 24
+    },
+    {
+      "id": "provider-to-denoise",
+      "from": "provider",
+      "to": "denoise",
+      "label": "降噪正文"
+    },
+    {
+      "id": "browser-to-capture",
+      "from": "browser",
+      "to": "capture",
+      "label": "记录标签页流量",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "launcher-to-pool",
+      "from": "launcher",
+      "to": "pool",
+      "label": "远程 CDP 端点",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "抓取入口",
+      "items": [
+        "函数式插件把提供方注册进 ctx.web 的抓取注册表，不做默认导出服务",
+        "与 HTTP 抓取提供方共享同一套错误码分类，工具层无需区分后端"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "三种浏览器后端",
+      "items": [
+        "local：每次抓取现开现关，上下文全新",
+        "managed：DSH 常驻持久化浏览器，登录态跨抓取保留，只关标签页",
+        "cdp：复用他处已启动的浏览器，默认沿用其默认上下文"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "动作与守卫",
+      "items": [
+        "候选按可达性排序：CSS 选择器、可见文本、角色加可访问名",
+        "挑战页在同一个页面与上下文中等待并自行放行，超时才报错",
+        "同意横幅只在文档足够短且词汇匹配时才允许点击"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "离线产物与边界",
+      "items": [
+        "开启 recordNetwork 后按标签页写 network.jsonl 与 HAR 1.2",
+        "抓包全程尽力而为，CDP 或文件系统失败不会让抓取失败",
+        "代理只在 local / managed 启动时注入，CDP 后端只能给出提示"
+      ]
+    }
+  ]
+}
