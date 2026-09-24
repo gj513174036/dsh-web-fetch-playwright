@@ -403,3 +403,4 @@ ticket #4 推翻，修订记录见 §9 之后的「修订」小节。
 - 负向对照（等一个页面从不调用的端点）在真机上同样跑过，响亮失败并点名最后一条响应：
   `… the last response was https://datasearch.nmpa.gov.cn/datasearch/config/ff80808183cad75001840881f848179f.json?date=… (HTTP 200) — at …/search-result.html`。
 - 另有真浏览器集成用例 3 条（本地 HTTP 服务 + 真 Chromium）覆盖"点击引发的到达""接管页从弹出起被监听""端点从不被调用"，与上面这条真机记录相互独立。
+- **经插件自己的 `web_fetch` 工具路径**（重启 `dsh web` 加载 0.2.26 之后）再跑一次，返回的摘要与上表逐字相同，正文是完整的 10 行结果表，抓完后浏览器标签页回到 1 个——入口不同，结论一致。
