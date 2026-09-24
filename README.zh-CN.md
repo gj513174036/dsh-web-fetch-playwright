@@ -42,7 +42,7 @@
 - **可视调试用本地启动器** —— `dsh-web-fetch-launch` 复制你的真实 profile、用 `--remote-debugging-port`（并带上配置好的代理）启动你自己的 Chrome，并打印把该端口送到插件宿主机的 `autossh` 反向隧道命令（见 [两种拓扑](#两种拓扑可视浏览器--服务器无头)）。
 - **抓包记录** —— 每次抓取一条 CDP 会话，把该标签页的 XHR/Fetch/WebSocket 流量（URL、Method、Headers、载荷、响应正文、WS 帧）在抓取进行中就追加进 JSONL，结束时导出 HAR 1.2；默认关闭，且产物按设计含明文凭据（见[抓包记录](#抓包记录xhr--fetch--websocket)）。
 - **热配置** —— 「设置 → 插件 → 插件配置」卡片可随时切换后端、上下文模式、降噪开关与并发数，改动对下一次抓取即时生效，无需重启。
-- **预算控制** —— 单次抓取 45s 超时；并发按后端定价（`maxConcurrency`，默认本地 4 个浏览器 / CDP 与 DSH 托管后端 **50 个标签页**；排队的抓取等不到空位会在 20s 内尽快报错并提示重试，而不是一直挂到被工具层中止）；拦截图片/字体/媒体子请求；返回体 10 万字符封顶。
+- **预算控制** —— 单次抓取默认 45s 超时（`fetchBudgetMs` 可调）；并发按后端定价（`maxConcurrency`，默认本地 4 个浏览器 / CDP 与 DSH 托管后端 **50 个标签页**；排队的抓取等不到空位会在 20s 内尽快报错并提示重试，而不是一直挂到被工具层中止）；拦截图片/字体/媒体子请求；返回体 10 万字符封顶。
 - **Cloudflare 挑战有界等待** —— 导航落到验证中间页（"Just a moment…" 及其多语言同族，通过官方 `cf-mitigated: challenge` 响应头 + 结构性页面标记识别）时，抓取保持**同一标签页与上下文**，等待浏览器自行通过验证：跟踪*最后一次*主 frame 响应（真实页面随后重载进来），并轮询活 DOM 以捕获 SPA 式清除。有界且可配置（`challengeWaitMs`，默认 15s；`0` 恢复旧版首响应行为），附带同标签页有界重试（`challengeRetries`，默认 1）。预算耗尽时以独立的 `WEB_FETCH_CHALLENGE` 错误码明确失败，而不是把中间页当正文返回。同理，同意闸门在接受之后仍未清除时，以 `WEB_FETCH_CONSENT` 明确失败，而不是把闸门页当正文返回。全程不点击、不注入验证码答案、不伪造浏览器状态、不导出或复制 cookie。
 
 ## 工作原理
@@ -113,8 +113,9 @@ bundle 插件加入 profile 层栈后需**重启 `dsh web`** 生效；卸载用 
 | `observe` | `false` | 返回页面的**可操作状态**而不是正文：可触及控件的标签与状态（`checked`/`unchecked`、`disabled`、`covered`、以标签形式可见）、完整计数、可见文本开头。用于面对陌生页面——没有任何标签会写出来的前置条件，往往就是一个计数——它是模式而非每次调用的选项，因为抓取入口只带一个 URL。 |
 | `dismissConsent` | `false` | 页面稳定后、读取之前，点击已知同意管理器的"全部接受"控件（OneTrust、TrustArc、Cookiebot、Didomi、Osano、Usercentrics、CookieYes、Complianz、Iubenda、Klaro、Google Funding Choices、Quantcast）；这些都没命中时，退而点击任何位于同意类界面里的"全部接受 / accept all"控件（判据：位于对话框、同意命名的祖先容器、固定/粘性浮层之中；若是整页同意插页（接受控件以上三者都没有），则该页本身够短且 URL/标题命中同意语境即可）。默认关闭：这次点击会在抓取所用的 profile 里记录**你的**同意（CDP 与托管后端下就是你的真实 profile），同意 cookie 会留在那里。尽力而为：没有横幅、后端不支持 `evaluate`、点击抛错，都不会影响抓取结果。 |
 | `maxConcurrency` | *（自动）* | 同时渲染的页面上限（1–200）。留空按后端取默认：本地 **4**（每个槽位启动一个浏览器）/ CDP 与 DSH 托管后端 **50 个标签页**（浏览器已在运行，一个并发名额就是一个标签页）。超出的请求短暂排队；20s 内等不到空位则以 `WEB_FETCH_TIMEOUT` 尽快失败并提示重试或调大该值，而不是一直挂起直到工具层预算中止。 |
+| `fetchBudgetMs` | `45000` | **单次抓取预算**（毫秒，5000–600000）。排队、打开浏览器/标签页、导航、配方的动作、`waitFor` 链条、挑战等待与正文读取，全部都要落在这个预算内。慢的单页应用、或需要**人工在标签页里操作**的配方要调大它；工具层自己的 `fetchTimeoutMs`（默认 30 秒）若不一起调大，仍会先掐断这次调用。 |
 | `challengeWaitMs` | `15000` | Cloudflare 挑战的**有界**自然等待上限（毫秒，0–60000），在同一标签页内等待浏览器自行通过验证。`0` 关闭整条挑战处理链路——直接返回首次响应（0.2.5 之前的旧行为）。 |
-| `challengeRetries` | `1` | 一个等待窗口耗尽后的**同标签页**重新导航次数（0–3）；浏览器已拿到的通关 cookie 留在上下文里供重试使用。总耗时始终受 45s 单次抓取预算约束。 |
+| `challengeRetries` | `1` | 一个等待窗口耗尽后的**同标签页**重新导航次数（0–3）；浏览器已拿到的通关 cookie 留在上下文里供重试使用。总耗时始终受单次抓取预算（`fetchBudgetMs`，默认 45s）约束。 |
 | `recordNetwork` | `false` | 记录每次抓取的 XHR/Fetch/WebSocket 流量，产出 JSONL + HAR 1.2。默认关闭：产物含明文凭据。 |
 | `recordDir` | 空 | 抓包基目录；每次抓包在其下新建独立的 `<sessionId>` 子目录。留空 = `<工作目录>/net-dumps`（已 gitignore；目录 `0700`、文件 `0600`）。 |
 | `captureBodies` | `true` | 通过 `Network.getResponseBody` 读取响应正文。关闭则只记 URL、状态、Headers 与请求载荷。 |
@@ -255,7 +256,7 @@ PYTHONPATH=tools/netdump python3 -m netdump summary net-dumps/<session>/network.
 3. **有界重试** —— 窗口耗尽后，同一标签页默认再导航一次（`challengeRetries`），上下文里已有的通关 cookie 继续生效。
 4. **明确失败** —— 返回独立的 `WEB_FETCH_CHALLENGE` 错误码（web seam 的 `code` 是开放字符串，允许 provider 专属码），消息中写明站点、等待预算与最后一次挑战响应的状态。
 
-安全边界（刻意为之）：不点击 Turnstile、不解验证码、不注入 token、不伪装指纹/UA、不做代理**轮换**（配置的代理是单一的静态出口，绝不会按请求切换以绕过挑战）、不导出 cookie——隔离模式下本次抓取挣到的通关态随其 context 一起销毁；profile 模式下它留在远端浏览器自己的 profile 里，插件从不复制或清理。等待始终受 `challengeWaitMs` 与 45s 单次抓取预算双重约束，永不无限阻塞。
+安全边界（刻意为之）：不点击 Turnstile、不解验证码、不注入 token、不伪装指纹/UA、不做代理**轮换**（配置的代理是单一的静态出口，绝不会按请求切换以绕过挑战）、不导出 cookie——隔离模式下本次抓取挣到的通关态随其 context 一起销毁；profile 模式下它留在远端浏览器自己的 profile 里，插件从不复制或清理。等待始终受 `challengeWaitMs` 与单次抓取预算（`fetchBudgetMs`）双重约束，永不无限阻塞。
 
 ## 文档
 

@@ -19,11 +19,15 @@ import {
   MAX_BODY_BYTES_CEILING,
   MAX_CHALLENGE_RETRIES,
   MAX_CHALLENGE_WAIT_MS,
+  DEFAULT_FETCH_BUDGET_MS,
   MAX_CONCURRENCY_CEILING,
+  MAX_FETCH_BUDGET_MS,
+  MIN_FETCH_BUDGET_MS,
   PROXY_LOOPBACK_BYPASS,
   effectiveChallengeRetries,
   effectiveChallengeWaitMs,
   effectiveContextMode,
+  effectiveFetchBudgetMs,
   effectiveHeadless,
   effectiveMaxConcurrency,
   effectiveRecordBase,
@@ -58,6 +62,7 @@ describe('Config', () => {
       targetsFile: '',
       challengeWaitMs: DEFAULT_CHALLENGE_WAIT_MS,
       challengeRetries: DEFAULT_CHALLENGE_RETRIES,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
       proxyServer: '',
       proxyBypass: '',
       proxyUsername: '',
@@ -117,6 +122,7 @@ describe('Config', () => {
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
       challengeRetries: 2,
+      fetchBudgetMs: 45_000,
       proxyServer: 'http://127.0.0.1:7890',
       proxyBypass: '*.internal',
       proxyUsername: 'proxyuser',
@@ -134,6 +140,7 @@ describe('Config', () => {
       maxConcurrency: 50,
       challengeWaitMs: 30_000,
       challengeRetries: 2,
+      fetchBudgetMs: 45_000,
       proxyServer: 'http://127.0.0.1:7890',
       proxyBypass: '*.internal',
       proxyUsername: 'proxyuser',
@@ -188,6 +195,27 @@ describe('effective challenge knobs', () => {
     expect(effectiveChallengeRetries({ challengeRetries: 0 })).toBe(0)
     expect(effectiveChallengeRetries({ challengeRetries: 3 })).toBe(3)
     expect(effectiveChallengeRetries({})).toBe(DEFAULT_CHALLENGE_RETRIES)
+  })
+})
+
+describe('effectiveFetchBudgetMs', () => {
+  it('an explicit budget wins; a missing one falls back to the schema default', () => {
+    expect(effectiveFetchBudgetMs({ fetchBudgetMs: 120_000 })).toBe(120_000)
+    expect(effectiveFetchBudgetMs({})).toBe(DEFAULT_FETCH_BUDGET_MS)
+  })
+
+  it('clamps a value the schema could not have produced instead of trusting it', () => {
+    expect(effectiveFetchBudgetMs({ fetchBudgetMs: 1_000 })).toBe(MIN_FETCH_BUDGET_MS)
+    expect(effectiveFetchBudgetMs({ fetchBudgetMs: 10_000_000 })).toBe(MAX_FETCH_BUDGET_MS)
+    expect(effectiveFetchBudgetMs({ fetchBudgetMs: 0 })).toBe(DEFAULT_FETCH_BUDGET_MS)
+    expect(effectiveFetchBudgetMs({ fetchBudgetMs: Number.NaN })).toBe(DEFAULT_FETCH_BUDGET_MS)
+  })
+
+  it('accepts the budget in the schema, rejects out-of-range values', () => {
+    expect(Config({ fetchBudgetMs: 90_000 }).fetchBudgetMs).toBe(90_000)
+    expect(Config({}).fetchBudgetMs).toBe(DEFAULT_FETCH_BUDGET_MS)
+    expect(() => Config({ fetchBudgetMs: 1_000 })).toThrow()
+    expect(() => Config({ fetchBudgetMs: 10_000_000 })).toThrow()
   })
 })
 

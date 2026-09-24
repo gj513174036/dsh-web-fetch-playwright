@@ -15,6 +15,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { ResolvedConfig } from '../src/config.ts'
+import { DEFAULT_FETCH_BUDGET_MS } from '../src/config.ts'
 import { CdpConnectionPool } from '../src/cdp-pool.ts'
 import type { ResolvedPlaywright } from '../src/playwright-resolve.ts'
 import { CAPTURE_ERROR_KINDS_MAX, captureErrorKey, CaptureErrorReporter, PlaywrightFetchProvider, WEB_FETCH_CHALLENGE_CODE, WEB_FETCH_PROXY_CODE } from '../src/provider.ts'
@@ -207,6 +208,7 @@ function resolvedConfig(over: Partial<ResolvedConfig> = {}): ResolvedConfig {
     maxConcurrency: 4,
     challengeWaitMs: 0,
     challengeRetries: 0,
+    fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     proxyServer: '',
     proxyBypass: '',
     proxyUsername: '',
@@ -475,6 +477,7 @@ class FakeProvider extends PlaywrightFetchProvider {
       // Legacy default: the challenge path stays off unless a test opts in.
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
       ...config,
     }))
   }
@@ -507,6 +510,7 @@ class GatedProvider extends PlaywrightFetchProvider {
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
       ...config,
     }))
   }
@@ -1195,6 +1199,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     }), pool)
 
     const first = await provider.fetch({ url: 'https://example.com/a' })
@@ -1228,6 +1233,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     }), pool)
 
     const results = await Promise.all(Array.from({ length: 50 }, (_, i) =>
@@ -1253,6 +1259,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     }), pool)
 
     const first = await provider.fetch({ url: 'https://example.com/a' })
@@ -1288,6 +1295,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     }), pool)
 
     const results = await Promise.all(Array.from({ length: 12 }, (_, i) =>
@@ -1312,6 +1320,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     }), pool)
 
     const controller = new AbortController()
@@ -1342,6 +1351,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     }), pool)
 
     await provider.fetch({ url: 'https://example.com/popup-spawner' })
@@ -1377,6 +1387,7 @@ describe('PlaywrightFetchProvider CDP backend', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: DEFAULT_FETCH_BUDGET_MS,
     }))
     // Real bundled playwright-core; port 1 refuses connections immediately.
     const error = await provider.fetch({ url: 'https://example.com/x' }).then(() => { throw new Error('expected rejection') }, (e: unknown) => e)

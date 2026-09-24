@@ -17,7 +17,7 @@ import { Config } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { PlaywrightFetchProvider } from './provider.ts'
 
-export { Config, DEFAULT_CDP_ENDPOINT, DEFAULT_CHALLENGE_RETRIES, DEFAULT_CHALLENGE_WAIT_MS, DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, MANAGED_PROFILE_DIRECTORY, PROXY_LOOPBACK_BYPASS, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveHeadless, effectiveMaxConcurrency, effectiveUserDataDir, managedLaunchFor, managedLaunchKey, mergeProxyBypass, normalizeCdpEndpoint, normalizeProxyServer, proxyOptionFor, redactProxyServer } from './config.ts'
+export { Config, DEFAULT_CDP_ENDPOINT, DEFAULT_CHALLENGE_RETRIES, DEFAULT_CHALLENGE_WAIT_MS, DEFAULT_FETCH_BUDGET_MS, DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, MANAGED_PROFILE_DIRECTORY, MAX_FETCH_BUDGET_MS, MIN_FETCH_BUDGET_MS, PROXY_LOOPBACK_BYPASS, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveFetchBudgetMs, effectiveHeadless, effectiveMaxConcurrency, effectiveUserDataDir, managedLaunchFor, managedLaunchKey, mergeProxyBypass, normalizeCdpEndpoint, normalizeProxyServer, proxyOptionFor, redactProxyServer } from './config.ts'
 export type { CdpContextMode, Config as PlaywrightFetchConfig, ManagedLaunch, ManagedSettings, PlaywrightBackend, ProxySettings, ResolvedConfig } from './config.ts'
 export { BrowserPool } from './browser-pool.ts'
 export type { BrowserLease, BrowserOpener, BrowserPoolOptions, LeaseContext, LeaseMode } from './browser-pool.ts'

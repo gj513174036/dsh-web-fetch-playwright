@@ -260,7 +260,7 @@ PYTHONPATH=tools/netdump python3 -m netdump build capture.har -o netdump-out
 | 页面安顿 | `waitForLoadState('networkidle')`，**上限 5 秒** | `SETTLE_MS = 5_000` |
 | 之后 | 读正文 → **关掉这个标签页** | `BrowserPool.release()` → `page.close()` |
 | 单个等待步骤 | 上限 **10 秒**；预算不够就"当作这一步没发生" | `STEP_CEILING_MS = 10_000` |
-| 整次抓取 | **45 秒** | `DEFAULT_TIMEOUT_MS = 45_000` |
+| 整次抓取 | **默认 45 秒**（`fetchBudgetMs` 可配，5000–600000） | `src/config.ts` → `DEFAULT_FETCH_BUDGET_MS` / `effectiveFetchBudgetMs()` |
 
 `networkidle` 的判据只是"**500 毫秒内没有网络活动**"。**分波加载**的单页应用
 （先鉴权 → 再组织/菜单/字典 → **最后才请求业务数据**）会在两波之间的空隙里被判定为"页面安静了"，
@@ -559,4 +559,4 @@ WantedBy=timers.target
 | 复放必须用 `requestExtra` 的权威头集（含 `Cookie`）；缺 `Cookie` 时得到 `HTTP 200` + `{"status":401,"message":"登录超时"}` | 实测：同一名单接口的 T1（原样）与 T4（去掉 Cookie）对比 |
 | `Set-Cookie … expires=Fri, 14 Jun 22013` 型 cookie 不会按时过期，但服务端仍会失效（业务码 401，HTTP 仍 200） | 实测：同一系统的响应头与会话失效响应 |
 | 带 `crypt-key` + `timestamp` 的接口**未必**签名：四连测试里改业务参数照样返回数据 | 实测：同一名单接口的 T1/T2 |
-| 单步等待上限 10 秒、整次抓取 45 秒、页面安顿上限 5 秒、标签页结束时被关 | `src/actions.ts` → `STEP_CEILING_MS`；`src/provider.ts` → `DEFAULT_TIMEOUT_MS` / `SETTLE_MS`；`src/browser-pool.ts` → `release()` |
+| 单步等待上限 10 秒、整次抓取 45 秒、页面安顿上限 5 秒、标签页结束时被关 | `src/actions.ts` → `STEP_CEILING_MS`；`src/config.ts` → `DEFAULT_FETCH_BUDGET_MS`；`src/provider.ts` → `SETTLE_MS`；`src/browser-pool.ts` → `release()` |

@@ -29,6 +29,7 @@ export type PlaywrightCardLocaleKey =
   | 'targetsFile' | 'targetsFileHint' | 'targetsFilePlaceholder'
   | 'maxConcurrency' | 'maxConcurrencyHint' | 'maxConcurrencyPlaceholder'
   | 'challengeWaitMs' | 'challengeWaitMsHint' | 'challengeWaitMsPlaceholder'
+  | 'fetchBudgetMs' | 'fetchBudgetMsHint' | 'fetchBudgetMsPlaceholder'
   | 'proxyServer' | 'proxyServerHint' | 'proxyServerPlaceholder'
   | 'proxyBypass' | 'proxyBypassHint' | 'proxyBypassPlaceholder'
   | 'proxyUsername' | 'proxyUsernameHint'
@@ -99,6 +100,9 @@ export const en: Record<PlaywrightCardLocaleKey, string> = {
   challengeWaitMs: 'Cloudflare challenge wait (ms)',
   challengeWaitMsHint: 'Bounded wait for a Cloudflare challenge to clear naturally in the same tab (0–60000; 0 = off). 0 disables: the first response is returned as-is.',
   challengeWaitMsPlaceholder: '(default: 15000)',
+  fetchBudgetMs: 'Fetch budget (ms)',
+  fetchBudgetMsHint: 'Everything one fetch does has to fit inside this budget: queueing, opening the browser or tab, navigation, the recipe\u2019s actions, a challenge wait and the content read (5000\u2013600000). The tool layer\u2019s own timeout (fetchTimeoutMs, 30s by default) still cuts the call first unless that is raised too.',
+  fetchBudgetMsPlaceholder: '(default: 45000)',
   proxyServer: 'Outbound proxy',
   proxyServerHint: 'host:port or an http(s)/socks4/socks5 URL, e.g. http://127.0.0.1:7890. Blank = direct connection. Injected into every browser this plugin launches (local and DSH-managed). In CDP mode it is NOT applied by the plugin: a proxy is a launch-time property of that browser, so it must have been started with --proxy-server=... — use the launcher below, or the browser egresses directly. This plugin neither injects nor verifies it there, and never blocks the fetch over it.',
   proxyServerPlaceholder: 'http://127.0.0.1:7890',
@@ -178,6 +182,9 @@ export const zh: Record<PlaywrightCardLocaleKey, string> = {
   challengeWaitMs: 'Cloudflare 挑战等待上限（毫秒）',
   challengeWaitMsHint: '在同一标签页内有界等待 Cloudflare 验证自然通过（0–60000；0 = 关闭）。关闭时直接返回首次响应——旧版行为。',
   challengeWaitMsPlaceholder: '（默认：15000）',
+  fetchBudgetMs: '单次抓取预算（毫秒）',
+  fetchBudgetMsHint: '一次抓取的全部开销都要落在这个预算内：排队、打开浏览器/标签页、导航、配方的动作、挑战等待与正文读取（5000\u2013600000）。工具层自己的超时（fetchTimeoutMs，默认 30 秒）若不一起调大，仍会先掐断这次调用。',
+  fetchBudgetMsPlaceholder: '（默认：45000）',
   proxyServer: '出站代理',
   proxyServerHint: 'host:port 或 http(s)/socks4/socks5 地址，例如 http://127.0.0.1:7890；留空 = 直连。会注入本插件启动的每个浏览器（本地与 DSH 托管）。CDP 模式下插件不生效：代理是该被接管浏览器自身的启动期属性，必须用它启动时的 --proxy-server=... 指定（用下方启动器即可），否则流量直连——插件既不注入也不校验，也不会因此拒绝抓取。',
   proxyServerPlaceholder: 'http://127.0.0.1:7890',

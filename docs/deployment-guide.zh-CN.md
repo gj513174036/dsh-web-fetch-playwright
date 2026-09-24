@@ -285,6 +285,7 @@ dsh plugin --profile web remove dsh-web-fetch-playwright
 | `denoise`（启用降噪算法） | 勾选 | 抓完自动去掉导航/侧栏/页脚/广告再转 Markdown；不勾则返回原始 HTML |
 | `maxConcurrency`（最大并发抓取数） | 空 → local 4 / managed 50 / cdp 50 | 上限 200。local 的每个并发是一个**浏览器进程**；managed/cdp 的每个并发是一个**标签页** |
 | `challengeWaitMs`（Cloudflare 挑战等待上限） | 15000 | 0–60000；0 = 关闭（首响应即结果）。遇 Cloudflare 拦截时调大 |
+| `fetchBudgetMs`（单次抓取预算） | 45000 | 5000–600000。排队 + 开浏览器/标签页 + 导航 + 配方动作 + 挑战等待 + 读正文，全部要落在里面。慢 SPA、或要**留时间给人操作**时调大；工具层 `fetchTimeoutMs`（默认 30000）不一起调大仍会先掐断 |
 | `challengeRetries` | 1 | 0–3。等待窗口用完后同页重试次数 |
 | `proxyServer`（代理地址） | 空 | **代理开关**：`host:port`（按 http 处理）或 `http(s)/socks4/socks5://…`；空 = 直连 |
 | `proxyBypass`（代理绕过列表） | 空 | 逗号分隔；`127.0.0.1`/`localhost`/`::1` **始终**自动绕过 |
@@ -700,7 +701,7 @@ WantedBy=multi-user.target
 | 场景 | 建议 |
 |---|---|
 | 抓取并发上不去 | local 每个并发是一个浏览器进程，建议 4–8；managed/cdp 每个并发是标签页，可到 50 |
-| 频繁 `WEB_FETCH_TIMEOUT` | 单次抓取预算 45s、排队超时 20s；提高 `maxConcurrency` 或降低并发 |
+| 频繁 `WEB_FETCH_TIMEOUT` | 单次抓取预算 `fetchBudgetMs`（默认 45s）、排队超时 20s；提高 `maxConcurrency` 或降低并发；若日志显示工具层先超时，还要调大 preset 里的 `fetchTimeoutMs` |
 | Cloudflare 过不去 | 调大 `challengeWaitMs`（上限 60000）与 `challengeRetries`（上限 3）；用带登录态的 managed/cdp 用户目录通常更有效 |
 | 磁盘增长 | 抓包是主要来源：定期清理 `net-dumps/`；`maxBodyBytes` 调小或 `captureBodies` 关掉 |
 | 登录态失效 | managed：重建/清理 `userDataDir` 后重新登录；cdp：在浏览器那台机器重新登录 |
@@ -716,7 +717,7 @@ WantedBy=multi-user.target
 | `WEB_FETCH_PROXY` | 代理地址不可用/非法；或 local/managed 因代理启动失败 | 检查 `proxyServer` 写法与代理连通性；cdp 模式下该字段仅用于生成启动命令 |
 | `WEB_FETCH_CHALLENGE` | 站点持续返回 Cloudflare 挑战 | 调大 `challengeWaitMs`/`challengeRetries`；改用已有登录态的 profile |
 | `WEB_PROVIDER_ERROR` | 浏览器启动失败 / CDP 连不上 | local/managed：检查 `playwrightPath` 或装浏览器（§5）；cdp：确认遥控口开着且隧道/网络可达 |
-| `WEB_FETCH_TIMEOUT` | 单次 > 45s，或排队 > 20s | 提高 `maxConcurrency`；检查代理/目标站是否极慢 |
+| `WEB_FETCH_TIMEOUT` | 单次 > `fetchBudgetMs`（默认 45s），或排队 > 20s | 提高 `fetchBudgetMs`/`maxConcurrency`；检查代理/目标站是否极慢 |
 | `WEB_ABORTED` | 调用方取消 | 无需处置 |
 | `WEB_UNSUPPORTED_CONTENT_TYPE` | 返回的不是 HTML/文本/JSON/XML | 该 URL 不适合用本插件 |
 | `WEB_INVALID_URL` / `WEB_BLOCKED_URL` | URL 非法、超长、含内嵌凭据 | 修正 URL（凭据别放 URL 里） |

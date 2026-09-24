@@ -51,10 +51,31 @@ export const DEFAULT_MAX_CONCURRENCY_MANAGED = 50
 export const MAX_CONCURRENCY_CEILING = 200
 
 /**
+ * Default per-fetch budget (ms). Everything a fetch does — queueing, opening
+ * the browser or the tab, navigation, the target's actions, a challenge wait
+ * and the content read — has to fit inside it.
+ *
+ * 45s is sized for a page that renders on its own. Raise it when a recipe has
+ * to outlast a slow single-page app (a `waitFor time` chain is bounded by this
+ * budget, not by the 10s per-step ceiling), or when a human is expected to
+ * drive the tab while the fetch is recording. The tool layer's own timeout
+ * (`fetchTimeoutMs`, 30s by default) still cuts the call first unless that is
+ * raised too.
+ */
+export const DEFAULT_FETCH_BUDGET_MS = 45_000
+
+/** Floor the schema accepts for `fetchBudgetMs` (below this, no page can settle). */
+export const MIN_FETCH_BUDGET_MS = 5_000
+
+/** Ceiling the schema accepts for `fetchBudgetMs` (10 minutes). */
+export const MAX_FETCH_BUDGET_MS = 600_000
+
+/**
  * Default bounded wait (ms) for a Cloudflare challenge to clear naturally —
  * the user's real browser passes the verification on its own while the fetch
- * holds the same page and context. Sized to fit the 45s per-fetch deadline
- * with the settle/decode tail (and one retry) still inside it.
+ * holds the same page and context. Sized to fit the default per-fetch budget
+ * ({@link DEFAULT_FETCH_BUDGET_MS}) with the settle/decode tail (and one
+ * retry) still inside it.
  */
 export const DEFAULT_CHALLENGE_WAIT_MS = 15_000
 
@@ -152,6 +173,12 @@ export interface Config {
    * that names its file.
    */
   targetsFile?: string
+  /**
+   * Per-fetch budget (ms): queueing, opening the browser or tab, navigation,
+   * the target's actions, the challenge wait and the content read all have to
+   * fit inside it. Schema default: {@link DEFAULT_FETCH_BUDGET_MS}.
+   */
+  fetchBudgetMs?: number
   /**
    * Bounded wait (ms) for a Cloudflare challenge to clear naturally inside
    * the same page/context. `0` (or any config leaving this at 0) restores the
@@ -260,6 +287,10 @@ export const Config: z<Config> = z.object({
   // Optional on purpose: the effective default depends on `backend`, which a
   // static schema default cannot express.
   maxConcurrency: z.number().step(1).min(1).max(MAX_CONCURRENCY_CEILING),
+  // The whole-fetch budget. Explicit so a slow SPA — or a recipe whose wait
+  // chain is meant to outlast one — can be given more room than the default;
+  // the tool layer's own timeout is a separate, higher-level limit.
+  fetchBudgetMs: z.number().step(1_000).min(MIN_FETCH_BUDGET_MS).max(MAX_FETCH_BUDGET_MS).default(DEFAULT_FETCH_BUDGET_MS),
   // The bounded natural-wait knobs; 0 disables the whole challenge path.
   challengeWaitMs: z.number().step(100).min(0).max(MAX_CHALLENGE_WAIT_MS).default(DEFAULT_CHALLENGE_WAIT_MS),
   challengeRetries: z.number().step(1).min(0).max(MAX_CHALLENGE_RETRIES).default(DEFAULT_CHALLENGE_RETRIES),
@@ -345,6 +376,20 @@ export function effectiveMaxConcurrency(config: Pick<Config, 'backend' | 'maxCon
 export function effectiveChallengeWaitMs(config: Pick<Config, 'challengeWaitMs'>): number {
   if (typeof config.challengeWaitMs === 'number') return config.challengeWaitMs
   return DEFAULT_CHALLENGE_WAIT_MS
+}
+
+/**
+ * The per-fetch budget a fetch actually runs with: an explicit setting wins,
+ * else the schema default. Values out of range are clamped rather than
+ * rejected here, because the resolved section is not re-validated per fetch.
+ *
+ * @param config - the resolved settings section (or any partial of it).
+ * @returns the whole-fetch budget in milliseconds.
+ */
+export function effectiveFetchBudgetMs(config: Pick<Config, 'fetchBudgetMs'>): number {
+  const value = config.fetchBudgetMs
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return DEFAULT_FETCH_BUDGET_MS
+  return Math.min(Math.max(value, MIN_FETCH_BUDGET_MS), MAX_FETCH_BUDGET_MS)
 }
 
 /**

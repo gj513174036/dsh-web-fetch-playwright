@@ -47,6 +47,11 @@ export interface PlaywrightSettings {
    */
   challengeWaitMs?: number
   /**
+   * Per-fetch budget (ms): everything one fetch does — including a `waitFor`
+   * chain — has to fit inside it (5000–600000).
+   */
+  fetchBudgetMs?: number
+  /**
    * Outbound proxy for the browser this plugin launches: `host:port` or an
    * `http(s)/socks4/socks5` URL. Blank = direct connection. In CDP mode it
    * does not apply to the fetch (that browser is started elsewhere) — it
@@ -109,6 +114,8 @@ export interface PlaywrightCardState extends CardShell {
   maxConcurrency: CardFieldState
   /** Challenge wait input (draft decimal integer of milliseconds). */
   challengeWaitMs: CardFieldState
+  /** Per-fetch budget (ms) as the card holds it (5000–600000). */
+  fetchBudgetMs: CardFieldState
   /** Proxy server input (host:port or scheme URL). */
   proxyServer: CardFieldState
   /** Proxy bypass-list input (comma-separated hosts). */
@@ -170,6 +177,7 @@ export class PlaywrightCardController {
         textField('targetsFile'),
         numberField('maxConcurrency', 1, 200),
         numberField('challengeWaitMs', 0, 60_000),
+        numberField('fetchBudgetMs', 5_000, 600_000),
         textField('proxyServer'),
         textField('proxyBypass'),
         textField('proxyUsername'),
@@ -200,6 +208,7 @@ export class PlaywrightCardController {
       targetsFile: this.form.field('targetsFile'),
       maxConcurrency: this.form.field('maxConcurrency'),
       challengeWaitMs: this.form.field('challengeWaitMs'),
+      fetchBudgetMs: this.form.field('fetchBudgetMs'),
       proxyServer: this.form.field('proxyServer'),
       proxyBypass: this.form.field('proxyBypass'),
       proxyUsername: this.form.field('proxyUsername'),

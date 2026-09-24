@@ -276,6 +276,7 @@ describe('PlaywrightFetchProvider integration', () => {
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     }))
     const result = await provider.fetch({ url: baseUrl })
     expect(result.statusCode).toBe(200)
@@ -305,6 +306,7 @@ describe('PlaywrightFetchProvider integration', () => {
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     }))
     const result = await provider.fetch({ url: baseUrl })
     expect(result.body.kind).toBe('html')
@@ -328,6 +330,7 @@ describe('PlaywrightFetchProvider integration', () => {
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     }))
     // Port 1 on loopback: connection refused by the OS, no browser page loads.
     const error = await provider.fetch({ url: 'http://127.0.0.1:1/' })
@@ -397,6 +400,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     }))
     const result = await provider.fetch({ url: baseUrl })
     expect(result.statusCode).toBe(200)
@@ -423,6 +427,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     }))
     const results = await Promise.allSettled(Array.from({ length: 12 }, (_, i) =>
       provider.fetch({ url: `${baseUrl}?tab=${String(i)}` })))
@@ -450,6 +455,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     }))
     const first = await provider.fetch({ url: `${baseUrl}cookie` })
     const second = await provider.fetch({ url: `${baseUrl}cookie` })
@@ -479,6 +485,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       targetsFile: '',
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     }))
     await provider.fetch({ url: `${baseUrl}cookie` }) // sets a cookie — then dies with its context
     const second = await provider.fetch({ url: `${baseUrl}cookie` })
@@ -507,6 +514,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       targetsFile: '',
       challengeWaitMs: 12_000,
       challengeRetries: 1,
+      fetchBudgetMs: 45_000,
     }))
     const first = await provider.fetch({ url: `${baseUrl}guarded/article` })
     const firstText = first.body.kind === 'text' ? first.body.content : ''
@@ -539,6 +547,7 @@ describe('PlaywrightFetchProvider CDP integration', () => {
       targetsFile: '',
       challengeWaitMs: 12_000,
       challengeRetries: 1,
+      fetchBudgetMs: 45_000,
     }))
     const first = await provider.fetch({ url: `${baseUrl}guarded/article` })
     expect(first.statusCode).toBe(200)
@@ -569,6 +578,7 @@ describe('PlaywrightFetchProvider challenge A/B (simulated Cloudflare edge)', ()
       observe: false,
       targetsFile: '',
       maxConcurrency: 4,
+      fetchBudgetMs: 45_000,
       ...over,
     })
   }
@@ -707,6 +717,7 @@ describe('PlaywrightFetchProvider response condition (real browser, real XHR)', 
       maxConcurrency: 4,
       challengeWaitMs: 0,
       challengeRetries: 0,
+      fetchBudgetMs: 45_000,
     })
   }
 

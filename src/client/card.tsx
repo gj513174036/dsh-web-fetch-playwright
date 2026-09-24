@@ -314,6 +314,19 @@ export function PlaywrightCard(props: PlaywrightCardProps) {
         onEdit={(text) => { props.edit('challengeWaitMs', text) }}
         onReset={() => { props.resetField('challengeWaitMs') }}
       />
+      <ValueField
+        id="plugin-config-playwright-fetch-budget"
+        label={t('fetchBudgetMs')}
+        hint={t('fetchBudgetMsHint')}
+        placeholder={t('fetchBudgetMsPlaceholder')}
+        overriddenLabel={t('overridden')}
+        resetLabel={t('reset')}
+        invalidLabel={t('invalidText')}
+        disabled={disabled}
+        {...state.fetchBudgetMs}
+        onEdit={(text) => { props.edit('fetchBudgetMs', text) }}
+        onReset={() => { props.resetField('fetchBudgetMs') }}
+      />
       <CheckboxField
         id="plugin-config-playwright-record-network"
         label={t('recordNetwork')}

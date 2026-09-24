@@ -339,7 +339,7 @@ autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>
 | `recordNetwork` | 只在需要排查/挖接口时开 | 产物含明文凭据 |
 | `targetsFile` | 指向仓库里那份配方 | 生产配方应该被评审、被 diff |
 
-**并发与预算**：一次抓取 45s 上限；超出的请求短暂排队，20s 内等不到空位会以 `WEB_FETCH_TIMEOUT` 尽快失败并提示调大并发，而不是一直挂起。动作只是让**单次**抓取更久，不改变并发与重试语义。
+**并发与预算**：一次抓取默认 45s 上限（`fetchBudgetMs` 可调，5000–600000）；超出的请求短暂排队，20s 内等不到空位会以 `WEB_FETCH_TIMEOUT` 尽快失败并提示调大并发，而不是一直挂起。动作只是让**单次**抓取更久，不改变并发与重试语义。
 
 容器里怎么让浏览器跑起来（含无 root 时只下载浏览器、`/dev/shm`、持久卷、`local` vs `cdp` 的选择）见 [`deployment-guide.zh-CN.md` §5](./deployment-guide.zh-CN.md)。
 
@@ -351,7 +351,7 @@ autossh -M 0 -N -R 9222:127.0.0.1:9222 <user@server>
 
 想复现旧行为（把中间页当正文）就设 `challengeWaitMs: 0`；想在本地看前后对比：`node scripts/challenge-demo.mjs`（本地模拟），`node scripts/challenge-online.mjs <url>`（真实站点）。
 
-**安全边界（刻意为之）**：不点击 Turnstile、不解验证码、不注入 token、不伪装指纹/UA、不做代理轮换以绕过挑战、不导出 cookie。等待永远受 `challengeWaitMs` 与 45s 预算双重约束。
+**安全边界（刻意为之）**：不点击 Turnstile、不解验证码、不注入 token、不伪装指纹/UA、不做代理轮换以绕过挑战、不导出 cookie。等待永远受 `challengeWaitMs` 与单次抓取预算（`fetchBudgetMs`）双重约束。
 
 > 注意区分：**Cloudflare 挑战**（有专门的中间页与 `cf-mitigated` 头）与**站点的前置 WAF**（如 NMPA 的 412 + 清空文档）不是一回事。后者如果浏览器自己能过，配方第一条 `waitFor`（例如 `使用提示`）就是等它过去；过不去就只能在浏览器 profile 已经过关的环境里跑（场景 E）。
 

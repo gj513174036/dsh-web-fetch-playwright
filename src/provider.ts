@@ -75,7 +75,7 @@ import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebFetchProvider, WebFetchRequest, WebFetchResult } from '@deepseek-ai/dsh-web'
 import { CHALLENGE_DOM_PROBE, CHALLENGE_FINISH_RESERVE_MS, CHALLENGE_POLL_INTERVAL_MS, classifyChallengeHtml, classifyChallengeResponse, isChallengeCompatibleResponse } from './challenge.ts'
 import type { ChallengeVerdict } from './challenge.ts'
-import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, captureOptionsFor, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveHeadless, effectiveMaxConcurrency, managedLaunchFor, managedLaunchKey, normalizeCdpEndpoint, proxyOptionFor, redactProxyServer } from './config.ts'
+import { DEFAULT_MAX_CONCURRENCY_CDP, DEFAULT_MAX_CONCURRENCY_LOCAL, DEFAULT_MAX_CONCURRENCY_MANAGED, captureOptionsFor, effectiveChallengeRetries, effectiveChallengeWaitMs, effectiveContextMode, effectiveFetchBudgetMs, effectiveHeadless, effectiveMaxConcurrency, managedLaunchFor, managedLaunchKey, normalizeCdpEndpoint, proxyOptionFor, redactProxyServer } from './config.ts'
 import type { ManagedLaunch, ProxySettings, ResolvedConfig } from './config.ts'
 import { NetworkRecorder, nextCaptureSessionId as recorderSessionId } from './recorder.ts'
 import { BrowserPool } from './browser-pool.ts'
@@ -254,9 +254,6 @@ function boundPipelineInput(html: string): { input: string; cut: boolean } {
  * retry or raise `maxConcurrency` instead of hanging until an abort.
  */
 const QUEUE_TIMEOUT_MS = 20_000
-
-/** Default per-fetch budget (ms), inside the tool layer's 60s. */
-const DEFAULT_TIMEOUT_MS = 45_000
 
 /** Best-effort post-DOM settle wait (ms) so SPA content can finish rendering. */
 const SETTLE_MS = 5_000
@@ -680,7 +677,7 @@ export class PlaywrightFetchProvider implements WebFetchProvider {
     if (signal?.aborted) throw new WebError('web fetch aborted', 'WEB_ABORTED')
     const config = this.configSource()
     const url = validateFetchUrl(request.url)
-    const deadline = new Deadline(signal, DEFAULT_TIMEOUT_MS)
+    const deadline = new Deadline(signal, effectiveFetchBudgetMs(config))
 
     let session: BrowserSession | undefined
     let acquired = false
