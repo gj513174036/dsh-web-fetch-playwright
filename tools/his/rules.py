@@ -29,7 +29,7 @@ import re
 import sys
 from typing import Any
 
-RULE_VERSION = "3"
+RULE_VERSION = "4"
 
 #: 结果里的方向标记与噪声。**裸 +/- 不算方向**：那会把 "-1.5" 的符号和 "3.5-9.5" 的连字符误当异常标记，
 #: 所以"清理数值"和"读方向"用两套模式。
@@ -183,6 +183,12 @@ def verdict_of(item: dict[str, Any], item_extra: dict[str, Any] | None = None) -
         "refKind": kind,
     }
 
+    # 0a) 处方/医嘱：它是"开过什么药"，不是化验值，永远不进异常清单
+    if str(item.get("orderType") or "").strip() or item.get("frequency") or item.get("itemKind"):
+        verdict.update(verdict="recorded", severity="info", ruleId="prescription",
+                       why=f"处方/医嘱：{result_text or ''}".strip("："))
+        return verdict
+
     # 0) 体检小结里的疾病/建议条目：没有数值，只有分级
     if item.get("level") is not None or (item.get("disease") and result_text in (None, "")):
         level = str(item.get("level") or "").strip()
@@ -239,6 +245,14 @@ def verdict_of(item: dict[str, Any], item_extra: dict[str, Any] | None = None) -
             verdict.update(verdict="low", severity="abnormal", ruleId="ref-range", why=f"{value} < 下限 {low}")
         else:
             verdict.update(verdict="normal", severity="info", ruleId="ref-range", why=f"{value} 落在 [{low}, {high}] 内")
+        return verdict
+
+    # 3.5) 结果本身是定性阴性（如 "阴性(-)"）→ 正常。有定性参考区间的情形留给下面的
+    #      qualitative 分支（它的 why 会带上参考，信息更多）。
+    if (value is None and kind != "qualitative" and result_text is not None
+            and _QUALITATIVE_NEGATIVE.search(str(result_text))):
+        verdict.update(verdict="negative", severity="info", ruleId="qualitative-result",
+                       why=f"定性结果 {str(result_text).strip()!r} 本身为阴性")
         return verdict
 
     # 4) 只有 haveCrisis 线索：降级为"请人看一眼"

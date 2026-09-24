@@ -1,7 +1,9 @@
 {
   "_comment": "端点表：把'哪些路径、什么参数'从代码里抽出来。这是**占位示例**（路径是编的），真实系统的那份请放在仓库之外或 gitignore 目录里，用 --endpoints 指过去。params 是位置参数名，按顺序传给接口。",
   "roster":          { "path": "/api/example/roster",        "params": ["doctorName", "startDate", "endDate", "pageNum", "pageSize"] },
+  "identity":        { "path": "/api/example/identity",      "params": ["name", "pageNum", "pageSize"] },
   "clinicRecords":   { "path": "/api/example/visits",        "params": ["userId", "pageNum", "pageSize"] },
+  "visitDetail":     { "path": "/api/example/visit/{id}",    "params": ["id", "registerId"] },
   "reports":         { "path": "/api/example/reports",       "params": ["userId", "itemType", "pageNum", "pageSize"],
                        "itemTypes": { "lab": "LAB", "exam": "EXAM" } },
   "reportDetail":    { "path": "/api/example/report/{id}",   "params": ["id"] },
@@ -10,5 +12,15 @@
   "crisis":          { "path": "/api/example/crisis",        "params": ["medicalNo", "pageNum", "pageSize"] },
   "itemHistory":     { "path": "/api/example/item-history",  "params": ["itemName", "userId"] },
   "personByName":    { "path": "/api/example/person",        "params": ["name", "telephone"] },
-  "personSearch":    { "path": "/api/example/person-search", "params": ["nameOrPhone", "pageNum", "pageSize"] }
+  "personSearch":    { "path": "/api/example/person-search", "params": ["nameOrPhone", "pageNum", "pageSize"] },
+  "dictionaries":    { "path": "/api/example/dictionaries",  "params": ["dictionaryTypeCode"],
+                       "codes": {
+                         "usage": "MD_ITEM_USAGE",
+                         "doseUnit": "MD_ITEM_DOSE_UNIT",
+                         "orderType": "HMS_TANANT_OPERATION_ITEM_TYPE",
+                         "executeStatus": "HIS_DOCTOR_WORK_BENCH_REPORT_EXECUTE_TYPE",
+                         "medicalType": "HMS_MEDICAL_TYPE",
+                         "medicalGroup": "HMS_MEDICAL_GROUP",
+                         "sex": "HMS_COMM_SEX"
+                       } }
 }

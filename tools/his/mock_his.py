@@ -88,8 +88,9 @@ CHECKUP_SUMMARY = {
     "suggests": [{"disease": "建议低嘌呤饮食", "crisisLevel": "0", "crisisLevelName": ""}],
 }
 CRISIS_ROWS = [{"id": "cri-1", "medicalNo": MED_A, "userId": HMS_A, "crisisLevel": "3",
-                "crisisLevelName": "危急", "signType": "血钾", "signMsg": "7.10 mmol/L",
-                "signStatusName": "未处理"}]
+                "crisisName": "血钾危急值", "crisisType": "1", "itemName": "血钾",
+                "result": "7.10", "medicalValue": "7.10 mmol/L", "handleStatus": "未处理",
+                "checkDate": "2026-06-01 08:30:00"}]
 TREND = {
     "血脂四项": [
         {"itemCode": "CHO", "itemName": "总胆固醇", "result": "9.80", "referenceRange": "3.50-9.50",
@@ -97,6 +98,35 @@ TREND = {
         {"itemCode": "CHO", "itemName": "总胆固醇", "result": "5.10", "referenceRange": "3.50-9.50",
          "isYang": "0", "tipsContent": "", "checkTime": "2026-03-01 09:00:00"},
     ]
+}
+VISIT_DETAIL = {
+    "id": "visit-a1", "registerId": "reg-a", "userId": HIS_A, "name": "测试甲",
+    "diagnosisList": [{"diagnosisName": "高尿酸血症", "diagnosisCode": "E79.0", "diagnosisType": "1"}],
+    "itemList": [
+        {"itemCode": "XY001", "name": "非布司他片", "medicineName": "非布司他片",
+         "specifications": "40mg*16T", "usage": "01", "dosage": "40", "adultDose": "40",
+         "adultUnit": "24", "executeFrequencyName": "qd", "count": 1, "totalCount": 7,
+         "dayCount": 7, "itemType": "2", "executeStatus": "DONE", "totalPrice": "38.50",
+         "changeTime": "2026-09-24 09:20:00"},
+        {"itemCode": "JY001", "name": "血脂四项", "itemType": "5",
+         "executeFrequencyName": "", "executeStatus": "TO_EXECUTE", "totalPrice": "60.00"},
+    ],
+}
+IDENTITY_ROWS = [
+    {"id": HIS_A, "hmsArchivesUserId": HMS_A, "name": "测试甲", "telephone": "13800000001",
+     "identityCard": "440000199001010000", "gender": "1", "age": 41},
+    {"id": "his-a-9998", "hmsArchivesUserId": "hms-a-9998", "name": "测试甲",
+     "telephone": "13900000009", "identityCard": "440000199001010009", "gender": "2", "age": 41},
+]
+DICT_ENTRIES = {
+    "MD_ITEM_USAGE": [{"itemValue": "01", "name": "口服"}, {"itemValue": "02", "name": "外用"}],
+    "MD_ITEM_DOSE_UNIT": [{"itemValue": "24", "name": "mg"}, {"itemValue": "01", "name": "小包"}],
+    "HMS_TANANT_OPERATION_ITEM_TYPE": [{"itemValue": "1", "name": "中药"}, {"itemValue": "2", "name": "西药"}],
+    "HIS_DOCTOR_WORK_BENCH_REPORT_EXECUTE_TYPE": [{"itemValue": "DONE", "name": "已执行"},
+                                                  {"itemValue": "TO_EXECUTE", "name": "待执行"}],
+    "HMS_MEDICAL_TYPE": [{"itemValue": "1", "name": "福利体检"}],
+    "HMS_MEDICAL_GROUP": [{"itemValue": "1", "name": "单位体检"}],
+    "HMS_COMM_SEX": [{"itemValue": "M", "name": "男"}, {"itemValue": "F", "name": "女"}],
 }
 ARCHIVE_PERSON = {"id": HMS_A, "name": "测试甲", "gender": "1", "age": 41, "telephone": "13800000001",
                   "identityCard": "440000199001010000", "bmi": "24.1", "bloodType": "A"}
@@ -138,6 +168,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/example/roster":
             rows = [] if one("doctorName") == "NOBODY" else [ROSTER_A, ROSTER_B]
             self._send(_ok(_paged(rows)))
+        elif path == "/api/example/identity":
+            self._send(_ok(_paged([r for r in IDENTITY_ROWS if r["name"] == one("name")])))
+        elif path == "/api/example/dictionaries":
+            wanted = [c for c in one("dictionaryTypeCode").split(",") if c]
+            self._send(_ok({c: DICT_ENTRIES.get(c, []) for c in wanted}))
+        elif re.match(r"^/api/example/visit/[^/]+$", path):
+            self._send(_ok(VISIT_DETAIL))
         elif path == "/api/example/visits":
             user = one("userId")
             rows = []

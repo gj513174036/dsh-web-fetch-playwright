@@ -29,8 +29,9 @@ python3 tools/his/collect.py --mode daily \
 # 3) 判定
 python3 tools/his/rules.py --facts /opt/his/out/facts-2026-09-24.jsonl --out /opt/his/out --tag 2026-09-24
 
-# 按姓名进（姓名+手机号 → 档案 id → 体检侧记录）
-python3 tools/his/collect.py --mode person --name "张三" --telephone "13800000000" ...
+# 按人拉全量：姓名+手机号 → 就诊病历 + 处方医嘱 + 检验 + 检查 + 体检 + 危急值
+python3 tools/his/collect.py --mode person --name "张三" --telephone "13800000000" \
+    --with-trends ...
 ```
 
 退出码：`0` 正常；`1` 有接口失败（默认不中止，逐条记在 `errors` 里）；`2` 配置错；
@@ -71,13 +72,25 @@ python3 tools/his/collect.py --mode person --name "张三" --telephone "13800000
 每条输出都带 `ruleId` / `ruleVersion` / `why` / `sourceEndpoint` / `sourceId` / `checkTime`，
 所以任何时候都能回答"凭什么把这一项标成异常"。
 
-### 从真机上换来的三条字段语义（很反直觉，别照直觉写）
+### 身份定位（`--mode person` 的第一步）
+
+`identity` 接口按姓名查，一行同时给出**两套 id**（HIS 侧与档案侧），所以一次调用就能把
+"病例/检验/检查"和"体检/档案"两条线都接上。但：
+
+* **它的 `telephone` 过滤参数被服务端忽略**（实测给不给都返回同名全部行）→ 精确匹配必须在**客户端**做；
+* 匹配不唯一时脚本**直接失败**（退出码 1，提示"身份定位不唯一"），而不是随便挑一个 ——
+  同名患者是常态，挑错人等于把别人的病历写进你的库。
+
+### 从真机上换来的字段语义（很反直觉，别照直觉写）
 
 1. **`haveCrisis` 不是危急值标志**：实测 1664 个检验明细里 1609 个是 `"1"`。真正的危急值在
    独立模块（`crisis` 端点）。把它当异常会一次刷出上千条假危急值。
 2. **`abnormalTips` 的 `M`/`N` 是正常**：实测分布 `M`×1096、空×324、`H`×77、`L`×37、`N`×37、`P`×17。
    "非空即异常"会把 1096 条正常项判成异常。
 3. **参考区间常常是分段的**，且方向写在 `resultRemark`（`↑`/`↓`）里，不是写在结果字符串里。
+4. **剂量单位与包装单位是两个字段**：单次量用 `adultUnit`（如 `24`=mg），总量用 `unit`（如 `20`=片）。
+   混用会写出"共 7mg"这种看着对、其实是 7 片数的用量 —— 处方串里最容易犯的错。
+5. **定性结果自身就是结论**：`阴性(-)` 这类没有参考区间时也应当判为正常，否则会掉进"判不了"里刷噪声。
 
 ## 3.5 字典与主数据：哪些码要翻译、项目名称从哪来
 
@@ -108,6 +121,10 @@ python3 tools/his/collect.py --mode person --name "张三" --telephone "13800000
 | `evaluated-<日期>.jsonl` | 每一条明细 + 判定（全量） |
 | `abnormal-<日期>.jsonl` | 只含 `severity ∈ {crisis, abnormal, review}` |
 
+事实的 `kind`：`visit`（就诊）· `prescription`（处方/医嘱，含药品名·规格·用量·频次·天数）·
+`lab`（检验明细）· `exam`（检查结论）· `checkup`（体检结论）· `crisis`（危急值）· `trend`（单项历史）。
+处方与体检结论在判定里都是 `recorded`（已记录），**不会进异常清单**。
+
 目录 `0700`、文件 `0600`：里面是**明文 Cookie 与患者数据**。
 
 **续跑**靠 `facts` 里已有的 `(日期, 患者, 类别, 来源 id)` 键；拉不到的接口**不落事实**，
@@ -129,8 +146,9 @@ python3 tools/his/mock_his.py --port 8099                        # 手工起假�
 ```
 
 覆盖：参考区间（区间 / 单边 / 定性 / 分段 / 反序）、判定优先级（危急值 > 标志 > 区间 > 判不了）、
-`M/N` 正常码、`haveCrisis` 降级、体检结论分级，以及端到端（起 mock → 采集 → 判定 → 断言五类判定
-各就各位）、`--via-curl` 传输、续跑不重复、缺 Cookie 必须失败、名单 0 条必须退出码 3。
+`M/N` 正常码、`haveCrisis` 降级、体检结论分级、处方归 `recorded`，以及端到端（起 mock → 采集 → 判定）、
+`--mode person` 全量（两套 id / 处方 / 码值翻成人话 / 同名拒绝）、`--via-curl` 传输、续跑不重复、
+缺 Cookie 必须失败、名单 0 条必须退出码 3。
 
 ## 7. 已知限制
 

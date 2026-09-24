@@ -89,6 +89,9 @@ class VerdictPriorityTest(unittest.TestCase):
 
     def test_checkup_conclusion_levels(self) -> None:
         # 体检结论列的是既往诊断，每条都带严重度分级：整体算异常会刷出数百条噪声
+        prescription = rules.verdict_of({"itemName": "非布司他片", "orderType": "西药",
+                                         "frequency": "qd", "result": "单次 40mg，频次 qd，共 7mg，7 天，口服"})
+        self.assertEqual((prescription["verdict"], prescription["ruleId"]), ("recorded", "prescription"))
         graded = rules.verdict_of({"itemName": "高尿酸血症", "disease": "高尿酸血症", "level": "2", "flagText": "中度"})
         self.assertEqual((graded["verdict"], graded["ruleId"]), ("recorded", "diagnosis"))
         crisisish = rules.verdict_of({"itemName": "低血糖", "disease": "低血糖", "level": "5", "flagText": "危急"})
@@ -191,6 +194,7 @@ class PipelineEndToEndTest(unittest.TestCase):
 
         crisis = by_item[("血钾", "M0000001")]
         self.assertEqual((crisis["verdict"], crisis["ruleId"]), ("crisis", "crisis"))   # 危急值模块那一路
+        self.assertEqual(crisis["result"], "7.10")                                       # 字段映射对了才有值
         flagged = by_item[("甘油三酯", "rep-lab-1")]
         self.assertEqual((flagged["verdict"], flagged["ruleId"]), ("high", "report-flag"))
         ranged = by_item[("总胆固醇", "rep-lab-1")]
@@ -261,7 +265,7 @@ class PipelineEndToEndTest(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertIn("名单为 0", result.stderr)
 
-    def test_person_mode_resolves_name_to_id_then_checkups(self) -> None:
+    def test_person_mode_pulls_visits_prescriptions_and_checkups(self) -> None:
         outdir = os.path.join(self.tmp.name, "out-person")
         result = subprocess.run(
             [sys.executable, os.path.join(TOOLS, "collect.py"), "--mode", "person",
@@ -271,10 +275,37 @@ class PipelineEndToEndTest(unittest.TestCase):
             capture_output=True, text=True, timeout=120,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        tag = __import__("datetime").date.today().isoformat()
         facts = [json.loads(line) for line in
-                 open(os.path.join(outdir, f"facts-{__import__('datetime').date.today().isoformat()}.jsonl"), encoding="utf-8")]
-        self.assertTrue(any(fact["kind"] == "checkup" for fact in facts))
-        self.assertEqual(facts[0]["patient"]["hmsUserId"], mock_his.HMS_A)
+                 open(os.path.join(outdir, f"facts-{tag}.jsonl"), encoding="utf-8")]
+        kinds = {fact["kind"] for fact in facts}
+        self.assertLessEqual({"visit", "prescription", "lab", "exam", "checkup", "crisis"}, kinds)
+        patient = facts[0]["patient"]
+        # 姓名(+电话) → 两套 id：identity 端点一行同时给出
+        self.assertEqual((patient["hisUserId"], patient["hmsUserId"]), (mock_his.HIS_A, mock_his.HMS_A))
+        prescription = next(fact for fact in facts if fact["kind"] == "prescription")
+        drugs = {item["itemName"]: item for item in prescription["items"]}
+        self.assertIn("非布司他片", drugs)
+        # 码值翻成人话，而不是留在编码里
+        self.assertEqual(drugs["非布司他片"]["usage"], "口服")
+        self.assertEqual(drugs["非布司他片"]["unit"], "mg")
+        self.assertEqual(drugs["非布司他片"]["orderType"], "西药")
+        self.assertEqual(drugs["非布司他片"]["flagText"], "已执行")
+        self.assertIn("qd", drugs["非布司他片"]["result"])
+        self.assertEqual(prescription["source"]["endpoint"], "/api/example/visit/visit-a1")
+        # 同名的第二个人不会被混进来
+        self.assertTrue(all(fact["patient"]["hisUserId"] == mock_his.HIS_A for fact in facts))
+
+    def test_person_mode_refuses_ambiguous_identity(self) -> None:
+        outdir = self._fresh("out-ambiguous")
+        result = subprocess.run(
+            [sys.executable, os.path.join(TOOLS, "collect.py"), "--mode", "person",
+             "--session", self.session_path, "--out", outdir,
+             "--endpoints", os.path.join(TOOLS, "endpoints.example.json"), "--name", "测试甲"],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("身份定位不唯一", result.stderr)
 
 
 if __name__ == "__main__":

@@ -193,8 +193,9 @@ class Endpoints:
     """
 
     REQUIRED = (
-        "roster", "clinicRecords", "reports", "reportDetail", "checkups",
-        "checkupSummary", "crisis", "itemHistory", "personByName", "personSearch",
+        "roster", "identity", "clinicRecords", "visitDetail", "reports", "reportDetail",
+        "checkups", "checkupSummary", "crisis", "itemHistory", "personByName",
+        "personSearch", "dictionaries",
     )
 
     def __init__(self, doc: dict[str, Any]) -> None:
@@ -203,6 +204,7 @@ class Endpoints:
             raise CollectError(f"端点表缺少: {', '.join(missing)}")
         self.table = {key: doc[key] for key in self.REQUIRED}
         self.item_types = dict(self.table["reports"].get("itemTypes") or {"lab": "LAB", "exam": "EXAM"})
+        self.dict_codes = dict(self.table["dictionaries"].get("codes") or {})
 
     @classmethod
     def load(cls, path: str) -> "Endpoints":
@@ -220,6 +222,45 @@ class Endpoints:
             path = path.replace("{" + name + "}", str(value))
         params = {name: values[name] for name in spec.get("params", []) if name in values}
         return path, params
+
+
+class Dictionaries:
+    """码值 → 人话。
+
+    字典响应是**按字典码分组的对象**（``{data: {"<码>": [ {itemValue, name, code} ]}}``），
+    不是数组 —— 用列表去数会永远得到 0（这个坑踩过）。翻译失败时保留原码，
+    绝不让"翻不出来"变成"值丢了"。
+    """
+
+    def __init__(self, client: "Client", endpoints: Endpoints, enabled: bool = True) -> None:
+        self.maps: dict[str, dict[str, str]] = {}
+        codes = endpoints.dict_codes if enabled else {}
+        if not codes:
+            return
+        path, params = endpoints.render("dictionaries", dictionaryTypeCode=",".join(codes.values()))
+        doc = client.get_soft(path, **params)
+        data = data_of(doc)
+        if not isinstance(data, dict):
+            return
+        for role, code in codes.items():
+            table: dict[str, str] = {}
+            for entry in data.get(code) or []:
+                if not isinstance(entry, dict):
+                    continue
+                value = entry.get("itemValue")
+                name = entry.get("name")
+                if value is not None and name:
+                    table[str(value)] = str(name)
+            self.maps[role] = table
+
+    def label(self, role: str, value: Any) -> str:
+        """翻译一个码；翻不出就原样返回（便于事后发现缺了哪本字典）。"""
+        if value is None or str(value).strip() == "":
+            return ""
+        return self.maps.get(role, {}).get(str(value), str(value))
+
+    def loaded(self) -> dict[str, int]:
+        return {role: len(table) for role, table in self.maps.items()}
 
 
 def rows_of(doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -466,23 +507,82 @@ def diagnosis_items(summary: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def prescription_items(detail: dict[str, Any], dicts: "Dictionaries") -> list[dict[str, Any]]:
+    """病历详情的 ``itemList[]`` → 处方/医嘱事实行。
+
+    这里的字段本身就是人话（药品名、规格、单次量、频次、天数、总量），只有少数码值
+    （用法 ``usage``、单位 ``adultUnit``/``preparationUnit``、类别 ``itemType``、
+    执行状态 ``executeStatus``）需要字典翻译；翻不出来时保留原码。
+    """
+    data = data_of(detail) or {}
+    if not isinstance(data, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in data.get("itemList") or []:
+        if not isinstance(row, dict):
+            continue
+        dose_unit = dicts.label("doseUnit", row.get("adultUnit") or row.get("preparationUnit"))
+        pack_unit = dicts.label("doseUnit", row.get("unit"))
+        usage = dicts.label("usage", row.get("usage"))
+        order_type = dicts.label("orderType", row.get("itemType"))
+        frequency = row.get("executeFrequencyName") or row.get("executeFrequencyId") or ""
+        dosage = row.get("dosage") or row.get("adultDose") or row.get("dose")
+        day_count = row.get("dayCount") or row.get("treatmentCourseCount")
+        total = row.get("totalCount")
+        # 剂量单位与包装单位是两码事：单次量用 adultUnit(如 mg)，总量用 unit(如 片)。
+        # 混用会写出"共 7mg"这种看着对、其实错的用量（7 是片数）。
+        pieces = [part for part in (
+            f"单次 {dosage}{dose_unit}" if dosage else "",
+            f"频次 {frequency}" if frequency else "",
+            f"共 {total}{pack_unit}" if total else "",
+            f"{day_count} 天" if day_count else "",
+            usage,
+        ) if part]
+        is_medicine = str(row.get("itemType") or "") in ("1", "2", "3")
+        out.append(
+            {
+                "itemCode": row.get("itemCode"),
+                "itemName": row.get("name") or row.get("medicineName") or row.get("doctorServiceItemName"),
+                "result": "，".join(pieces) if is_medicine else "",   # 非药品是申请项目，没有用量
+                "unit": dose_unit,
+                "reference": row.get("specifications"),               # 规格
+                "flagText": dicts.label("executeStatus", row.get("executeStatus")),
+                "orderType": order_type,
+                "usage": usage,
+                "frequency": frequency,
+                "packUnit": pack_unit,
+                "price": row.get("totalPrice") or row.get("unitPrice"),
+                "checkTime": row.get("changeTime") or row.get("updTime"),
+                "itemKind": "medicine" if is_medicine else "service",
+            }
+        )
+    return out
+
+
 def crisis_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """危急值列表 → 事实行：每一行本身就是一条已被系统标为危机的明细。"""
+    """危急值事件列表 → 事实行。
+
+    注意字段名：``crisis_manager/crisis/list`` 的行有 100+ 字段（``crisisName`` / ``crisisType`` /
+    ``crisisLevel`` / ``itemName`` / ``result`` / ``medicalValue`` / ``handleStatus``…），
+    而 ``signType`` / ``signMsg`` / ``signStatusName`` 属于**另一个**接口（异常体征列表）——
+    用错了字段名，危急值行的项目名与结果都会是 null。
+    """
     out: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         out.append(
             {
-                "itemCode": row.get("signId") or row.get("itemCode"),
-                "itemName": row.get("signType") or row.get("itemName"),
-                "result": row.get("signMsg") or row.get("result"),
+                "itemCode": row.get("crisisType") or row.get("indexType") or row.get("id"),
+                "itemName": row.get("itemName") or row.get("crisisName"),
+                "result": row.get("result") or row.get("medicalValue"),
                 "unit": row.get("unit"),
                 "reference": row.get("reference"),
-                "flagText": row.get("signStatusName") or row.get("crisisLevelName"),
+                "flagText": row.get("handleStatus") or row.get("crisisLevel"),
                 "crisis": True,
-                "crisisValue": row.get("crisisLevelName") or row.get("crisisLevel"),
-                "checkTime": row.get("checkTime") or row.get("crtTime"),
+                "crisisValue": row.get("crisisLevel") or row.get("crisisLevelName"),
+                "checkTime": row.get("checkDate") or row.get("medicalDate"),
+                "disease": row.get("diagnosisName") or row.get("diagnose"),
             }
         )
     return out
@@ -625,39 +725,142 @@ def run_daily(client: Client, endpoints: Endpoints, sink: Sink, doctor: str, day
     return summary
 
 
-def run_person(client: Client, endpoints: Endpoints, sink: Sink, name: str, telephone: str, with_trends: bool) -> dict[str, Any]:
+def resolve_identity(client: Client, endpoints: Endpoints, name: str, telephone: str = "") -> dict[str, Any]:
+    """姓名（+电话）→ HIS 与档案两套 id。
+
+    走 ``identity`` 接口；它的 ``telephone`` 过滤参数**被服务端忽略**（实测），
+    所以精确匹配必须在客户端做 —— 同名患者是常态。
+    """
+    path, params = endpoints.render("identity", name=name, pageNum=1, pageSize=20)
+    rows = rows_of(client.get(path, **params))
+    if telephone:
+        rows = [row for row in rows if str(row.get("telephone") or "") == str(telephone)]
+    if len(rows) != 1:
+        raise CollectError(
+            f"身份定位不唯一：同名 {len(rows)} 条匹配（请带 --telephone 精确匹配，或核对号码）"
+        )
+    row = rows[0]
+    return {
+        "hisUserId": row.get("id"),
+        "hmsUserId": row.get("hmsArchivesUserId"),
+        "name": row.get("name"),
+        "telephone": row.get("telephone"),
+        "identityCard": row.get("identityCard"),
+        "sex": row.get("gender"),
+        "age": row.get("age"),
+    }
+
+
+def run_person(
+    client: Client,
+    endpoints: Endpoints,
+    sink: Sink,
+    name: str,
+    telephone: str,
+    with_trends: bool,
+    dicts: "Dictionaries",
+) -> dict[str, Any]:
+    """姓名 + 电话 → 这个人的全部记录（就诊 / 处方医嘱 / 检验 / 检查 / 体检 / 危急值）。"""
     date = dt.date.today().isoformat()
-    summary: dict[str, Any] = {"date": date, "person": name, "facts": 0, "candidates": []}
-    search_path, search_params = endpoints.render("personSearch", nameOrPhone=name, pageNum=1, pageSize=10)
-    doc = client.get(search_path, **search_params) if not telephone else {}
-    summary["candidates"] = [r.get("id") for r in rows_of(doc)] if doc else []
-    person = person_by_name(client, endpoints, name, telephone)
-    if not person:
-        raise CollectError(f"按姓名定位失败：{'同名多人，请带 --telephone' if summary['candidates'] else '没有匹配的档案'}")
-    hms_user_id = str(person.get("id"))
-    patient = {"hmsUserId": hms_user_id, "name": person.get("name"), "sex": person.get("gender"),
-               "age": person.get("age"), "telephone": person.get("telephone"), "identityCard": person.get("identityCard")}
-    for report in checkup_reports(client, endpoints, hms_user_id):
-        report_id = str(report.get("medicalDataId") or report.get("id"))
-        medical_no = report.get("medicalNo")
-        key = fact_key(date, patient, "checkup", report_id)
-        if key in sink.done:
-            continue
-        summary_path, summary_params = endpoints.render("checkupSummary", id=report_id)
-        summary_doc = client.get_soft(summary_path, **summary_params)
-        if not summary_doc:
-            continue
-        sink.fact(fact_row(day=date, patient=patient, kind="checkup", source_id=report_id,
-                           endpoint=summary_path,
-                           items=diagnosis_items(summary_doc), extra={"medicalNo": medical_no}))
-        summary["facts"] += 1
-        if medical_no:
-            crisis = crisis_list(client, endpoints, str(medical_no))
-            sink.fact(fact_row(day=date, patient=patient, kind="crisis", source_id=str(medical_no),
-                               endpoint=endpoints.table["crisis"]["path"], items=crisis_items(crisis)))
+    patient = resolve_identity(client, endpoints, name, telephone)
+    his_user_id = patient["hisUserId"]
+    hms_user_id = patient["hmsUserId"]
+    summary: dict[str, Any] = {
+        "date": date,
+        "person": name,
+        "hisUserId": his_user_id,
+        "hmsUserId": hms_user_id,
+        "visits": 0,
+        "prescriptions": 0,
+        "facts": 0,
+        "errors": [],
+        "dictionaries": dicts.loaded(),
+    }
+
+    # ② 就诊病历 + 医嘱/处方（病历详情里的 itemList）
+    seen_item_names: list[str] = []
+    for record in bridge_ids(client, endpoints, his_user_id):
+        visit_id = str(record.get("id"))
+        register_id = record.get("registerId")
+        key = fact_key(date, patient, "visit", visit_id)
+        if key not in sink.done:
+            sink.fact(fact_row(day=date, patient=patient, kind="visit", source_id=visit_id,
+                               endpoint=endpoints.table["clinicRecords"]["path"], items=[],
+                               extra={"diagnosisList": record.get("diagnosisList"),
+                                      "mainSuit": record.get("mainSuit"),
+                                      "recordsNo": record.get("recordsNo"),
+                                      "registerId": register_id}))
             summary["facts"] += 1
-    if with_trends:
-        for item_name in ("总胆固醇", "甘油三酯", "尿酸"):
+        summary["visits"] += 1
+        detail_path, detail_params = endpoints.render("visitDetail", id=visit_id, registerId=register_id)
+        detail = client.get_soft(detail_path, **detail_params)
+        if not detail:
+            continue
+        orders = prescription_items(detail, dicts)
+        key = fact_key(date, patient, "prescription", visit_id)
+        if key not in sink.done:
+            sink.fact(fact_row(day=date, patient=patient, kind="prescription", source_id=visit_id,
+                               endpoint=detail_path, items=orders,
+                               extra={"diagnosisList": (data_of(detail) or {}).get("diagnosisList")
+                                      if isinstance(data_of(detail), dict) else None}))
+            summary["facts"] += 1
+            summary["prescriptions"] += len(orders)
+        for order in orders:
+            item_name = order.get("itemName")
+            if item_name and item_name not in seen_item_names:
+                seen_item_names.append(item_name)
+
+    # ③④ 检验 / 检查报告 + 明细
+    for kind in ("lab", "exam"):
+        for report in his_reports(client, endpoints, his_user_id, kind):
+            report_id = str(report.get("id"))
+            key = fact_key(date, patient, kind, report_id)
+            if key in sink.done:
+                continue
+            detail_path, detail_params = endpoints.render("reportDetail", id=report_id)
+            detail = client.get_soft(detail_path, **detail_params)
+            if not detail:
+                continue
+            sink.raw(detail_path, detail_params, detail)
+            items = lab_items(detail) if kind == "lab" else []
+            extra = {"groupItemName": report.get("groupItemName")}
+            if kind == "exam":
+                extra.update(exam_conclusion(detail))
+            sink.fact(fact_row(day=date, patient=patient, kind=kind, source_id=report_id,
+                               endpoint=detail_path, items=items, extra=extra))
+            summary["facts"] += 1
+
+    # ⑤⑧ 体检 + 危急值（档案侧，用 hmsUserId）
+    if hms_user_id:
+        for report in checkup_reports(client, endpoints, hms_user_id):
+            report_id = str(report.get("medicalDataId") or report.get("id"))
+            medical_no = report.get("medicalNo")
+            key = fact_key(date, patient, "checkup", report_id)
+            if key not in sink.done:
+                summary_path, summary_params = endpoints.render("checkupSummary", id=report_id)
+                summary_doc = client.get_soft(summary_path, **summary_params)
+                if summary_doc:
+                    sink.raw(summary_path, summary_params, summary_doc)
+                    sink.fact(fact_row(day=date, patient=patient, kind="checkup", source_id=report_id,
+                                       endpoint=summary_path, items=diagnosis_items(summary_doc),
+                                       extra={"medicalNo": medical_no,
+                                              "medicalType": dicts.label("medicalType", report.get("medicalType")),
+                                              "medicalGroup": dicts.label("medicalGroup", report.get("medicalGroup"))}))
+                    summary["facts"] += 1
+            if medical_no:
+                key = fact_key(date, patient, "crisis", str(medical_no))
+                if key not in sink.done:
+                    crisis = crisis_list(client, endpoints, str(medical_no))
+                    sink.fact(fact_row(day=date, patient=patient, kind="crisis", source_id=str(medical_no),
+                                       endpoint=endpoints.table["crisis"]["path"], items=crisis_items(crisis)))
+                    summary["facts"] += 1
+
+    # ⑦ 单项历史（可选）
+    if with_trends and hms_user_id:
+        for item_name in seen_item_names[:8]:
+            key = fact_key(date, patient, "trend", item_name)
+            if key in sink.done:
+                continue
             trend_path, trend_params = endpoints.render("itemHistory", itemName=item_name, userId=hms_user_id)
             history = client.get_soft(trend_path, **trend_params)
             series = data_of(history)
@@ -666,14 +869,18 @@ def run_person(client: Client, endpoints: Endpoints, sink: Sink, name: str, tele
                 for group, points in series.items():
                     for point in points or []:
                         if isinstance(point, dict):
-                            items.append({"itemCode": point.get("itemCode"), "itemName": point.get("itemName") or group,
-                                          "result": point.get("result"), "reference": point.get("referenceRange"),
+                            items.append({"itemCode": point.get("itemCode"),
+                                          "itemName": point.get("itemName") or group,
+                                          "result": point.get("result"), "unit": None,
+                                          "reference": point.get("referenceRange"),
                                           "flagText": point.get("tipsContent"), "isYang": point.get("isYang"),
                                           "checkTime": point.get("checkTime")})
             if items:
                 sink.fact(fact_row(day=date, patient=patient, kind="trend", source_id=item_name,
-                                   endpoint=trend_path, items=items))
+                                   endpoint=trend_path, items=items, extra={"groupItemName": item_name}))
                 summary["facts"] += 1
+
+    summary["errors"] = list(client.errors)
     return summary
 
 
@@ -698,6 +905,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", help="mode=person：姓名")
     parser.add_argument("--telephone", default="", help="mode=person：手机号（消除同名歧义）")
     parser.add_argument("--with-trends", action="store_true", help="额外拉单项历史（异常值/趋势）")
+    parser.add_argument("--no-dictionaries", action="store_true",
+                        help="跳过字典翻译（默认会拉一次字典，把用法/单位/类别/状态翻成人话）")
     parser.add_argument("--trends-per-patient", type=int, default=8)
     return parser
 
@@ -726,7 +935,8 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.name:
                     print("[his] mode=person 需要 --name", file=sys.stderr)
                     return 2
-                summary = run_person(client, endpoints, sink, args.name, args.telephone, args.with_trends)
+                dicts = Dictionaries(client, endpoints, enabled=not args.no_dictionaries)
+                summary = run_person(client, endpoints, sink, args.name, args.telephone, args.with_trends, dicts)
         except CollectError as error:
             print(f"[his] 采集失败: {error}", file=sys.stderr)
             return 1
