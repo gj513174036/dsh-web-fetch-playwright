@@ -250,6 +250,40 @@ PYTHONPATH=tools/netdump python3 -m netdump build capture.har -o netdump-out
 > 所以登录要么靠 profile 里已有的登录态，要么把含密码的那份配方放在 **`.gitignore` 掉**的本地路径并把
 > `targetsFile` 指过去，配一个**专用只读账号**。
 
+#### 什么时候**必须**写配方，而不是"让它自己等"
+
+插件的默认等待是固定的，知道这几个数，你就能判断"这条 URL 到底要不要配方"：
+
+| 环节 | 默认行为 | 源码 |
+| --- | --- | --- |
+| 导航 | `goto(url, { waitUntil: 'domcontentloaded' })` | `src/provider.ts` |
+| 页面安顿 | `waitForLoadState('networkidle')`，**上限 5 秒** | `SETTLE_MS = 5_000` |
+| 之后 | 读正文 → **关掉这个标签页** | `BrowserPool.release()` → `page.close()` |
+| 单个等待步骤 | 上限 **10 秒**；预算不够就"当作这一步没发生" | `STEP_CEILING_MS = 10_000` |
+| 整次抓取 | **45 秒** | `DEFAULT_TIMEOUT_MS = 45_000` |
+
+`networkidle` 的判据只是"**500 毫秒内没有网络活动**"。**分波加载**的单页应用
+（先鉴权 → 再组织/菜单/字典 → **最后才请求业务数据**）会在两波之间的空隙里被判定为"页面安静了"，
+于是抓取在数据请求发出**之前**就收工。
+
+一次真实实测（同一个 SPA，两次抓取）：
+
+| | 不带配方 | 带一条 `waitFor time 8000` |
+| --- | --- | --- |
+| 抓取窗口 | 11.4 秒 | 15.7 秒 |
+| 框架类请求最后一条 | +9.8 秒 | +9.7 秒 |
+| **业务数据请求** | **没有发出**（窗口已关） | **+10.6 秒，抓到** ✅ |
+
+只差约 1 秒。所以判据很简单：**数据是异步出现（SPA、表单查询、点开才加载）就必须写 `waitFor`**；
+诊断特征同样明确——`netdump summary` 里全是鉴权/菜单/字典这类框架接口，**一条业务数据接口都没有**。
+
+写法上先用最笨的 `{ "kind": "time", "ms": 8000 }` 探路（≤10 秒上限），
+确认"多等就能出数据"之后，再换成确定性的 `text` 或 `response` 条件收紧：
+**`time` 是拐杖，`response`/`text` 才是成品。**
+
+> 顺带一个反直觉点：标签页在抓取结束时**一定会被关掉**（profile 模式下只留 context 与 cookie）。
+> 所以"抓完让它在旁边挂着、我手工点两下把数据点出来"行不通——**要点的动作必须写进配方**。
+
 ### 第 7–9 步：把抓包变成接口清单
 
 ```sh
@@ -299,29 +333,52 @@ os.chmod("/opt/his/session-headers.json", 0o600)
 print("kept:", sorted(hdrs))
 ```
 
-再**把参数改掉打一次**。两条路，优先用第一条（不需要服务器能连内网）：
+再**把参数改掉打一次**。最小验证是**四连测试**，按顺序做，每一步排除一种可能：
 
-1. **让插件去抓这个接口 URL**：`https://his.example.org/api/outpatient/registrations?date=今天`。
-   插件走的是那台已登录的浏览器，能到内网，看到的是真实结果。
-2. 在 DSH 主机上跑 httpx（仅当这台主机能连内网）：
+| # | 测试 | 它在回答什么 |
+| --- | --- | --- |
+| T1 | **原样重放**（原参数 + 原会话头） | 不通就别谈后面：凭证不全 / 出口 IP 被绑 / 会话已失效 |
+| T2 | 原参数 + **改一个业务参数**（如把日期改成昨天） | 通 → **不签名**，日常可以完全离线 ✅ |
+| T3 | 改业务参数 + **换一个新 `timestamp`**（接口带这个参数时） | 不通 → 参数与时间戳绑在一起，需要浏览器重放 |
+| T4 | 去掉 `Cookie`（只留自定义 token 头） | 定位"到底哪个凭证是必需的" |
+
+发这些请求有两条路，优先第一条：
+
+1. **让插件去抓这个接口 URL**：`https://his.example.org/api/outpatient/registrations?date=昨天`。
+   插件走那台已登录的浏览器，一定能到内网。
+2. **任何能到内网的主机 + 代理**：内网若有 SOCKS5/HTTP 代理，离线脚本可以走它
+   （`httpx[socks]`，或先用 `curl --socks5-hostname <proxy-host:port>` 手工验一次）。
+   注意**出口 IP 变了可能触发会话校验**——这正是 T1 存在的意义。
 
 ```python
 import httpx, json
 h = json.load(open("/opt/his/session-headers.json"))
 r = httpx.get("https://his.example.org/api/outpatient/registrations",
               params={"date": "2026-07-01"}, headers=h, timeout=20)
-print(r.status_code, r.text[:300])
+body = r.json()
+print(r.status_code, body.get("status"), len((body.get("data") or {}).get("list") or []))
 ```
+
+> ⚠️ **两个会让你误判的坑（都实测踩过）**
+>
+> 1. **复放要用抓包里的"权威头集"，不是基础头集。**
+>    `network.jsonl` 里同一个请求有两行头：`request`（CDP 基础头）与 **`requestExtra`（浏览器实际发出的
+>    完整头，含 `Cookie`）**。只抄 `request` 那一份 → 服务端回"登录超时"。
+> 2. **HTTP 200 不代表成功。** 上面那次失败返回的是
+>    `HTTP 200` + `{"status":401,"message":"登录超时"}` —— 业务状态码在 **body 里**。
+>    判断成败要看 `body.status`（或你系统里对应的字段），**只看 HTTP 状态码必然误判**。
 
 | 结果 | 含义 | 架构 |
 | --- | --- | --- |
-| `200` + 正常数据 | 不签名，只有会话做身份 | ✅ **理想**：日常完全离线，浏览器只在侦察期用一次 |
-| `200` 但空/报错 | 参数被签名或时间戳校验 | ⚠️ 每天必须用浏览器把"名单"这步重放一次（插件配方），明细若能离线就离线拉 |
-| `401` / `302` 到登录页 | 会话失效 | 先解决第 11 步 |
+| T1、T2 都通 | 不签名，只有会话做身份 | ✅ **理想**：日常完全离线，浏览器只在会话失效时用一次 |
+| T1 通、T2 不通 | 业务参数被签名 | ⚠️ 每天用浏览器把"名单"这步重放一次（插件配方），明细能离线就离线 |
+| T1 不通 | 凭证不全 / 出口 IP 被绑 / 会话失效 | 按 T4 定位缺哪个凭证；会话失效走第 13 步保鲜 |
+| 登录页 / 302 | 会话彻底失效 | 先解决第 11 步 |
 
-**顺带**：`requestHeaders` 里出现 `sign`、`signature`、`nonce`、`timestamp`、`x-encrypted-*`
-这类头，基本可直接判定"签名型"。实测样本（NMPA 抓包）里就有一条带 `sign` + `timestamp` + `token` 的
-GET，其 `date` 参数也是签名材料的一部分。
+**顺带**：`requestHeaders` 里出现 `sign`、`signature`、`nonce`、`x-encrypted-*` 这类头，是"签名型"的
+强烈嫌疑（实测样本里有一条带 `sign` + `timestamp` + `token` 的 GET，其日期参数也是签名材料的一部分）——
+但**要按上面的四连测试下结论，不要凭头名猜**：另一个实测系统同样带着 `crypt-key` 与 `timestamp`，
+四连测试却证明它**并不签名**。
 
 ### 第 11 步：判据 B —— 会话能活多久
 
@@ -332,6 +389,11 @@ GET，其 `date` 参数也是签名材料的一部分。
 | 有效期 ≥ 1 天且有"记住我" | ✅ 可无人值守：会话头缓存在 `session-headers.json`，到期前人工重登一次 |
 | 几小时就过期 | ⚠️ 每天开跑前先"保鲜"：抓一次列表页 → 重跑 `pick-headers.py` |
 | 每次登录要**短信验证码/扫码/人脸** | ⛔ **停在这里**。无人值守自动化在合规与技术上都该停（插件对验证码的立场是只检测、不破解），去要服务账号或只读接口 |
+
+**两种"不过期"要分清。** `Set-Cookie` 写成 `expires=Fri, 14 Jun 22013 …` 这种夸张年份，意思是 cookie
+**不会按时过期**（实测的一个系统正是如此）；但**服务端仍会失效**，而且失效信号不一定是 HTTP 401——
+同一系统回的是 `HTTP 200` + `{"status":401,"message":"登录超时"}`。所以日常作业的告警条件写成
+"**业务状态码 ≠ 成功**"，而不是"HTTP 状态码 ≠ 200"。
 
 ### 第 12 步：判据 C —— 前端形态
 
@@ -493,3 +555,8 @@ WantedBy=timers.target
 | 配方里 `type` 的 `value` 只能是字面量，因此凭据不能进配方 | `src/targets.ts` → `parseStep()` 的 `verb === 'type'` 分支 |
 | 插件对验证码只检测、不破解 | `src/challenge.ts` 模块头注释（"Solving, spoofing, CAPTCHA answering, and cookie lifting live outside the plugin entirely"） |
 | 录制只覆盖插件自己打开的那个标签页 | `src/client/locales.ts` → `recordNetworkHint`；`README.zh-CN.md` §抓包记录 |
+| 分波加载的 SPA 会早于业务请求被判定"安静"：实测窗口 11.4 秒（业务请求没发出）vs 带 8 秒等待的 15.7 秒（业务请求 +10.6 秒抓到） | 本次会话对某个内网门诊 HIS 的两次真实抓取（同一 SPA；域名与接口路径不记录在公开仓库） |
+| 复放必须用 `requestExtra` 的权威头集（含 `Cookie`）；缺 `Cookie` 时得到 `HTTP 200` + `{"status":401,"message":"登录超时"}` | 实测：同一名单接口的 T1（原样）与 T4（去掉 Cookie）对比 |
+| `Set-Cookie … expires=Fri, 14 Jun 22013` 型 cookie 不会按时过期，但服务端仍会失效（业务码 401，HTTP 仍 200） | 实测：同一系统的响应头与会话失效响应 |
+| 带 `crypt-key` + `timestamp` 的接口**未必**签名：四连测试里改业务参数照样返回数据 | 实测：同一名单接口的 T1/T2 |
+| 单步等待上限 10 秒、整次抓取 45 秒、页面安顿上限 5 秒、标签页结束时被关 | `src/actions.ts` → `STEP_CEILING_MS`；`src/provider.ts` → `DEFAULT_TIMEOUT_MS` / `SETTLE_MS`；`src/browser-pool.ts` → `release()` |
